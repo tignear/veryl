@@ -70,7 +70,7 @@
 | 2要素 (同幅) | [x] `test_four_state_concat` |
 | 2要素 (ワイド混合) | [x] `test_four_state_wide_concat_mixed` |
 | 3要素以上 | [x] `test_four_state_concat_three_elements` |
-| 奇数幅 (例: 3bit + 5bit) | [ ] |
+| 奇数幅 (例: 3bit + 5bit) | [x] `test_four_state_concat_odd_width` |
 | チャンク境界をまたぐ X | [ ] |
 
 ## 7. Mux / 三項演算子
@@ -79,7 +79,7 @@
 |----------|-----------|
 | X 条件 (1bit セレクタ) | [x] `test_four_state_mux_x_condition` |
 | 確定条件, X 分岐 | [x] `test_four_state_mux_x_in_branch` |
-| マルチビットセレクタ | [ ] |
+| マルチビットセレクタ | [x] `test_four_state_multibit_mux_with_x` |
 | カスケード Mux | [ ] |
 | 両分岐とも X | [ ] |
 
@@ -90,7 +90,7 @@
 | X キャプチャ | [x] `test_four_state_ff_capture_and_reset` |
 | リセットで X クリア | [x] 同上 |
 | 同期リセット + X | [ ] |
-| FF 内条件分岐 + X | [ ] |
+| FF 内条件分岐 + X | [x] `test_four_state_ff_conditional_with_x` |
 
 ## 9. 型変換・代入
 
@@ -98,8 +98,8 @@
 |----------|-----------|
 | logic → bit (X ドロップ) | [x] `test_four_state_mixing` |
 | bit → logic (mask=0 維持) | [x] `test_four_state_mixing` |
-| 狭幅 → 広幅 + X | [ ] |
-| 広幅 → 狭幅 + X | [ ] |
+| 狭幅 → 広幅 + X | [x] `test_four_state_width_widening_with_x` |
+| 広幅 → 狭幅 + X | [x] `test_four_state_width_narrowing_with_x` |
 | 明示的キャスト + X | [ ] |
 
 ## 10. 境界幅
@@ -110,7 +110,7 @@
 | 8bit | [x] 複数テスト | |
 | 64bit | [x] `test_four_state_wide_128bit_simple` | 1チャンク上限 |
 | 65bit | [x] `test_four_state_65bit_boundary` | 2チャンク下限 |
-| 127bit | [ ] | |
+| 127bit | [x] `test_four_state_127bit` | |
 | 128bit | [x] 複数ワイドテスト | |
 
 ## 11. 正規化 (IEEE 1800)
@@ -139,7 +139,11 @@
 - [x] ワイド比較 + X
 
 ### P2 — エッジケースの堅牢性
-- [ ] マルチビットセレクタ Mux
-- [ ] 広幅 ↔ 狭幅の代入 + X
-- [ ] FF 内条件分岐 + X
-- [ ] 127bit / 奇数幅の連結
+- [x] マルチビットセレクタ Mux
+- [x] 広幅 ↔ 狭幅の代入 + X
+- [x] FF 内条件分岐 + X
+- [x] 127bit / 奇数幅の連結
+
+## 既知の問題
+
+- **`case` 文 + 4-state**: `case` 文の selector が確定値でも default に落ちる場合がある（4-state モードのみ）。`if/else` による比較は正常動作する。

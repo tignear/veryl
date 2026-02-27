@@ -1714,3 +1714,279 @@ fn test_four_state_wide_comparison_with_x() {
     assert_eq!(m_eq, BigUint::from(1u32), "Wide EQ with X should yield X");
     assert_eq!(m_lt, BigUint::from(1u32), "Wide LT with X should yield X");
 }
+
+// ==========================================================================
+// P2: Multi-bit selector (case) with X
+// ==========================================================================
+#[test]
+fn test_four_state_multibit_mux_with_x() {
+    let code = r#"
+        module Top (
+            sel: input logic<2>,
+            a: input logic<8>,
+            b: input logic<8>,
+            c: input logic<8>,
+            y: output logic<8>
+        ) {
+            always_comb {
+                if sel == 2'd0 {
+                    y = a;
+                } else if sel == 2'd1 {
+                    y = b;
+                } else {
+                    y = c;
+                }
+            }
+        }
+    "#;
+    let mut sim = SimulatorBuilder::new(code, "Top")
+        .four_state(true)
+        .build()
+        .unwrap();
+
+    let id_sel = sim.signal("sel");
+    let id_a = sim.signal("a");
+    let id_b = sim.signal("b");
+    let id_c = sim.signal("c");
+    let id_y = sim.signal("y");
+
+    // Setup branch values
+    sim.modify(|io: &mut IOContext| {
+        io.set_four_state(id_a, BigUint::from(0xAAu32), BigUint::from(0u32));
+        io.set_four_state(id_b, BigUint::from(0xBBu32), BigUint::from(0u32));
+        io.set_four_state(id_c, BigUint::from(0xCCu32), BigUint::from(0u32));
+    })
+    .unwrap();
+
+    // Selector has X → result should have X (conservative mux of all branches)
+    sim.modify(|io: &mut IOContext| {
+        io.set_four_state(id_sel, BigUint::from(0u32), BigUint::from(1u32)); // bit 0 is X
+    })
+    .unwrap();
+    let (_, m) = sim.get_four_state(id_y);
+    assert_ne!(
+        m,
+        BigUint::from(0u32),
+        "Multi-bit mux with X in selector should produce X in output"
+    );
+}
+
+// ==========================================================================
+// P2: Width narrowing (wide → narrow) with X
+// ==========================================================================
+#[test]
+fn test_four_state_width_narrowing_with_x() {
+    let code = r#"
+        module Top (
+            a: input logic<16>,
+            y: output logic<8>
+        ) {
+            assign y = a[7:0];
+        }
+    "#;
+    let mut sim = SimulatorBuilder::new(code, "Top")
+        .four_state(true)
+        .build()
+        .unwrap();
+
+    let id_a = sim.signal("a");
+    let id_y = sim.signal("y");
+
+    // X in upper byte only → narrow to lower byte should have no X
+    sim.modify(|io: &mut IOContext| {
+        io.set_four_state(id_a, BigUint::from(0x12ABu32), BigUint::from(0xFF00u32));
+    })
+    .unwrap();
+    let (v, m) = sim.get_four_state(id_y);
+    assert_eq!(v, BigUint::from(0xABu32), "Lower byte should be 0xAB");
+    assert_eq!(m, BigUint::from(0u32), "Lower byte should have no X");
+
+    // X in lower byte → narrow should propagate X
+    sim.modify(|io: &mut IOContext| {
+        io.set_four_state(id_a, BigUint::from(0x1200u32), BigUint::from(0x000Fu32));
+    })
+    .unwrap();
+    let (v, m) = sim.get_four_state(id_y);
+    assert_eq!(m, BigUint::from(0x0Fu32), "Lower nibble X should propagate");
+    assert_eq!(v, BigUint::from(0u32), "X bits normalized to 0");
+}
+
+// ==========================================================================
+// P2: Width widening (narrow → wide) with X
+// ==========================================================================
+#[test]
+fn test_four_state_width_widening_with_x() {
+    let code = r#"
+        module Top (
+            a: input logic<8>,
+            y: output logic<16>
+        ) {
+            assign y = a;
+        }
+    "#;
+    let mut sim = SimulatorBuilder::new(code, "Top")
+        .four_state(true)
+        .build()
+        .unwrap();
+
+    let id_a = sim.signal("a");
+    let id_y = sim.signal("y");
+
+    // a has partial X → upper byte of y should be 0 (zero-extended), no X
+    sim.modify(|io: &mut IOContext| {
+        io.set_four_state(id_a, BigUint::from(0xA5u32), BigUint::from(0x0Fu32));
+    })
+    .unwrap();
+    let (v, m) = sim.get_four_state(id_y);
+    // Upper byte: zero-extended → 0x00, mask 0x00
+    // Lower byte: value 0xA0 (normalized: 0xA5 & ~0x0F = 0xA0), mask 0x0F
+    assert_eq!(m, BigUint::from(0x0Fu32), "Only lower nibble X should propagate");
+    assert_eq!(v, BigUint::from(0xA0u32), "Value: 0xA5 & ~0x0F = 0xA0");
+}
+
+// ==========================================================================
+// P2: FF with conditional assignment + X
+// ==========================================================================
+#[test]
+fn test_four_state_ff_conditional_with_x() {
+    let code = r#"
+        module Top (
+            clk: input clock,
+            rst: input reset,
+            en: input logic,
+            d: input logic<8>,
+            q: output logic<8>
+        ) {
+            always_ff {
+                if_reset {
+                    q = 8'd0;
+                } else if en {
+                    q = d;
+                }
+            }
+        }
+    "#;
+    let mut sim = SimulatorBuilder::new(code, "Top")
+        .four_state(true)
+        .build()
+        .unwrap();
+
+    let clk = sim.event("clk");
+    let id_rst = sim.signal("rst");
+    let id_en = sim.signal("en");
+    let id_d = sim.signal("d");
+    let id_q = sim.signal("q");
+
+    // Reset first
+    sim.modify(|io: &mut IOContext| {
+        io.set_four_state(id_rst, BigUint::from(1u32), BigUint::from(0u32));
+        io.set_four_state(id_en, BigUint::from(0u32), BigUint::from(0u32));
+        io.set_four_state(id_d, BigUint::from(0u32), BigUint::from(0u32));
+        io.set_four_state(id_q, BigUint::from(0u32), BigUint::from(0u32));
+    })
+    .unwrap();
+    sim.tick(clk).unwrap();
+    let (v_q, m_q) = sim.get_four_state(id_q);
+    assert_eq!(v_q, BigUint::from(0u32));
+    assert_eq!(m_q, BigUint::from(0u32), "Reset should clear X");
+
+    // en=1, d has X → q captures X
+    sim.modify(|io: &mut IOContext| {
+        io.set_four_state(id_rst, BigUint::from(0u32), BigUint::from(0u32));
+        io.set_four_state(id_en, BigUint::from(1u32), BigUint::from(0u32));
+        io.set_four_state(id_d, BigUint::from(0xABu32), BigUint::from(0x0Fu32));
+    })
+    .unwrap();
+    sim.tick(clk).unwrap();
+    let (_, m_q) = sim.get_four_state(id_q);
+    assert_eq!(m_q, BigUint::from(0x0Fu32), "en=1: X from d should propagate to q");
+
+    // en=0, d changes → q should hold previous value (with X)
+    sim.modify(|io: &mut IOContext| {
+        io.set_four_state(id_en, BigUint::from(0u32), BigUint::from(0u32));
+        io.set_four_state(id_d, BigUint::from(0xFFu32), BigUint::from(0u32));
+    })
+    .unwrap();
+    sim.tick(clk).unwrap();
+    let (_, m_q) = sim.get_four_state(id_q);
+    assert_eq!(m_q, BigUint::from(0x0Fu32), "en=0: q should hold previous X mask");
+}
+
+// ==========================================================================
+// P2: Odd-width concatenation (3bit + 5bit) with X
+// ==========================================================================
+#[test]
+fn test_four_state_concat_odd_width() {
+    let code = r#"
+        module Top (
+            a: input logic<3>,
+            b: input logic<5>,
+            y: output logic<8>
+        ) {
+            assign y = {a, b};
+        }
+    "#;
+    let mut sim = SimulatorBuilder::new(code, "Top")
+        .four_state(true)
+        .build()
+        .unwrap();
+
+    let id_a = sim.signal("a");
+    let id_b = sim.signal("b");
+    let id_y = sim.signal("y");
+
+    // a = 3'b101 (0x5), mask=0b010 (bit 1 is X); b = 5'b10011 (0x13), mask=0
+    sim.modify(|io: &mut IOContext| {
+        io.set_four_state(id_a, BigUint::from(0x5u32), BigUint::from(0b010u32));
+        io.set_four_state(id_b, BigUint::from(0x13u32), BigUint::from(0u32));
+    })
+    .unwrap();
+
+    let (v, m) = sim.get_four_state(id_y);
+    // y = {a, b} = {101, 10011} → 8'b101_10011
+    // mask: a's bit 1 X → in y that's bit 6 → mask = 0b0100_0000 = 0x40
+    assert_eq!(m, BigUint::from(0x40u32), "X in a[1] should appear at y[6]");
+    // value: a = 0b101 (bit 1 is X but val=0), b = 0x13
+    // y_val = (0b101 << 5) | 0b10011 = 0b10110011 = 0xB3
+    // Normalization: bit 6 val is already 0, so 0xB3 & ~0x40 = 0xB3
+    assert_eq!(v, BigUint::from(0xB3u32), "Concat value with X bit at position 6");
+}
+
+// ==========================================================================
+// P2: 127-bit width test
+// ==========================================================================
+#[test]
+fn test_four_state_127bit() {
+    let code = r#"
+        module Top (
+            a: input logic<127>,
+            b: input logic<127>,
+            y_and: output logic<127>
+        ) {
+            assign y_and = a & b;
+        }
+    "#;
+    let mut sim = SimulatorBuilder::new(code, "Top")
+        .four_state(true)
+        .build()
+        .unwrap();
+
+    let id_a = sim.signal("a");
+    let id_b = sim.signal("b");
+    let id_y = sim.signal("y_and");
+
+    // Set bit 126 (MSB of 127-bit) as X in a, b all ones
+    let val_a: BigUint = (BigUint::from(1u64) << 126) | BigUint::from(0xFFu64);
+    let mask_a: BigUint = BigUint::from(1u64) << 126;
+    let val_b: BigUint = (BigUint::from(u64::MAX) << 63) | BigUint::from(u64::MAX);
+
+    sim.modify(|io: &mut IOContext| {
+        io.set_four_state(id_a, val_a, mask_a.clone());
+        io.set_four_state(id_b, val_b, BigUint::from(0u32));
+    })
+    .unwrap();
+
+    let (_, m) = sim.get_four_state(id_y);
+    // AND: a[126]=X, b[126]=1 → result[126]=X
+    assert_eq!(m, mask_a, "127-bit AND: X at MSB should propagate");
+}
