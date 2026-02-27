@@ -1,0 +1,145 @@
+# 4-State テスト計画
+
+`tests/four_state.rs` のカバレッジ状況と追加テストの計画です。
+各項目の実装時にチェックを入れてください。
+
+## 凡例
+
+- [x] テスト済み
+- [ ] 未テスト（実装予定）
+
+---
+
+## 1. ビット演算 (Binary Bitwise)
+
+| 演算 | 単一幅 (≤64bit) | ワイド (>64bit) |
+|------|-----------------|----------------|
+| AND  | [x] `test_four_state_and_or` | [x] `test_four_state_wide_128bit` |
+| OR   | [x] `test_four_state_and_or` | [x] `test_four_state_wide_128bit` |
+| XOR  | [x] `test_four_state_xor_partial_x` | [x] `test_four_state_wide_128bit` (暗黙) |
+
+## 2. 算術演算 (Arithmetic)
+
+| 演算 | 単一幅 | ワイド | 備考 |
+|------|--------|--------|------|
+| ADD  | [x] `test_four_state_arithmetic_ops` | [x] `test_four_state_wide_arith` | |
+| SUB  | [x] `test_four_state_arithmetic_ops` | [x] `test_four_state_wide_arith` | |
+| MUL  | [ ] | [ ] | 保守的 all-X を期待 |
+| DIV  | [ ] | [ ] | 保守的 all-X を期待 |
+| MOD  | [ ] | [ ] | 保守的 all-X を期待 |
+
+## 3. シフト演算 (Shift)
+
+| 条件 | SHL | SHR | SAR |
+|------|-----|-----|-----|
+| 定数シフト量 | [x] `test_four_state_shift_by_constant` | [x] 同左 | [x] `test_four_state_wide_signed` |
+| 変数シフト量 (確定) | [x] `test_four_state_wide_shifts` | [x] 同左 | [ ] |
+| シフト量に X | [x] `test_four_state_shift_by_x_amount` | [x] `test_four_state_wide_shifts` | [ ] |
+| データと量の両方に X | [ ] | [ ] | [ ] |
+
+## 4. 比較演算 (Comparison)
+
+| 演算 | 単一幅 | ワイド | 備考 |
+|------|--------|--------|------|
+| EQ (`==`) | [x] `test_four_state_comparison_with_x` | [ ] | |
+| NE (`!=`) | [ ] | [ ] | |
+| LT (`<` unsigned) | [x] `test_four_state_comparison_with_x` | [ ] | |
+| GT (`>` unsigned) | [ ] | [ ] | |
+| LE (`<=` unsigned) | [ ] | [ ] | |
+| GE (`>=` unsigned) | [ ] | [ ] | |
+| LT (`<` signed) | [ ] | [ ] | |
+| GT (`>` signed) | [ ] | [ ] | |
+| LE (`<=` signed) | [ ] | [ ] | |
+| GE (`>=` signed) | [ ] | [ ] | |
+
+## 5. 単項演算 (Unary)
+
+| 演算 | 単一幅 | ワイド |
+|------|--------|--------|
+| Bitwise NOT (`~`) | [x] `test_four_state_unary_ops` | [ ] |
+| Negation (`-`) | [ ] | [ ] |
+| Logical NOT (`!`) | [ ] | [ ] |
+| Reduction AND | [x] `test_four_state_unary_ops` (部分) | [ ] |
+| Reduction OR | [x] `test_four_state_unary_ops` (部分) | [ ] |
+| Reduction XOR | [ ] | [ ] |
+
+## 6. 連結 (Concatenation)
+
+| パターン | テスト状況 |
+|----------|-----------|
+| 2要素 (同幅) | [x] `test_four_state_concat` |
+| 2要素 (ワイド混合) | [x] `test_four_state_wide_concat_mixed` |
+| 3要素以上 | [ ] |
+| 奇数幅 (例: 3bit + 5bit) | [ ] |
+| チャンク境界をまたぐ X | [ ] |
+
+## 7. Mux / 三項演算子
+
+| パターン | テスト状況 |
+|----------|-----------|
+| X 条件 (1bit セレクタ) | [x] `test_four_state_mux_x_condition` |
+| 確定条件, X 分岐 | [x] `test_four_state_mux_x_in_branch` |
+| マルチビットセレクタ | [ ] |
+| カスケード Mux | [ ] |
+| 両分岐とも X | [ ] |
+
+## 8. FF (フリップフロップ)
+
+| パターン | テスト状況 |
+|----------|-----------|
+| X キャプチャ | [x] `test_four_state_ff_capture_and_reset` |
+| リセットで X クリア | [x] 同上 |
+| 同期リセット + X | [ ] |
+| FF 内条件分岐 + X | [ ] |
+
+## 9. 型変換・代入
+
+| パターン | テスト状況 |
+|----------|-----------|
+| logic → bit (X ドロップ) | [x] `test_four_state_mixing` |
+| bit → logic (mask=0 維持) | [x] `test_four_state_mixing` |
+| 狭幅 → 広幅 + X | [ ] |
+| 広幅 → 狭幅 + X | [ ] |
+| 明示的キャスト + X | [ ] |
+
+## 10. 境界幅
+
+| 幅 | テスト状況 | 備考 |
+|----|-----------|------|
+| 1bit | [x] 比較演算結果で暗黙カバー | |
+| 8bit | [x] 複数テスト | |
+| 64bit | [x] `test_four_state_wide_128bit_simple` | 1チャンク上限 |
+| 65bit | [ ] | 2チャンク下限、最も壊れやすい境界 |
+| 127bit | [ ] | |
+| 128bit | [x] 複数ワイドテスト | |
+
+## 11. 正規化 (IEEE 1800)
+
+| パターン | テスト状況 |
+|----------|-----------|
+| 演算結果の v &= ~m | [x] `test_four_state_wide_shifts`, `test_four_state_wide_concat_mixed` |
+| 全ビット X 入力 | [x] `test_four_state_initial_and_set` |
+| 2-state 変数経由の X 遮断 | [x] `test_four_state_mixing_propagation` |
+
+---
+
+## 優先度ガイド
+
+### P0 — コアセマンティクスの検証
+- [ ] MUL / DIV / MOD + X （単一幅）
+- [ ] 比較演算の網羅 (NE, GT, GE, LE + 符号付き)
+- [ ] Reduction XOR + X
+- [ ] 65bit 幅テスト
+
+### P1 — よくある HDL パターン
+- [ ] Negation (`-`) + X
+- [ ] Logical NOT (`!`) + X
+- [ ] SAR + X シフト量
+- [ ] 3要素以上の連結
+- [ ] ワイド比較 + X
+
+### P2 — エッジケースの堅牢性
+- [ ] マルチビットセレクタ Mux
+- [ ] 広幅 ↔ 狭幅の代入 + X
+- [ ] FF 内条件分岐 + X
+- [ ] 127bit / 奇数幅の連結
