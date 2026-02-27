@@ -681,3 +681,220 @@ fn ff_unary_4s(
 ) {
     check_ff_unary_4s(op, in_ty, out_ty, a_v, a_m, e_v, e_m);
 }
+
+// ###################################################################
+// Wide (>64-bit) 4-state tests — exercises the multi-chunk path
+// ###################################################################
+
+/// Helper for wide 4-state comb binary.
+fn check_wide_comb_binary_4s(
+    op: &str,
+    width: usize,
+    a_val: &BigUint,
+    a_mask: &BigUint,
+    b_val: &BigUint,
+    b_mask: &BigUint,
+    exp_val: &BigUint,
+    exp_mask: &BigUint,
+) {
+    let ty = format!("logic<{width}>");
+    let code = format!(
+        r#"
+        module Top (a: input {ty}, b: input {ty}, o: output {ty}) {{
+            assign o = a {op} b;
+        }}
+    "#
+    );
+    let mut sim = Simulator::builder(&code, "Top")
+        .four_state(true)
+        .build()
+        .unwrap();
+    let sig_a = sim.signal("a");
+    let sig_b = sim.signal("b");
+    let sig_o = sim.signal("o");
+
+    sim.modify(|io: &mut IOContext| {
+        io.set_four_state(sig_a, a_val.clone(), a_mask.clone());
+        io.set_four_state(sig_b, b_val.clone(), b_mask.clone());
+    })
+    .unwrap();
+
+    let (v, m) = sim.get_four_state(sig_o);
+    assert_eq!(&m, exp_mask, "wide 4s comb {op}: mask mismatch");
+    assert_eq!(&v, exp_val, "wide 4s comb {op}: value mismatch");
+}
+
+/// Helper for wide 4-state comb unary.
+fn check_wide_comb_unary_4s(
+    op: &str,
+    width: usize,
+    a_val: &BigUint,
+    a_mask: &BigUint,
+    exp_val: &BigUint,
+    exp_mask: &BigUint,
+) {
+    let ty = format!("logic<{width}>");
+    let code = format!(
+        r#"
+        module Top (a: input {ty}, o: output {ty}) {{
+            assign o = {op}a;
+        }}
+    "#
+    );
+    let mut sim = Simulator::builder(&code, "Top")
+        .four_state(true)
+        .build()
+        .unwrap();
+    let sig_a = sim.signal("a");
+    let sig_o = sim.signal("o");
+
+    sim.modify(|io: &mut IOContext| {
+        io.set_four_state(sig_a, a_val.clone(), a_mask.clone());
+    })
+    .unwrap();
+
+    let (v, m) = sim.get_four_state(sig_o);
+    assert_eq!(&m, exp_mask, "wide 4s comb {op}: mask mismatch");
+    assert_eq!(&v, exp_val, "wide 4s comb {op}: value mismatch");
+}
+
+// ===================================================================
+// Wide 4-state: XOR — value at X positions must be 0 (IEEE)
+// ===================================================================
+
+#[test]
+fn wide_4s_xor_with_x() {
+    // 128-bit: a is defined, b is all-X → result all-X, value must be 0
+    let a_val = BigUint::from(0xDEAD_BEEF_CAFE_BABEu64) << 64 | BigUint::from(0x1234_5678_9ABC_DEF0u64);
+    let a_mask = BigUint::from(0u64);
+    let b_val = BigUint::from(0u64);
+    let b_mask = (BigUint::from(1u64) << 128) - BigUint::from(1u64); // all-ones 128-bit
+    let exp_val = BigUint::from(0u64); // IEEE: value=0 when mask=all-X
+    let exp_mask = (BigUint::from(1u64) << 128) - BigUint::from(1u64);
+    check_wide_comb_binary_4s("^", 128, &a_val, &a_mask, &b_val, &b_mask, &exp_val, &exp_mask);
+}
+
+#[test]
+fn wide_4s_xor_defined() {
+    // 128-bit: both defined → normal XOR, no X
+    let a_val = BigUint::from(0xFFFF_FFFF_FFFF_FFFFu64) << 64 | BigUint::from(0u64);
+    let b_val = BigUint::from(0u64) << 64 | BigUint::from(0xFFFF_FFFF_FFFF_FFFFu64);
+    let a_mask = BigUint::from(0u64);
+    let b_mask = BigUint::from(0u64);
+    let exp_val = (BigUint::from(1u64) << 128) - BigUint::from(1u64); // all ones
+    let exp_mask = BigUint::from(0u64);
+    check_wide_comb_binary_4s("^", 128, &a_val, &a_mask, &b_val, &b_mask, &exp_val, &exp_mask);
+}
+
+// ===================================================================
+// Wide 4-state: BitNot — value at X positions must be 0 (IEEE)
+// ===================================================================
+
+#[test]
+fn wide_4s_bitnot_partial_x() {
+    // 128-bit: lower 64 bits are X, upper 64 bits defined as 0xFF..FF
+    // ~(0xFFFF..., mask=0x0000...FFFF...) →
+    //   value: ~0xFFFF... = 0x0000... for upper, X for lower → 0x0000... (lower zeroed by IEEE)
+    //   mask: 0x0000...FFFF...
+    let a_val = (BigUint::from(0xFFFF_FFFF_FFFF_FFFFu64) << 64) | BigUint::from(0xAAAA_BBBB_CCCC_DDDDu64);
+    let a_mask = BigUint::from(0xFFFF_FFFF_FFFF_FFFFu64); // lower 64 bits are X
+    // ~a: upper 64 bits → 0x0000..., lower 64 bits → ~0xAAAA... but masked to X
+    // IEEE: value at X positions = 0
+    let exp_val = BigUint::from(0u64); // upper ~0xFFFF = 0x0000, lower is X → 0
+    let exp_mask = BigUint::from(0xFFFF_FFFF_FFFF_FFFFu64);
+    check_wide_comb_unary_4s("~", 128, &a_val, &a_mask, &exp_val, &exp_mask);
+}
+
+// ===================================================================
+// Wide 4-state: Arithmetic — any X → all X, value=0 (IEEE)
+// ===================================================================
+
+#[test]
+fn wide_4s_add_x() {
+    let a_val = BigUint::from(1u64) << 100;
+    let a_mask = BigUint::from(0u64);
+    let b_val = BigUint::from(0u64);
+    let b_mask = BigUint::from(1u64); // bit 0 is X
+    let exp_val = BigUint::from(0u64);
+    let exp_mask = (BigUint::from(1u64) << 128) - BigUint::from(1u64);
+    check_wide_comb_binary_4s("+", 128, &a_val, &a_mask, &b_val, &b_mask, &exp_val, &exp_mask);
+}
+
+// ===================================================================
+// Wide 4-state: Reduction — any X → result X, value=0 (IEEE)
+// ===================================================================
+
+#[test]
+fn wide_4s_red_xor_x() {
+    // 128-bit value with one X bit → reduction XOR result is X
+    let a_val = BigUint::from(0x03u64) << 64; // some bits set in upper half
+    let a_mask = BigUint::from(1u64); // bit 0 is X
+    let exp_val = BigUint::from(0u64);
+    let exp_mask = BigUint::from(1u64); // 1-bit result, X
+    check_wide_comb_unary_4s("^", 128, &a_val, &a_mask, &exp_val, &exp_mask);
+}
+
+// ###################################################################
+// Concat 4-state tests
+// ###################################################################
+
+#[test]
+fn concat_4s_partial_x() {
+    // {a, b} where a is 8-bit defined, b is 8-bit with X
+    // Result: upper 8 bits defined, lower 8 bits X
+    // IEEE: value at X positions must be 0
+    let code = r#"
+        module Top (a: input logic<8>, b: input logic<8>, o: output logic<16>) {
+            assign o = {a, b};
+        }
+    "#;
+    let mut sim = Simulator::builder(code, "Top")
+        .four_state(true)
+        .build()
+        .unwrap();
+    let sig_a = sim.signal("a");
+    let sig_b = sim.signal("b");
+    let sig_o = sim.signal("o");
+
+    sim.modify(|io: &mut IOContext| {
+        io.set_four_state(sig_a, BigUint::from(0xABu64), BigUint::from(0u64));
+        io.set_four_state(sig_b, BigUint::from(0xCDu64), BigUint::from(0xFFu64)); // all X
+    })
+    .unwrap();
+
+    let (v, m) = sim.get_four_state(sig_o);
+    // mask: upper 8 = 0x00, lower 8 = 0xFF → 0x00FF
+    assert_eq!(m, BigUint::from(0x00FFu64), "concat 4s: mask mismatch");
+    // IEEE: value at X positions = 0 → upper 0xAB, lower 0x00 → 0xAB00
+    assert_eq!(v, BigUint::from(0xAB00u64), "concat 4s: value mismatch");
+}
+
+#[test]
+fn wide_concat_4s_partial_x() {
+    // {a, b} where a is 64-bit defined, b is 64-bit with all X
+    // Total: 128 bits — exercises the wide concat path
+    let code = r#"
+        module Top (a: input logic<64>, b: input logic<64>, o: output logic<128>) {
+            assign o = {a, b};
+        }
+    "#;
+    let mut sim = Simulator::builder(code, "Top")
+        .four_state(true)
+        .build()
+        .unwrap();
+    let sig_a = sim.signal("a");
+    let sig_b = sim.signal("b");
+    let sig_o = sim.signal("o");
+
+    sim.modify(|io: &mut IOContext| {
+        io.set_four_state(sig_a, BigUint::from(0xCAFE_BABE_DEAD_BEEFu64), BigUint::from(0u64));
+        io.set_four_state(sig_b, BigUint::from(0x1234_5678_9ABC_DEF0u64), BigUint::from(0xFFFF_FFFF_FFFF_FFFFu64));
+    })
+    .unwrap();
+
+    let (v, m) = sim.get_four_state(sig_o);
+    let exp_mask = BigUint::from(0xFFFF_FFFF_FFFF_FFFFu64); // lower 64 bits X
+    let exp_val = BigUint::from(0xCAFE_BABE_DEAD_BEEFu64) << 64; // upper defined, lower 0
+    assert_eq!(m, exp_mask, "wide concat 4s: mask mismatch");
+    assert_eq!(v, exp_val, "wide concat 4s: value mismatch");
+}
