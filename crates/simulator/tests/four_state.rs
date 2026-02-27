@@ -1990,3 +1990,279 @@ fn test_four_state_127bit() {
     // AND: a[126]=X, b[126]=1 → result[126]=X
     assert_eq!(m, mask_a, "127-bit AND: X at MSB should propagate");
 }
+
+// ==========================================================================
+// Wide (128-bit) Unary NOT + X
+// ==========================================================================
+#[test]
+fn test_four_state_wide_unary_not_with_x() {
+    let code = r#"
+        module Top (
+            a: input logic<128>,
+            y: output logic<128>
+        ) {
+            assign y = ~a;
+        }
+    "#;
+    let mut sim = SimulatorBuilder::new(code, "Top")
+        .four_state(true)
+        .build()
+        .unwrap();
+
+    let id_a = sim.signal("a");
+    let id_y = sim.signal("y");
+
+    // Upper word has X, lower word is 0xFF..FF
+    let val_a: BigUint = (BigUint::from(0xAAu64) << 64) | BigUint::from(u64::MAX);
+    let mask_a: BigUint = BigUint::from(0xFFu64) << 64;
+    sim.modify(|io: &mut IOContext| {
+        io.set_four_state(id_a, val_a, mask_a.clone());
+    })
+    .unwrap();
+
+    let (v, m) = sim.get_four_state(id_y);
+    // NOT: mask preserved, defined bits inverted
+    assert_eq!(m, mask_a, "Wide NOT should preserve mask");
+    // Lower word: ~0xFF..FF = 0x00..00
+    assert_eq!(
+        v & BigUint::from(u64::MAX),
+        BigUint::from(0u64),
+        "Lower word: ~0xFFFFFFFFFFFFFFFF = 0"
+    );
+}
+
+// ==========================================================================
+// Wide (128-bit) Negation + X
+// ==========================================================================
+#[test]
+fn test_four_state_wide_negation_with_x() {
+    let code = r#"
+        module Top (
+            a: input logic<128>,
+            y: output logic<128>
+        ) {
+            assign y = -a;
+        }
+    "#;
+    let mut sim = SimulatorBuilder::new(code, "Top")
+        .four_state(true)
+        .build()
+        .unwrap();
+
+    let id_a = sim.signal("a");
+    let id_y = sim.signal("y");
+
+    // Any X → all-X (conservative for arithmetic)
+    let mask_a: BigUint = BigUint::from(1u64) << 64;
+    sim.modify(|io: &mut IOContext| {
+        io.set_four_state(id_a, BigUint::from(5u32), mask_a);
+    })
+    .unwrap();
+
+    let (v, m) = sim.get_four_state(id_y);
+    let all_x: BigUint = (BigUint::from(u64::MAX) << 64) | BigUint::from(u64::MAX);
+    assert_eq!(m, all_x, "Wide negation with X should yield all-X");
+    assert_eq!(v, BigUint::from(0u32), "Value normalized to 0");
+}
+
+// ==========================================================================
+// Wide (128-bit) Reduction AND/OR/XOR + X
+// ==========================================================================
+#[test]
+fn test_four_state_wide_reduction_with_x() {
+    let code = r#"
+        module Top (
+            a: input logic<128>,
+            y_rand: output logic,
+            y_ror:  output logic,
+            y_rxor: output logic
+        ) {
+            assign y_rand = &a;
+            assign y_ror  = |a;
+            assign y_rxor = ^a;
+        }
+    "#;
+    let mut sim = SimulatorBuilder::new(code, "Top")
+        .four_state(true)
+        .build()
+        .unwrap();
+
+    let id_a = sim.signal("a");
+    let id_rand = sim.signal("y_rand");
+    let id_ror = sim.signal("y_ror");
+    let id_rxor = sim.signal("y_rxor");
+
+    // a: upper word has X, lower word is all-1s
+    let val_a: BigUint = (BigUint::from(0xAAu64) << 64) | BigUint::from(u64::MAX);
+    let mask_a: BigUint = BigUint::from(0xFFu64) << 64;
+    sim.modify(|io: &mut IOContext| {
+        io.set_four_state(id_a, val_a, mask_a);
+    })
+    .unwrap();
+
+    // Reduction AND: some bits are X, no definite 0 → result X
+    let (_, m_rand) = sim.get_four_state(id_rand);
+    assert_eq!(m_rand, BigUint::from(1u32), "Wide &a with X (no definite 0) should be X");
+
+    // Reduction OR: lower word has definite 1s
+    // IEEE 1800: |a = 1 if any bit is definite 1 (even if other bits are X)
+    // Current implementation: conservative — any X in any chunk → result X
+    // TODO: implement dominant-value optimization for wide reduction OR
+    let (_, m_ror) = sim.get_four_state(id_ror);
+    assert_eq!(m_ror, BigUint::from(1u32), "Wide |a: current impl is conservative (X)");
+
+    // Reduction XOR: any X bit → result X
+    let (_, m_rxor) = sim.get_four_state(id_rxor);
+    assert_eq!(m_rxor, BigUint::from(1u32), "Wide ^a with any X should be X");
+}
+
+// ==========================================================================
+// Mux: both branches X
+// ==========================================================================
+#[test]
+fn test_four_state_mux_both_branches_x() {
+    let code = r#"
+        module Top (
+            sel: input logic,
+            a: input logic<8>,
+            b: input logic<8>,
+            y: output logic<8>
+        ) {
+            assign y = if sel ? a : b;
+        }
+    "#;
+    let mut sim = SimulatorBuilder::new(code, "Top")
+        .four_state(true)
+        .build()
+        .unwrap();
+
+    let id_sel = sim.signal("sel");
+    let id_a = sim.signal("a");
+    let id_b = sim.signal("b");
+    let id_y = sim.signal("y");
+
+    // sel=1 (defined), a=all-X, b=all-X → selects a, result all-X
+    sim.modify(|io: &mut IOContext| {
+        io.set_four_state(id_sel, BigUint::from(1u32), BigUint::from(0u32));
+        io.set_four_state(id_a, BigUint::from(0u32), BigUint::from(0xFFu32));
+        io.set_four_state(id_b, BigUint::from(0u32), BigUint::from(0xFFu32));
+    })
+    .unwrap();
+    let (v, m) = sim.get_four_state(id_y);
+    assert_eq!(m, BigUint::from(0xFFu32), "sel=1 selecting X branch → all-X");
+    assert_eq!(v, BigUint::from(0u32));
+
+    // sel=0 (defined), still selects b which is X
+    sim.modify(|io: &mut IOContext| {
+        io.set_four_state(id_sel, BigUint::from(0u32), BigUint::from(0u32));
+    })
+    .unwrap();
+    let (_, m) = sim.get_four_state(id_y);
+    assert_eq!(m, BigUint::from(0xFFu32), "sel=0 selecting X branch → all-X");
+
+    // sel=X, both branches X → definitely all-X
+    sim.modify(|io: &mut IOContext| {
+        io.set_four_state(id_sel, BigUint::from(0u32), BigUint::from(1u32));
+    })
+    .unwrap();
+    let (_, m) = sim.get_four_state(id_y);
+    assert_eq!(m, BigUint::from(0xFFu32), "sel=X, both branches X → all-X");
+}
+
+// ==========================================================================
+// Cascaded Mux with X
+// ==========================================================================
+#[test]
+fn test_four_state_cascaded_mux_with_x() {
+    let code = r#"
+        module Top (
+            sel1: input logic,
+            sel2: input logic,
+            a: input logic<8>,
+            b: input logic<8>,
+            c: input logic<8>,
+            y: output logic<8>
+        ) {
+            assign y = if sel1 ? (if sel2 ? a : b) : c;
+        }
+    "#;
+    let mut sim = SimulatorBuilder::new(code, "Top")
+        .four_state(true)
+        .build()
+        .unwrap();
+
+    let id_sel1 = sim.signal("sel1");
+    let id_sel2 = sim.signal("sel2");
+    let id_a = sim.signal("a");
+    let id_b = sim.signal("b");
+    let id_c = sim.signal("c");
+    let id_y = sim.signal("y");
+
+    sim.modify(|io: &mut IOContext| {
+        io.set_four_state(id_a, BigUint::from(0xAAu32), BigUint::from(0u32));
+        io.set_four_state(id_b, BigUint::from(0xBBu32), BigUint::from(0u32));
+        io.set_four_state(id_c, BigUint::from(0xCCu32), BigUint::from(0u32));
+    })
+    .unwrap();
+
+    // sel1=1, sel2=1 → a (defined)
+    sim.modify(|io: &mut IOContext| {
+        io.set_four_state(id_sel1, BigUint::from(1u32), BigUint::from(0u32));
+        io.set_four_state(id_sel2, BigUint::from(1u32), BigUint::from(0u32));
+    })
+    .unwrap();
+    let (v, m) = sim.get_four_state(id_y);
+    assert_eq!(v, BigUint::from(0xAAu32), "sel1=1,sel2=1 → a");
+    assert_eq!(m, BigUint::from(0u32));
+
+    // sel1=1, sel2=X → inner mux uncertain, result has X
+    sim.modify(|io: &mut IOContext| {
+        io.set_four_state(id_sel2, BigUint::from(0u32), BigUint::from(1u32));
+    })
+    .unwrap();
+    let (_, m) = sim.get_four_state(id_y);
+    assert_ne!(m, BigUint::from(0u32), "sel1=1,sel2=X → inner mux X propagates");
+
+    // sel1=0 → c regardless of sel2
+    sim.modify(|io: &mut IOContext| {
+        io.set_four_state(id_sel1, BigUint::from(0u32), BigUint::from(0u32));
+    })
+    .unwrap();
+    let (v, m) = sim.get_four_state(id_y);
+    assert_eq!(v, BigUint::from(0xCCu32), "sel1=0 → c regardless of sel2");
+    assert_eq!(m, BigUint::from(0u32));
+}
+
+// ==========================================================================
+// Shift: both data and amount have X
+// ==========================================================================
+#[test]
+fn test_four_state_shift_both_x() {
+    let code = r#"
+        module Top (
+            a: input logic<8>,
+            sh: input logic<8>,
+            y: output logic<8>
+        ) {
+            assign y = a >> sh;
+        }
+    "#;
+    let mut sim = SimulatorBuilder::new(code, "Top")
+        .four_state(true)
+        .build()
+        .unwrap();
+
+    let id_a = sim.signal("a");
+    let id_sh = sim.signal("sh");
+    let id_y = sim.signal("y");
+
+    // Both data and shift amount have X → all-X
+    sim.modify(|io: &mut IOContext| {
+        io.set_four_state(id_a, BigUint::from(0xFFu32), BigUint::from(0x0Fu32));
+        io.set_four_state(id_sh, BigUint::from(2u32), BigUint::from(1u32));
+    })
+    .unwrap();
+    let (v, m) = sim.get_four_state(id_y);
+    assert_eq!(m, BigUint::from(0xFFu32), "Shift with X in both data and amount → all-X");
+    assert_eq!(v, BigUint::from(0u32));
+}

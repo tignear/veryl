@@ -35,7 +35,7 @@
 | 定数シフト量 | [x] `test_four_state_shift_by_constant` | [x] 同左 | [x] `test_four_state_wide_signed` |
 | 変数シフト量 (確定) | [x] `test_four_state_wide_shifts` | [x] 同左 | [x] `test_four_state_sar_x_shift_amount` (確定ケース) |
 | シフト量に X | [x] `test_four_state_shift_by_x_amount` | [x] `test_four_state_wide_shifts` | [x] `test_four_state_sar_x_shift_amount` |
-| データと量の両方に X | [ ] | [ ] | [ ] |
+| データと量の両方に X | [x] `test_four_state_shift_both_x` | [x] 同左 | [ ] |
 
 ## 4. 比較演算 (Comparison)
 
@@ -56,12 +56,12 @@
 
 | 演算 | 単一幅 | ワイド |
 |------|--------|--------|
-| Bitwise NOT (`~`) | [x] `test_four_state_unary_ops` | [ ] |
-| Negation (`-`) | [x] `test_four_state_negation_with_x` | [ ] |
+| Bitwise NOT (`~`) | [x] `test_four_state_unary_ops` | [x] `test_four_state_wide_unary_not_with_x` |
+| Negation (`-`) | [x] `test_four_state_negation_with_x` | [x] `test_four_state_wide_negation_with_x` |
 | Logical NOT (`!`) | [x] `test_four_state_logical_not_with_x` | [ ] |
-| Reduction AND | [x] `test_four_state_unary_ops` (部分) | [ ] |
-| Reduction OR | [x] `test_four_state_unary_ops` (部分) | [ ] |
-| Reduction XOR | [x] `test_four_state_reduction_xor_with_x` | [ ] |
+| Reduction AND | [x] `test_four_state_unary_ops` (部分) | [x] `test_four_state_wide_reduction_with_x` |
+| Reduction OR | [x] `test_four_state_unary_ops` (部分) | [x] 同上 (※保守的実装) |
+| Reduction XOR | [x] `test_four_state_reduction_xor_with_x` | [x] 同上 |
 
 ## 6. 連結 (Concatenation)
 
@@ -80,8 +80,8 @@
 | X 条件 (1bit セレクタ) | [x] `test_four_state_mux_x_condition` |
 | 確定条件, X 分岐 | [x] `test_four_state_mux_x_in_branch` |
 | マルチビットセレクタ | [x] `test_four_state_multibit_mux_with_x` |
-| カスケード Mux | [ ] |
-| 両分岐とも X | [ ] |
+| カスケード Mux | [x] `test_four_state_cascaded_mux_with_x` |
+| 両分岐とも X | [x] `test_four_state_mux_both_branches_x` |
 
 ## 8. FF (フリップフロップ)
 
@@ -146,4 +146,5 @@
 
 ## 既知の問題
 
-- **`case` 文 + 4-state**: `case` 文の selector が確定値でも default に落ちる場合がある（4-state モードのみ）。`if/else` による比較は正常動作する。
+- **`case` 文 + 4-state**: `case` 文の selector が確定値でも default に落ちる場合がある（4-state モードのみ）。原因: `Op::EqWildcard` が `BinaryOp::Eq` にマッピングされ、4-state の保守的マスク計算で比較結果が X 扱いになる。`if/else` による比較は正常動作する。修正には `BinaryOp::EqWildcard` の新設が必要。
+- **ワイド Reduction OR の保守的実装**: IEEE 1800 では `|a` は確定 1 ビットが存在すれば結果は確定 1 だが、現実装はいずれかのチャンクに X があれば結果を X とする保守的動作。
