@@ -170,10 +170,13 @@ impl SIRTranslator {
 
             if self.options.four_state {
                 let val_m = cast_type(state.builder, dst_chunks_m[0], ty);
+                // IEEE 1800 normalization: v &= ~m
+                let not_m = state.builder.ins().bnot(val_m);
+                let safe_v = state.builder.ins().band(val_v, not_m);
                 state.regs.insert(
                     *dst,
                     TransValue::FourState {
-                        values: vec![val_v],
+                        values: vec![safe_v],
                         masks: vec![val_m],
                     },
                 );
@@ -181,10 +184,19 @@ impl SIRTranslator {
                 state.regs.insert(*dst, TransValue::TwoState(vec![val_v]));
             }
         } else if self.options.four_state {
+            // IEEE 1800 normalization: v &= ~m per chunk
+            let safe_chunks_v: Vec<Value> = dst_chunks_v
+                .iter()
+                .zip(dst_chunks_m.iter())
+                .map(|(&v, &m)| {
+                    let not_m = state.builder.ins().bnot(m);
+                    state.builder.ins().band(v, not_m)
+                })
+                .collect();
             state.regs.insert(
                 *dst,
                 TransValue::FourState {
-                    values: dst_chunks_v,
+                    values: safe_chunks_v,
                     masks: dst_chunks_m,
                 },
             );
@@ -516,10 +528,20 @@ impl SIRTranslator {
                     res_masks.push(state.builder.ins().iconst(types::I64, 0));
                 }
 
+                // IEEE 1800 normalization: v &= ~m per chunk
+                let safe_chunks: Vec<Value> = res_chunks
+                    .iter()
+                    .zip(res_masks.iter())
+                    .map(|(&v, &m)| {
+                        let not_m = state.builder.ins().bnot(m);
+                        state.builder.ins().band(v, not_m)
+                    })
+                    .collect();
+
                 state.regs.insert(
                     *dst,
                     TransValue::FourState {
-                        values: res_chunks,
+                        values: safe_chunks,
                         masks: res_masks,
                     },
                 );
@@ -699,10 +721,20 @@ impl SIRTranslator {
                     res_masks.push(state.builder.ins().iconst(types::I64, 0));
                 }
 
+                // IEEE 1800 normalization: v &= ~m per chunk
+                let safe_chunks: Vec<Value> = res_chunks
+                    .iter()
+                    .zip(res_masks.iter())
+                    .map(|(&v, &m)| {
+                        let not_m = state.builder.ins().bnot(m);
+                        state.builder.ins().band(v, not_m)
+                    })
+                    .collect();
+
                 state.regs.insert(
                     *dst,
                     TransValue::FourState {
-                        values: res_chunks,
+                        values: safe_chunks,
                         masks: res_masks,
                     },
                 );

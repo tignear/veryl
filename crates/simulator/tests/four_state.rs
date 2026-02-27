@@ -928,7 +928,9 @@ fn test_four_state_wide_shifts() {
     .unwrap();
 
     let (v_shr, m_shr) = sim.get_four_state(id_y_shr);
-    assert_eq!(v_shr, val_a);
+    // IEEE 1800 normalization: value bits at X positions are cleared (v &= ~m)
+    // Upper word val=0xAA is X (mask=0xFF), so normalized to 0; lower word 0x55 remains
+    assert_eq!(v_shr, BigUint::from(0x55u64));
     assert_eq!(m_shr, mask_a);
 
     // Case 2: Shift by 64 (entire word boundary)
@@ -937,7 +939,8 @@ fn test_four_state_wide_shifts() {
     })
     .unwrap();
     let (v_shr, m_shr) = sim.get_four_state(id_y_shr);
-    assert_eq!(v_shr, BigUint::from(0xAAu64));
+    // Upper word (val=0xAA, mask=0xFF) shifted to lower; after normalization: 0xAA & ~0xFF = 0
+    assert_eq!(v_shr, BigUint::from(0u64));
     assert_eq!(m_shr, BigUint::from(0xFFu64));
 
     // Case 3: Shift by amount with X -> Result should be all X
@@ -1088,8 +1091,10 @@ fn test_four_state_wide_concat_mixed() {
     .unwrap();
 
     let (v_c, m_c) = sim.get_four_state(id_y_concat);
-    let expected_v = (BigUint::from(0xAAu64) << 64) | BigUint::from(0x55u64);
     let expected_m = BigUint::from(0xFFu64) << 64;
+    // IEEE 1800 normalization: value bits at X positions are cleared (v &= ~m)
+    // a's val=0xAA with mask=0xFF → normalized val=0x00; concatenated with b=0x55
+    let expected_v = BigUint::from(0x55u64);
     assert_eq!(v_c, expected_v);
     assert_eq!(m_c, expected_m);
 }
