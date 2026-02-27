@@ -363,21 +363,10 @@ impl SIRTranslator {
                     }
                 };
 
-                let safe_res_v = match op {
-                    BinaryOp::And
-                    | BinaryOp::Or
-                    | BinaryOp::Xor
-                    | BinaryOp::Shl
-                    | BinaryOp::Shr
-                    | BinaryOp::Sar
-                    | BinaryOp::LogicAnd
-                    | BinaryOp::LogicOr => res_v,
-                    _ => {
-                        let zero = state.builder.ins().iconst(common_ty, 0);
-                        let is_all_x = state.builder.ins().icmp(IntCC::NotEqual, res_m, zero);
-                        state.builder.ins().select(is_all_x, zero, res_v)
-                    }
-                };
+                // IEEE 1800 normalization: value bits at X positions must be 0.
+                // v &= ~m is safe for all ops: Bit regs have mask=0 so v is unchanged.
+                let not_m = state.builder.ins().bnot(res_m);
+                let safe_res_v = state.builder.ins().band(res_v, not_m);
 
                 let final_res_v = cast_type(state.builder, safe_res_v, dst_ty);
                 let final_res_m = cast_type(state.builder, res_m, dst_ty);
@@ -624,10 +613,13 @@ impl SIRTranslator {
                     }
                 };
 
+                // IEEE 1800 normalization: v &= ~m
+                let not_m = state.builder.ins().bnot(res_m);
+                let safe_res_v = state.builder.ins().band(res_v, not_m);
                 let final_res_v = if common_ty.bits() > dst_ty.bits() {
-                    state.builder.ins().ireduce(dst_ty, res_v)
+                    state.builder.ins().ireduce(dst_ty, safe_res_v)
                 } else {
-                    res_v
+                    safe_res_v
                 };
                 let final_res_m = if common_ty.bits() > dst_ty.bits() {
                     state.builder.ins().ireduce(dst_ty, res_m)
