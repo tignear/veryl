@@ -1,5 +1,6 @@
 ---
 source: crates/simulator/tests/false_loop.rs
+assertion_line: 507
 expression: sir_output
 ---
 === Evaluation Flip-Flops (eval_apply_ffs) ===
@@ -21,7 +22,7 @@ Execution Unit 0:
     r6: logic<1>
     r7: bit<64>
     r8: logic<1>
-    r9: logic<1>
+    r9: bit<1>
     r10: logic<1>
     r11: bit<1>
     r12: bit<1>
@@ -29,7 +30,7 @@ Execution Unit 0:
     r14: logic<1>
     r15: bit<64>
     r16: logic<1>
-    r17: logic<1>
+    r17: bit<1>
     r18: logic<1>
     r19: bit<1>
     r20: bit<1>
@@ -37,7 +38,7 @@ Execution Unit 0:
     r22: logic<1>
     r23: bit<64>
     r24: logic<1>
-    r25: logic<1>
+    r25: bit<1>
     r26: logic<1>
     r27: bit<1>
     r28: bit<1>
@@ -45,7 +46,7 @@ Execution Unit 0:
     r30: logic<1>
     r31: bit<64>
     r32: logic<1>
-    r33: logic<1>
+    r33: bit<1>
     r34: logic<1>
     r35: bit<1>
     r36: bit<1>
@@ -53,7 +54,7 @@ Execution Unit 0:
     r38: logic<1>
     r39: bit<64>
     r40: logic<1>
-    r41: logic<1>
+    r41: bit<1>
     r42: logic<1>
     r43: bit<1>
     r44: bit<1>
@@ -61,7 +62,7 @@ Execution Unit 0:
     r46: logic<1>
     r47: bit<64>
     r48: logic<1>
-    r49: logic<1>
+    r49: bit<1>
     r50: logic<1>
     r51: bit<1>
     r52: bit<1>
@@ -69,7 +70,7 @@ Execution Unit 0:
     r54: logic<1>
     r55: bit<64>
     r56: logic<1>
-    r57: logic<1>
+    r57: bit<1>
     r58: logic<1>
     r59: bit<1>
     r60: bit<1>
@@ -77,7 +78,7 @@ Execution Unit 0:
     r62: logic<1>
     r63: bit<64>
     r64: logic<1>
-    r65: logic<1>
+    r65: bit<1>
     r66: logic<1>
     r67: bit<1>
     r68: bit<1>
@@ -85,7 +86,7 @@ Execution Unit 0:
     r70: logic<1>
     r71: bit<64>
     r72: logic<1>
-    r73: logic<1>
+    r73: bit<1>
     r74: logic<1>
     r75: bit<1>
     r76: bit<1>
@@ -93,7 +94,7 @@ Execution Unit 0:
     r78: logic<1>
     r79: bit<64>
     r80: logic<1>
-    r81: logic<1>
+    r81: bit<1>
     r82: logic<1>
     r83: bit<1>
     r84: bit<1>
@@ -101,7 +102,7 @@ Execution Unit 0:
     r86: logic<1>
     r87: bit<64>
     r88: logic<1>
-    r89: logic<1>
+    r89: bit<1>
     r90: logic<1>
     r91: bit<1>
     r92: bit<1>
@@ -109,7 +110,7 @@ Execution Unit 0:
     r94: logic<1>
     r95: bit<64>
     r96: logic<1>
-    r97: logic<1>
+    r97: bit<1>
     r98: logic<1>
     r99: bit<1>
     r100: bit<1>
@@ -117,7 +118,7 @@ Execution Unit 0:
     r102: logic<1>
     r103: bit<64>
     r104: logic<1>
-    r105: logic<1>
+    r105: bit<1>
     r106: logic<1>
     r107: bit<1>
     r108: bit<1>
@@ -125,7 +126,7 @@ Execution Unit 0:
     r110: logic<1>
     r111: bit<64>
     r112: logic<1>
-    r113: logic<1>
+    r113: bit<1>
     r114: logic<1>
     r115: bit<1>
     r116: bit<1>
@@ -133,7 +134,7 @@ Execution Unit 0:
     r118: logic<1>
     r119: bit<64>
     r120: logic<1>
-    r121: logic<1>
+    r121: bit<1>
     r122: logic<1>
     r123: bit<1>
     r124: bit<1>
@@ -141,7 +142,7 @@ Execution Unit 0:
     r126: logic<1>
     r127: bit<64>
     r128: logic<1>
-    r129: logic<1>
+    r129: bit<1>
     r130: logic<1>
     r131: bit<1>
     r132: bit<1>
@@ -149,13 +150,13 @@ Execution Unit 0:
     r134: logic<1>
     r135: bit<64>
     r136: logic<1>
-    r137: logic<1>
+    r137: bit<1>
     r138: logic<1>
     r139: bit<1>
     r140: bit<1>
     r141: bit<1>
     r142: logic<1>
-    r143: logic<19>
+    r143: bit<19>
     r144: bit<64>
     r145: logic<20>
     r146: logic<20>
@@ -166,11 +167,11 @@ Execution Unit 0:
     r151: logic<20>
     r152: bit<64>
     r153: logic<1>
-    r154: logic<1>
+    r154: bit<1>
     r155: logic<1>
     r156: bit<64>
     r157: logic<1>
-    r158: logic<1>
+    r158: bit<1>
     r159: logic<1>
     r160: bit<1>
     r161: bit<1>
@@ -178,7 +179,7 @@ Execution Unit 0:
     r163: logic<1>
     r164: bit<64>
     r165: logic<1>
-    r166: logic<1>
+    r166: bit<1>
     r167: logic<1>
     r168: bit<1>
     r169: bit<1>
@@ -186,7 +187,7 @@ Execution Unit 0:
     r171: logic<1>
     r172: bit<64>
     r173: logic<1>
-    r174: logic<1>
+    r174: bit<1>
     r175: logic<1>
     r176: bit<1>
     r177: bit<1>
@@ -195,7 +196,7 @@ Execution Unit 0:
     r180: logic<20>
     r181: bit<64>
     r182: logic<20>
-    r183: logic<20>
+    r183: bit<20>
     r184: logic<20>
     r185: logic<64>
     r186: logic<64>

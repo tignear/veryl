@@ -606,7 +606,7 @@ impl<'a> FfParser<'a> {
                     shifted_reg
                 } else {
                     let mask_val = (BigUint::from(1u64) << part_width) - BigUint::from(1u64);
-                    let mask_reg = ir_builder.alloc_logic(part_width);
+                    let mask_reg = ir_builder.alloc_bit(part_width, false);
                     ir_builder.emit(SIRInstruction::Imm(mask_reg, SIRValue::new(mask_val)));
 
                     let final_reg = ir_builder.alloc_logic(part_width);
@@ -700,7 +700,7 @@ impl<'a> FfParser<'a> {
         width: usize,
         ir_builder: &mut SIRBuilder<A>,
     ) {
-        let reg = ir_builder.alloc_logic(width);
+        let reg = ir_builder.alloc_bit(width, false);
 
         ir_builder.emit(SIRInstruction::Imm(reg, v));
         self.stack.push_back(reg);
@@ -822,7 +822,7 @@ impl<'a> FfParser<'a> {
             } else if src_width > target_width {
                 // Truncation
                 let mask_val = (BigUint::from(1u64) << target_width) - BigUint::from(1u64);
-                let mask_reg = ir_builder.alloc_logic(target_width);
+                let mask_reg = ir_builder.alloc_bit(target_width, false);
                 ir_builder.emit(SIRInstruction::Imm(mask_reg, SIRValue::new(mask_val)));
 
                 let trunc_reg = ir_builder.alloc_logic(target_width);
@@ -965,7 +965,7 @@ impl<'a> FfParser<'a> {
                 .expect("Invalid LHS for power operation");
 
             let result = if exp == 0 {
-                let one = ir_builder.alloc_logic(width);
+                let one = ir_builder.alloc_bit(width, false);
                 ir_builder.emit(SIRInstruction::Imm(one, SIRValue::new(1u32)));
                 one
             } else {
@@ -1312,7 +1312,7 @@ impl<'a> FfParser<'a> {
 
             if src_width > member_width {
                 let mask_val = (BigUint::from(1u64) << member_width) - BigUint::from(1u64);
-                let mask_reg = ir_builder.alloc_logic(member_width);
+                let mask_reg = ir_builder.alloc_bit(member_width, false);
                 ir_builder.emit(SIRInstruction::Imm(mask_reg, SIRValue::new(mask_val)));
 
                 let trunc_reg = ir_builder.alloc_logic(member_width);
@@ -1325,7 +1325,7 @@ impl<'a> FfParser<'a> {
                 reg = trunc_reg;
             } else if src_width < member_width {
                 let pad_width = member_width - src_width;
-                let zero_reg = ir_builder.alloc_logic(pad_width);
+                let zero_reg = ir_builder.alloc_bit(pad_width, false);
                 ir_builder.emit(SIRInstruction::Imm(zero_reg, SIRValue::new(0u32)));
                 reg = self
                     .emit_concat_registers(&[(zero_reg, pad_width), (reg, src_width)], ir_builder);

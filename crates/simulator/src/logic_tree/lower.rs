@@ -117,7 +117,7 @@ impl SLTToSIRLowerer {
             }
 
             SLTNode::Constant(val, width, _signed) => {
-                let reg = builder.alloc_logic(*width);
+                let reg = builder.alloc_bit(*width, false);
                 builder.emit(SIRInstruction::Imm(reg, SIRValue::new(val.clone())));
                 reg
             }
@@ -196,7 +196,7 @@ impl SLTToSIRLowerer {
 
         // 2. Clear upper bits: Apply a bitmask to ensure only the requested slice width remains.
         let mask_val = (BigUint::from(1u64) << width) - BigUint::from(1u64);
-        let mask_reg = builder.alloc_logic(width);
+        let mask_reg = builder.alloc_bit(width, false);
         builder.emit(SIRInstruction::Imm(mask_reg, SIRValue::new(mask_val)));
 
         let dest = builder.alloc_logic(width);
