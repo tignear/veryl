@@ -879,7 +879,7 @@ fn test_mixed_signed_unsigned_comparison() {
             }
         }
     "#;
-    let sim = Simulator::builder(code, "Top").build().unwrap();
+    let mut sim = Simulator::builder(code, "Top").build().unwrap();
     let o_const = sim.signal("o_const");
     let o_var = sim.signal("o_var");
     let o_signed_op = sim.signal("o_signed_op");

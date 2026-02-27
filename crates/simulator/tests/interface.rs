@@ -46,7 +46,7 @@ fn test_interface_connection() {
 
     // This is expected to panic or fail until interface support is implemented
     // Note: Simulator::new parses the code internally.
-    let sim = Simulator::builder(code, top).build().unwrap();
+    let mut sim = Simulator::builder(code, top).build().unwrap();
 
     // Run simulation
 

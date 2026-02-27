@@ -101,7 +101,7 @@ pub fn generate_project(ir: &Ir) -> proc_macro2::TokenStream {
                         
                         sim.modify(|io| io.set_wide(self.#port_ident, val_full)).unwrap();
                     }
-                    pub fn #getter_name(&self, sim: &veryl_simulator::Simulator, index: usize) -> #rust_type {
+                    pub fn #getter_name(&self, sim: &mut veryl_simulator::Simulator, index: usize) -> #rust_type {
                         let val_full = sim.get(self.#port_ident);
                         let element_width = #element_width;
                         let bit_offset = index * element_width;
@@ -112,7 +112,7 @@ pub fn generate_project(ir: &Ir) -> proc_macro2::TokenStream {
                 });
                 bound_methods.extend(quote! {
                     pub fn #setter_name(&mut self, index: usize, val: #rust_type) { self.ids.#setter_name(self.sim, index, val); }
-                    pub fn #getter_name(&self, index: usize) -> #rust_type { self.ids.#getter_name(self.sim, index) }
+                    pub fn #getter_name(&mut self, index: usize) -> #rust_type { self.ids.#getter_name(self.sim, index) }
                 });
                 io_methods.extend(quote! {
                     pub fn #setter_name(&mut self, _index: usize, _val: #rust_type) {
@@ -130,7 +130,7 @@ pub fn generate_project(ir: &Ir) -> proc_macro2::TokenStream {
                     pub fn #setter_name(&self, sim: &mut veryl_simulator::Simulator, val: #rust_type) {
                         #setter_body
                     }
-                    pub fn #getter_name(&self, sim: &veryl_simulator::Simulator) -> #rust_type {
+                    pub fn #getter_name(&self, sim: &mut veryl_simulator::Simulator) -> #rust_type {
                         let val = sim.get(self.#port_ident);
                         val.try_into().unwrap_or_else(|_| panic!("Value overflow for {}", #name))
                     }
@@ -138,7 +138,7 @@ pub fn generate_project(ir: &Ir) -> proc_macro2::TokenStream {
 
                 bound_methods.extend(quote! {
                     pub fn #setter_name(&mut self, val: #rust_type) { self.ids.#setter_name(self.sim, val); }
-                    pub fn #getter_name(&self) -> #rust_type { self.ids.#getter_name(self.sim) }
+                    pub fn #getter_name(&mut self) -> #rust_type { self.ids.#getter_name(self.sim) }
                 });
 
                 let io_setter_body = if width <= 128 {
@@ -160,7 +160,7 @@ pub fn generate_project(ir: &Ir) -> proc_macro2::TokenStream {
                     pub fn #setter_4state(&self, sim: &mut veryl_simulator::Simulator, val: #big_uint, mask: #big_uint) {
                         sim.modify(|io| io.set_four_state(self.#port_ident, val, mask)).unwrap();
                     }
-                    pub fn #getter_4state(&self, sim: &veryl_simulator::Simulator) -> (#big_uint, #big_uint) {
+                    pub fn #getter_4state(&self, sim: &mut veryl_simulator::Simulator) -> (#big_uint, #big_uint) {
                         sim.get_four_state(self.#port_ident)
                     }
                 });
@@ -169,7 +169,7 @@ pub fn generate_project(ir: &Ir) -> proc_macro2::TokenStream {
                     pub fn #setter_4state(&mut self, val: #big_uint, mask: #big_uint) {
                         self.ids.#setter_4state(self.sim, val, mask);
                     }
-                    pub fn #getter_4state(&self) -> (#big_uint, #big_uint) {
+                    pub fn #getter_4state(&mut self) -> (#big_uint, #big_uint) {
                         self.ids.#getter_4state(self.sim)
                     }
                 });
@@ -238,7 +238,7 @@ pub fn generate_project(ir: &Ir) -> proc_macro2::TokenStream {
                             val_full = (val_full & !mask) | (veryl_simulator::BigUint::from(val) << bit_offset);
                             sim.modify(|io| io.set_wide(self.#member_ident, val_full)).unwrap();
                         }
-                        pub fn #getter_name(&self, sim: &veryl_simulator::Simulator, index: usize) -> #rust_type {
+                        pub fn #getter_name(&self, sim: &mut veryl_simulator::Simulator, index: usize) -> #rust_type {
                             let val_full = sim.get(self.#member_ident);
                             let element_width = #element_width;
                             let bit_offset = index * element_width;
@@ -249,7 +249,7 @@ pub fn generate_project(ir: &Ir) -> proc_macro2::TokenStream {
                     });
                     if_bound_methods.extend(quote! {
                         pub fn #setter_name(&mut self, index: usize, val: #rust_type) { self.ids.#setter_name(self.sim, index, val); }
-                        pub fn #getter_name(&self, index: usize) -> #rust_type { self.ids.#getter_name(self.sim, index) }
+                        pub fn #getter_name(&mut self, index: usize) -> #rust_type { self.ids.#getter_name(self.sim, index) }
                     });
                     if_io_methods.extend(quote! {
                         pub fn #setter_name(&mut self, _index: usize, _val: #rust_type) { }
@@ -265,7 +265,7 @@ pub fn generate_project(ir: &Ir) -> proc_macro2::TokenStream {
                         pub fn #setter_name(&self, sim: &mut veryl_simulator::Simulator, val: #rust_type) {
                             #setter_body
                         }
-                        pub fn #getter_name(&self, sim: &veryl_simulator::Simulator) -> #rust_type {
+                        pub fn #getter_name(&self, sim: &mut veryl_simulator::Simulator) -> #rust_type {
                             let val = sim.get(self.#member_ident);
                             val.try_into().unwrap_or_else(|_| panic!("Value overflow for {}", #member_name))
                         }
@@ -273,7 +273,7 @@ pub fn generate_project(ir: &Ir) -> proc_macro2::TokenStream {
 
                     if_bound_methods.extend(quote! {
                         pub fn #setter_name(&mut self, val: #rust_type) { self.ids.#setter_name(self.sim, val); }
-                        pub fn #getter_name(&self) -> #rust_type { self.ids.#getter_name(self.sim) }
+                        pub fn #getter_name(&mut self) -> #rust_type { self.ids.#getter_name(self.sim) }
                     });
 
                     let io_setter_body = if width <= 128 {
@@ -295,7 +295,7 @@ pub fn generate_project(ir: &Ir) -> proc_macro2::TokenStream {
                         pub fn #setter_4state(&self, sim: &mut veryl_simulator::Simulator, val: #big_uint, mask: #big_uint) {
                             sim.modify(|io| io.set_four_state(self.#member_ident, val, mask)).unwrap();
                         }
-                        pub fn #getter_4state(&self, sim: &veryl_simulator::Simulator) -> (#big_uint, #big_uint) {
+                        pub fn #getter_4state(&self, sim: &mut veryl_simulator::Simulator) -> (#big_uint, #big_uint) {
                             sim.get_four_state(self.#member_ident)
                         }
                     });
@@ -304,7 +304,7 @@ pub fn generate_project(ir: &Ir) -> proc_macro2::TokenStream {
                         pub fn #setter_4state(&mut self, val: #big_uint, mask: #big_uint) {
                             self.ids.#setter_4state(self.sim, val, mask);
                         }
-                        pub fn #getter_4state(&self) -> (#big_uint, #big_uint) {
+                        pub fn #getter_4state(&mut self) -> (#big_uint, #big_uint) {
                             self.ids.#getter_4state(self.sim)
                         }
                     });

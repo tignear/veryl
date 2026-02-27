@@ -163,7 +163,7 @@ fn test_shift_constant_folding_wide() {
             assign o3 = 128'shc000_0000_0000_0000_0000_0000_0000_0000 >>> 1;
         }
     "#;
-    let sim = Simulator::builder(code, "Top").build().unwrap();
+    let mut sim = Simulator::builder(code, "Top").build().unwrap();
     let o = sim.signal("o");
     let o2 = sim.signal("o2");
     let o3 = sim.signal("o3");
@@ -200,7 +200,7 @@ fn test_shift_constant_folding_native() {
             assign o3 = 64'shc000_0000_0000_0000 >>> 1;
         }
     "#;
-    let sim = SimulatorBuilder::new(code, "Top")
+    let mut sim = SimulatorBuilder::new(code, "Top")
         .trace_analyzer_ir()
         .trace_on_build()
         .build_with_trace()

@@ -19,6 +19,7 @@ pub struct Simulator {
     pub(crate) backend: JitBackend,
     pub(crate) program: Program,
     pub(crate) vcd_writer: Option<crate::vcd::VcdWriter>,
+    pub(crate) dirty: bool,
 }
 
 impl std::fmt::Debug for Simulator {
@@ -37,11 +38,16 @@ impl Simulator {
             backend,
             program,
             vcd_writer: None,
+            dirty: false,
         }
     }
 
     /// Captures the current state of all signals and writes them to the VCD file.
     pub fn dump(&mut self, timestamp: u64) {
+        if self.dirty {
+            self.backend.eval_comb().unwrap();
+            self.dirty = false;
+        }
         if let Some(ref mut writer) = self.vcd_writer {
             let backend = &self.backend;
             writer
@@ -53,7 +59,7 @@ impl Simulator {
         }
     }
 
-    /// Modifies internal state via a callback and re-stabilizes combinational logic.
+    /// Modifies internal state via a callback and marks combinational logic as dirty.
     pub fn modify<F>(&mut self, f: F) -> Result<(), RuntimeErrorCode>
     where
         F: FnOnce(&mut IOContext),
@@ -62,15 +68,18 @@ impl Simulator {
             backend: &mut self.backend,
         };
         f(&mut ctx);
-        // Re-evaluate combinational logic to propagate the new state.
-        self.backend.eval_comb()?;
+        self.dirty = true;
         Ok(())
     }
 
     /// Manually triggers a clock or event to process sequential logic.
     pub fn tick(&mut self, event: EventRef) -> Result<(), RuntimeErrorCode> {
+        if self.dirty {
+            self.backend.eval_comb()?;
+        }
         self.backend.eval_ff_at(event)?;
         self.backend.eval_comb()?;
+        self.dirty = false;
         Ok(())
     }
 
@@ -88,18 +97,29 @@ impl Simulator {
     }
 
     /// Retrieves the current value of a variable using a pre-resolved [`SignalRef`] handle.
-    pub fn get(&self, signal: SignalRef) -> BigUint {
+    /// Lazily evaluates combinational logic if the state is dirty.
+    pub fn get(&mut self, signal: SignalRef) -> BigUint {
+        if self.dirty {
+            self.backend.eval_comb().unwrap();
+            self.dirty = false;
+        }
         self.backend.get(signal)
     }
 
     /// Retrieves the current 4-state value (value, mask) of a variable using a [`SignalRef`] handle.
-    pub fn get_four_state(&self, signal: SignalRef) -> (BigUint, BigUint) {
+    /// Lazily evaluates combinational logic if the state is dirty.
+    pub fn get_four_state(&mut self, signal: SignalRef) -> (BigUint, BigUint) {
+        if self.dirty {
+            self.backend.eval_comb().unwrap();
+            self.dirty = false;
+        }
         self.backend.get_four_state(signal)
     }
 
     /// Directly execute combinational logic evaluation.
     pub fn eval_comb(&mut self) -> Result<(), RuntimeErrorCode> {
         self.backend.eval_comb()?;
+        self.dirty = false;
         Ok(())
     }
 }

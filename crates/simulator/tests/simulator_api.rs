@@ -115,7 +115,7 @@ fn test_initial_state() {
             assign b = a;
         }
     "#;
-    let sim = Simulator::builder(code, "Top").build().unwrap();
+    let mut sim = Simulator::builder(code, "Top").build().unwrap();
     let b = sim.signal("b");
 
     // Initial value should be 0

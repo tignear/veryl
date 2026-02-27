@@ -117,7 +117,7 @@ fn test_concatenation_constant_self_determination() {
             assign o3 = {8'hf0, 8'hff + 8'h1};
         }
     "#;
-    let sim = SimulatorBuilder::new(code, "Top")
+    let mut sim = SimulatorBuilder::new(code, "Top")
         .trace_analyzer_ir()
         .trace_on_build()
         .build_with_trace()
@@ -179,7 +179,7 @@ fn test_shift_rhs_constant_self_determination() {
             assign o = 16'h1 << (8'hff + 8'h1);
         }
     "#;
-    let sim = Simulator::builder(code, "Top").build().unwrap();
+    let mut sim = Simulator::builder(code, "Top").build().unwrap();
     let o = sim.signal("o");
 
     assert_eq!(

@@ -22,7 +22,7 @@ fn test_context_determined_width_subtraction() {
     let res = result.res;
     let trace = result.trace;
 
-    let sim = res.expect("Build should succeed");
+    let mut sim = res.expect("Build should succeed");
     if let Some(air) = trace.analyzer_ir {
         println!("AIR:\n{}", air);
     }
@@ -67,7 +67,7 @@ fn test_unsized_constant_width_subtraction() {
     let res = result.res;
     let trace = result.trace;
 
-    let sim = res.expect("Build should succeed");
+    let mut sim = res.expect("Build should succeed");
 
     if let Some((blocks, arena)) = trace.flattened_comb_blocks {
         for path in blocks {
@@ -199,7 +199,7 @@ fn test_comparison_different_widths() {
         }
     "#;
     let sim = SimulatorBuilder::new(code, "Top").build();
-    let sim = sim.expect("Build should succeed");
+    let mut sim = sim.expect("Build should succeed");
     let o = sim.signal("o");
     assert_eq!(sim.get(o), 1u8.into(), "2'd3 == 3'd3 should be true");
 }
@@ -216,7 +216,7 @@ fn test_addition_different_widths() {
         }
     "#;
     let sim = SimulatorBuilder::new(code, "Top").build();
-    let sim = sim.expect("Build should succeed");
+    let mut sim = sim.expect("Build should succeed");
     let o = sim.signal("o");
     assert_eq!(sim.get(o), 7u8.into(), "2'd2 + 3'd5 should be 7");
 }
@@ -266,7 +266,7 @@ fn test_zero_extend() {
         }
     "#;
     let sim = SimulatorBuilder::new(code, "Top").build();
-    let sim = sim.expect("Build should succeed");
+    let mut sim = sim.expect("Build should succeed");
     let o = sim.signal("o");
     assert_eq!(sim.get(o), 1u8.into(), "2'd1 zero-extended to 4 bits");
 }
@@ -283,7 +283,7 @@ fn test_nested_width_propagation() {
         }
     "#;
     let sim = SimulatorBuilder::new(code, "Top").build();
-    let sim = sim.expect("Build should succeed");
+    let mut sim = sim.expect("Build should succeed");
     let o = sim.signal("o");
     assert_eq!(sim.get(o), 6u8.into(), "(1+2)*2 = 6, width propagation");
 }

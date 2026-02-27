@@ -152,7 +152,7 @@ impl Simulation {
     }
 
     /// Retrieves the current value of a variable using a pre-resolved [`SignalRef`] handle.
-    pub fn get(&self, signal: SignalRef) -> malachite_bigint::BigUint {
+    pub fn get(&mut self, signal: SignalRef) -> malachite_bigint::BigUint {
         self.simulator.get(signal)
     }
 
@@ -376,6 +376,7 @@ impl Simulation {
             }
         }
 
+        self.simulator.dirty = false;
         self.dump(current_time);
 
         Ok(Some(current_time))

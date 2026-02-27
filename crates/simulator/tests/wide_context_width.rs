@@ -144,7 +144,7 @@ fn test_wide_context_constant_folding() {
             }
         }
     "#;
-    let sim = Simulator::builder(code, "Top").build().unwrap();
+    let mut sim = Simulator::builder(code, "Top").build().unwrap();
     let o = sim.signal("o");
 
     let expected = BigUint::from(1u32) << 64;
@@ -227,7 +227,7 @@ fn test_wide_context_constant_folding_128bit() {
             }
         }
     "#;
-    let sim = Simulator::builder(code, "Top").build().unwrap();
+    let mut sim = Simulator::builder(code, "Top").build().unwrap();
     let o = sim.signal("o");
 
     let expected = BigUint::from(1u32) << 32;

@@ -58,10 +58,13 @@ fn test_true_loop_convergence_failure() {
     let id_a = sim.signal("a");
     // Initially a=0, so y=0 (stable)
     // Set a=1 to trigger oscillation
-    let res = sim.modify(|io| {
+    sim.modify(|io| {
         io.set(id_a, 1u8);
-    });
+    })
+    .unwrap();
 
+    // With lazy eval, oscillation is detected when eval_comb is explicitly called
+    let res = sim.eval_comb();
     assert!(res.is_err());
     assert_eq!(res.unwrap_err(), RuntimeErrorCode::DetectedTrueLoop);
 }
