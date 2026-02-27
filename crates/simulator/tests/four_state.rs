@@ -1099,5 +1099,618 @@ fn test_four_state_wide_concat_mixed() {
     assert_eq!(m_c, expected_m);
 }
 
+// ==========================================================================
+// P0: MUL / DIV / MOD + X (conservative all-X)
+// ==========================================================================
+#[test]
+fn test_four_state_mul_with_x() {
+    let code = r#"
+        module Top (
+            a: input logic<8>,
+            b: input logic<8>,
+            y_mul: output logic<8>
+        ) {
+            assign y_mul = a * b;
+        }
+    "#;
+    let mut sim = SimulatorBuilder::new(code, "Top")
+        .four_state(true)
+        .build()
+        .unwrap();
 
+    let id_a = sim.signal("a");
+    let id_b = sim.signal("b");
+    let id_y = sim.signal("y_mul");
 
+    // Both defined: 3 * 7 = 21
+    sim.modify(|io: &mut IOContext| {
+        io.set_four_state(id_a, BigUint::from(3u32), BigUint::from(0u32));
+        io.set_four_state(id_b, BigUint::from(7u32), BigUint::from(0u32));
+    })
+    .unwrap();
+    let (v, m) = sim.get_four_state(id_y);
+    assert_eq!(v, BigUint::from(21u32), "3 * 7 = 21");
+    assert_eq!(m, BigUint::from(0u32), "No X when both defined");
+
+    // One operand has X: result should be all-X
+    sim.modify(|io: &mut IOContext| {
+        io.set_four_state(id_b, BigUint::from(0u32), BigUint::from(1u32));
+    })
+    .unwrap();
+    let (v, m) = sim.get_four_state(id_y);
+    assert_eq!(m, BigUint::from(0xFFu32), "MUL with X should yield all-X mask");
+    assert_eq!(v, BigUint::from(0u32), "Value should be 0 after normalization");
+}
+
+#[test]
+fn test_four_state_div_with_x() {
+    let code = r#"
+        module Top (
+            a: input logic<8>,
+            b: input logic<8>,
+            y_div: output logic<8>
+        ) {
+            assign y_div = a / b;
+        }
+    "#;
+    let mut sim = SimulatorBuilder::new(code, "Top")
+        .four_state(true)
+        .build()
+        .unwrap();
+
+    let id_a = sim.signal("a");
+    let id_b = sim.signal("b");
+    let id_y = sim.signal("y_div");
+
+    // Both defined: 20 / 4 = 5
+    sim.modify(|io: &mut IOContext| {
+        io.set_four_state(id_a, BigUint::from(20u32), BigUint::from(0u32));
+        io.set_four_state(id_b, BigUint::from(4u32), BigUint::from(0u32));
+    })
+    .unwrap();
+    let (v, m) = sim.get_four_state(id_y);
+    assert_eq!(v, BigUint::from(5u32), "20 / 4 = 5");
+    assert_eq!(m, BigUint::from(0u32));
+
+    // Dividend has X: result all-X
+    sim.modify(|io: &mut IOContext| {
+        io.set_four_state(id_a, BigUint::from(0u32), BigUint::from(0x80u32));
+    })
+    .unwrap();
+    let (v, m) = sim.get_four_state(id_y);
+    assert_eq!(m, BigUint::from(0xFFu32), "DIV with X dividend should yield all-X");
+    assert_eq!(v, BigUint::from(0u32));
+}
+
+#[test]
+fn test_four_state_mod_with_x() {
+    let code = r#"
+        module Top (
+            a: input logic<8>,
+            b: input logic<8>,
+            y_mod: output logic<8>
+        ) {
+            assign y_mod = a % b;
+        }
+    "#;
+    let mut sim = SimulatorBuilder::new(code, "Top")
+        .four_state(true)
+        .build()
+        .unwrap();
+
+    let id_a = sim.signal("a");
+    let id_b = sim.signal("b");
+    let id_y = sim.signal("y_mod");
+
+    // Both defined: 17 % 5 = 2
+    sim.modify(|io: &mut IOContext| {
+        io.set_four_state(id_a, BigUint::from(17u32), BigUint::from(0u32));
+        io.set_four_state(id_b, BigUint::from(5u32), BigUint::from(0u32));
+    })
+    .unwrap();
+    let (v, m) = sim.get_four_state(id_y);
+    assert_eq!(v, BigUint::from(2u32), "17 % 5 = 2");
+    assert_eq!(m, BigUint::from(0u32));
+
+    // Divisor has X: result all-X
+    sim.modify(|io: &mut IOContext| {
+        io.set_four_state(id_b, BigUint::from(0u32), BigUint::from(1u32));
+    })
+    .unwrap();
+    let (v, m) = sim.get_four_state(id_y);
+    assert_eq!(m, BigUint::from(0xFFu32), "MOD with X divisor should yield all-X");
+    assert_eq!(v, BigUint::from(0u32));
+}
+
+// ==========================================================================
+// P0: Comparison operators with X (NE, GT, GE, LE + signed variants)
+// ==========================================================================
+#[test]
+fn test_four_state_ne_with_x() {
+    let code = r#"
+        module Top (
+            a: input logic<8>,
+            b: input logic<8>,
+            y_ne: output logic
+        ) {
+            assign y_ne = a != b;
+        }
+    "#;
+    let mut sim = SimulatorBuilder::new(code, "Top")
+        .four_state(true)
+        .build()
+        .unwrap();
+
+    let id_a = sim.signal("a");
+    let id_b = sim.signal("b");
+    let id_y = sim.signal("y_ne");
+
+    // Both defined: 10 != 20 → 1
+    sim.modify(|io: &mut IOContext| {
+        io.set_four_state(id_a, BigUint::from(10u32), BigUint::from(0u32));
+        io.set_four_state(id_b, BigUint::from(20u32), BigUint::from(0u32));
+    })
+    .unwrap();
+    let (v, m) = sim.get_four_state(id_y);
+    assert_eq!(v, BigUint::from(1u32), "10 != 20 should be true");
+    assert_eq!(m, BigUint::from(0u32));
+
+    // One has X → result X
+    sim.modify(|io: &mut IOContext| {
+        io.set_four_state(id_a, BigUint::from(0u32), BigUint::from(1u32));
+    })
+    .unwrap();
+    let (_, m) = sim.get_four_state(id_y);
+    assert_eq!(m, BigUint::from(1u32), "NE with X should yield X result");
+}
+
+#[test]
+fn test_four_state_gt_with_x() {
+    let code = r#"
+        module Top (
+            a: input logic<8>,
+            b: input logic<8>,
+            y_gt: output logic
+        ) {
+            assign y_gt = a >: b;
+        }
+    "#;
+    let mut sim = SimulatorBuilder::new(code, "Top")
+        .four_state(true)
+        .build()
+        .unwrap();
+
+    let id_a = sim.signal("a");
+    let id_b = sim.signal("b");
+    let id_y = sim.signal("y_gt");
+
+    // Both defined: 20 > 10 → 1
+    sim.modify(|io: &mut IOContext| {
+        io.set_four_state(id_a, BigUint::from(20u32), BigUint::from(0u32));
+        io.set_four_state(id_b, BigUint::from(10u32), BigUint::from(0u32));
+    })
+    .unwrap();
+    let (v, m) = sim.get_four_state(id_y);
+    assert_eq!(v, BigUint::from(1u32), "20 > 10 should be true");
+    assert_eq!(m, BigUint::from(0u32));
+
+    // One has X → result X
+    sim.modify(|io: &mut IOContext| {
+        io.set_four_state(id_b, BigUint::from(0u32), BigUint::from(1u32));
+    })
+    .unwrap();
+    let (_, m) = sim.get_four_state(id_y);
+    assert_eq!(m, BigUint::from(1u32), "GT with X should yield X result");
+}
+
+#[test]
+fn test_four_state_ge_le_with_x() {
+    let code = r#"
+        module Top (
+            a: input logic<8>,
+            b: input logic<8>,
+            y_ge: output logic,
+            y_le: output logic
+        ) {
+            assign y_ge = a >= b;
+            assign y_le = a <= b;
+        }
+    "#;
+    let mut sim = SimulatorBuilder::new(code, "Top")
+        .four_state(true)
+        .build()
+        .unwrap();
+
+    let id_a = sim.signal("a");
+    let id_b = sim.signal("b");
+    let id_y_ge = sim.signal("y_ge");
+    let id_y_le = sim.signal("y_le");
+
+    // Both defined and equal: GE=1, LE=1
+    sim.modify(|io: &mut IOContext| {
+        io.set_four_state(id_a, BigUint::from(10u32), BigUint::from(0u32));
+        io.set_four_state(id_b, BigUint::from(10u32), BigUint::from(0u32));
+    })
+    .unwrap();
+    let (v_ge, m_ge) = sim.get_four_state(id_y_ge);
+    let (v_le, m_le) = sim.get_four_state(id_y_le);
+    assert_eq!(v_ge, BigUint::from(1u32), "10 >= 10");
+    assert_eq!(m_ge, BigUint::from(0u32));
+    assert_eq!(v_le, BigUint::from(1u32), "10 <= 10");
+    assert_eq!(m_le, BigUint::from(0u32));
+
+    // One has X → both results X
+    sim.modify(|io: &mut IOContext| {
+        io.set_four_state(id_a, BigUint::from(0u32), BigUint::from(1u32));
+    })
+    .unwrap();
+    let (_, m_ge) = sim.get_four_state(id_y_ge);
+    let (_, m_le) = sim.get_four_state(id_y_le);
+    assert_eq!(m_ge, BigUint::from(1u32), "GE with X should yield X");
+    assert_eq!(m_le, BigUint::from(1u32), "LE with X should yield X");
+}
+
+#[test]
+fn test_four_state_signed_comparison_with_x() {
+    let code = r#"
+        module Top (
+            a: input signed logic<8>,
+            b: input signed logic<8>,
+            y_lt_s: output logic,
+            y_gt_s: output logic,
+            y_le_s: output logic,
+            y_ge_s: output logic
+        ) {
+            assign y_lt_s = a <: b;
+            assign y_gt_s = a >: b;
+            assign y_le_s = a <= b;
+            assign y_ge_s = a >= b;
+        }
+    "#;
+    let mut sim = SimulatorBuilder::new(code, "Top")
+        .four_state(true)
+        .build()
+        .unwrap();
+
+    let id_a = sim.signal("a");
+    let id_b = sim.signal("b");
+    let id_lt = sim.signal("y_lt_s");
+    let id_gt = sim.signal("y_gt_s");
+    let id_le = sim.signal("y_le_s");
+    let id_ge = sim.signal("y_ge_s");
+
+    // Both defined: a=-1 (0xFF), b=1 → signed: -1 < 1
+    sim.modify(|io: &mut IOContext| {
+        io.set_four_state(id_a, BigUint::from(0xFFu32), BigUint::from(0u32));
+        io.set_four_state(id_b, BigUint::from(1u32), BigUint::from(0u32));
+    })
+    .unwrap();
+    let (v_lt, m_lt) = sim.get_four_state(id_lt);
+    let (v_gt, m_gt) = sim.get_four_state(id_gt);
+    assert_eq!(v_lt, BigUint::from(1u32), "signed: -1 < 1 should be true");
+    assert_eq!(m_lt, BigUint::from(0u32));
+    assert_eq!(v_gt, BigUint::from(0u32), "signed: -1 > 1 should be false");
+    assert_eq!(m_gt, BigUint::from(0u32));
+
+    // One has X → all comparisons yield X
+    sim.modify(|io: &mut IOContext| {
+        io.set_four_state(id_a, BigUint::from(0u32), BigUint::from(1u32));
+    })
+    .unwrap();
+    let (_, m_lt) = sim.get_four_state(id_lt);
+    let (_, m_gt) = sim.get_four_state(id_gt);
+    let (_, m_le) = sim.get_four_state(id_le);
+    let (_, m_ge) = sim.get_four_state(id_ge);
+    assert_eq!(m_lt, BigUint::from(1u32), "Signed LT with X should yield X");
+    assert_eq!(m_gt, BigUint::from(1u32), "Signed GT with X should yield X");
+    assert_eq!(m_le, BigUint::from(1u32), "Signed LE with X should yield X");
+    assert_eq!(m_ge, BigUint::from(1u32), "Signed GE with X should yield X");
+}
+
+// ==========================================================================
+// P0: Reduction XOR + X
+// ==========================================================================
+#[test]
+fn test_four_state_reduction_xor_with_x() {
+    let code = r#"
+        module Top (
+            a: input logic<8>,
+            y_rxor: output logic
+        ) {
+            assign y_rxor = ^a;
+        }
+    "#;
+    let mut sim = SimulatorBuilder::new(code, "Top")
+        .four_state(true)
+        .build()
+        .unwrap();
+
+    let id_a = sim.signal("a");
+    let id_y = sim.signal("y_rxor");
+
+    // All defined: ^0xA5 = ^10100101 = 0 (even number of 1s)
+    sim.modify(|io: &mut IOContext| {
+        io.set_four_state(id_a, BigUint::from(0xA5u32), BigUint::from(0u32));
+    })
+    .unwrap();
+    let (v, m) = sim.get_four_state(id_y);
+    assert_eq!(m, BigUint::from(0u32), "No X when all bits defined");
+    assert_eq!(v, BigUint::from(0u32), "^0xA5 = 0 (even parity)");
+
+    // Any bit X → result X
+    sim.modify(|io: &mut IOContext| {
+        io.set_four_state(id_a, BigUint::from(0xA5u32), BigUint::from(1u32));
+    })
+    .unwrap();
+    let (_, m) = sim.get_four_state(id_y);
+    assert_eq!(m, BigUint::from(1u32), "Reduction XOR with any X bit should yield X");
+}
+
+// ==========================================================================
+// P0: 65-bit width (1→2 chunk boundary)
+// ==========================================================================
+#[test]
+fn test_four_state_65bit_boundary() {
+    let code = r#"
+        module Top (
+            a: input logic<65>,
+            b: input logic<65>,
+            y_and: output logic<65>,
+            y_add: output logic<65>
+        ) {
+            assign y_and = a & b;
+            assign y_add = a + b;
+        }
+    "#;
+    let mut sim = SimulatorBuilder::new(code, "Top")
+        .four_state(true)
+        .build()
+        .unwrap();
+
+    let id_a = sim.signal("a");
+    let id_b = sim.signal("b");
+    let id_y_and = sim.signal("y_and");
+    let id_y_add = sim.signal("y_add");
+
+    // Set a = value with bit 64 set, b = all defined
+    let val_a = BigUint::from(1u64) << 64 | BigUint::from(0xFFu64);
+    let mask_a: BigUint = BigUint::from(1u64) << 64; // only bit 64 is X
+    let val_b = BigUint::from(1u64) << 64 | BigUint::from(0x0Fu64);
+
+    sim.modify(|io: &mut IOContext| {
+        io.set_four_state(id_a, val_a, mask_a.clone());
+        io.set_four_state(id_b, val_b, BigUint::from(0u32));
+    })
+    .unwrap();
+
+    // AND: bit 64 of a is X, bit 64 of b is 1 → result bit 64 is X
+    // Lower bits: 0xFF & 0x0F = 0x0F (no X)
+    let (v_and, m_and) = sim.get_four_state(id_y_and);
+    assert_eq!(m_and, BigUint::from(1u64) << 64, "AND: X bit should propagate at bit 64");
+    assert_eq!(v_and, BigUint::from(0x0Fu64), "AND: lower bits 0xFF & 0x0F = 0x0F, bit64 normalized to 0");
+
+    // ADD: any X → all-X (conservative)
+    let (v_add, m_add) = sim.get_four_state(id_y_add);
+    let all_x_65 = (BigUint::from(1u64) << 65) - BigUint::from(1u64);
+    assert_eq!(m_add, all_x_65, "ADD with X should yield all-X mask for 65 bits");
+    assert_eq!(v_add, BigUint::from(0u32), "Value normalized to 0 when all-X");
+}
+
+// ==========================================================================
+// P1: Negation (-) + X
+// ==========================================================================
+#[test]
+fn test_four_state_negation_with_x() {
+    let code = r#"
+        module Top (
+            a: input logic<8>,
+            y_neg: output logic<8>
+        ) {
+            assign y_neg = -a;
+        }
+    "#;
+    let mut sim = SimulatorBuilder::new(code, "Top")
+        .four_state(true)
+        .build()
+        .unwrap();
+
+    let id_a = sim.signal("a");
+    let id_y = sim.signal("y_neg");
+
+    // Defined: -5 = 0xFB (8-bit two's complement)
+    sim.modify(|io: &mut IOContext| {
+        io.set_four_state(id_a, BigUint::from(5u32), BigUint::from(0u32));
+    })
+    .unwrap();
+    let (v, m) = sim.get_four_state(id_y);
+    assert_eq!(v, BigUint::from(0xFBu32), "-5 = 0xFB in 8-bit");
+    assert_eq!(m, BigUint::from(0u32));
+
+    // Any X → all-X (conservative for arithmetic)
+    sim.modify(|io: &mut IOContext| {
+        io.set_four_state(id_a, BigUint::from(0u32), BigUint::from(1u32));
+    })
+    .unwrap();
+    let (v, m) = sim.get_four_state(id_y);
+    assert_eq!(m, BigUint::from(0xFFu32), "Negation with X should yield all-X");
+    assert_eq!(v, BigUint::from(0u32));
+}
+
+// ==========================================================================
+// P1: Logical NOT (!) + X
+// ==========================================================================
+#[test]
+fn test_four_state_logical_not_with_x() {
+    let code = r#"
+        module Top (
+            a: input logic<8>,
+            y_lnot: output logic
+        ) {
+            assign y_lnot = !a;
+        }
+    "#;
+    let mut sim = SimulatorBuilder::new(code, "Top")
+        .four_state(true)
+        .build()
+        .unwrap();
+
+    let id_a = sim.signal("a");
+    let id_y = sim.signal("y_lnot");
+
+    // Defined nonzero: !0x0A = 0
+    sim.modify(|io: &mut IOContext| {
+        io.set_four_state(id_a, BigUint::from(0x0Au32), BigUint::from(0u32));
+    })
+    .unwrap();
+    let (v, m) = sim.get_four_state(id_y);
+    assert_eq!(v, BigUint::from(0u32), "!nonzero = 0");
+    assert_eq!(m, BigUint::from(0u32));
+
+    // Defined zero: !0 = 1
+    sim.modify(|io: &mut IOContext| {
+        io.set_four_state(id_a, BigUint::from(0u32), BigUint::from(0u32));
+    })
+    .unwrap();
+    let (v, m) = sim.get_four_state(id_y);
+    assert_eq!(v, BigUint::from(1u32), "!0 = 1");
+    assert_eq!(m, BigUint::from(0u32));
+
+    // X input → result X
+    sim.modify(|io: &mut IOContext| {
+        io.set_four_state(id_a, BigUint::from(0u32), BigUint::from(1u32));
+    })
+    .unwrap();
+    let (_, m) = sim.get_four_state(id_y);
+    assert_eq!(m, BigUint::from(1u32), "Logical NOT with X should yield X");
+}
+
+// ==========================================================================
+// P1: SAR + X shift amount
+// ==========================================================================
+#[test]
+fn test_four_state_sar_x_shift_amount() {
+    let code = r#"
+        module Top (
+            a: input signed logic<8>,
+            sh: input logic<8>,
+            y_sar: output signed logic<8>
+        ) {
+            assign y_sar = a >>> sh;
+        }
+    "#;
+    let mut sim = SimulatorBuilder::new(code, "Top")
+        .four_state(true)
+        .build()
+        .unwrap();
+
+    let id_a = sim.signal("a");
+    let id_sh = sim.signal("sh");
+    let id_y = sim.signal("y_sar");
+
+    // Defined: 0x80 (signed = -128) >>> 2 = 0xE0 (sign-extended)
+    sim.modify(|io: &mut IOContext| {
+        io.set_four_state(id_a, BigUint::from(0x80u32), BigUint::from(0u32));
+        io.set_four_state(id_sh, BigUint::from(2u32), BigUint::from(0u32));
+    })
+    .unwrap();
+    let (v, m) = sim.get_four_state(id_y);
+    assert_eq!(v, BigUint::from(0xE0u32), "0x80 >>> 2 = 0xE0 (sign extend)");
+    assert_eq!(m, BigUint::from(0u32));
+
+    // Shift amount has X → all-X
+    sim.modify(|io: &mut IOContext| {
+        io.set_four_state(id_sh, BigUint::from(0u32), BigUint::from(1u32));
+    })
+    .unwrap();
+    let (v, m) = sim.get_four_state(id_y);
+    assert_eq!(m, BigUint::from(0xFFu32), "SAR by X amount should yield all-X");
+    assert_eq!(v, BigUint::from(0u32));
+}
+
+// ==========================================================================
+// P1: 3+ element concatenation with X
+// ==========================================================================
+#[test]
+fn test_four_state_concat_three_elements() {
+    let code = r#"
+        module Top (
+            a: input logic<4>,
+            b: input logic<4>,
+            c: input logic<4>,
+            y: output logic<12>
+        ) {
+            assign y = {a, b, c};
+        }
+    "#;
+    let mut sim = SimulatorBuilder::new(code, "Top")
+        .four_state(true)
+        .build()
+        .unwrap();
+
+    let id_a = sim.signal("a");
+    let id_b = sim.signal("b");
+    let id_c = sim.signal("c");
+    let id_y = sim.signal("y");
+
+    // a=0xA (X on all bits), b=0x5 (defined), c=0x3 (defined)
+    sim.modify(|io: &mut IOContext| {
+        io.set_four_state(id_a, BigUint::from(0xAu32), BigUint::from(0xFu32)); // a: all X
+        io.set_four_state(id_b, BigUint::from(0x5u32), BigUint::from(0u32));   // b: defined
+        io.set_four_state(id_c, BigUint::from(0x3u32), BigUint::from(0u32));   // c: defined
+    })
+    .unwrap();
+
+    let (v, m) = sim.get_four_state(id_y);
+    // y = {a, b, c} = {XXXX, 0101, 0011} → mask = 0xF00, value = 0x053 (a normalized to 0)
+    assert_eq!(m, BigUint::from(0xF00u32), "Only high nibble should be X");
+    assert_eq!(v, BigUint::from(0x053u32), "Defined parts: b=5, c=3; a normalized to 0");
+}
+
+// ==========================================================================
+// P1: Wide comparison + X
+// ==========================================================================
+#[test]
+fn test_four_state_wide_comparison_with_x() {
+    let code = r#"
+        module Top (
+            a: input logic<128>,
+            b: input logic<128>,
+            y_eq: output logic,
+            y_lt: output logic
+        ) {
+            assign y_eq = a == b;
+            assign y_lt = a <: b;
+        }
+    "#;
+    let mut sim = SimulatorBuilder::new(code, "Top")
+        .four_state(true)
+        .build()
+        .unwrap();
+
+    let id_a = sim.signal("a");
+    let id_b = sim.signal("b");
+    let id_y_eq = sim.signal("y_eq");
+    let id_y_lt = sim.signal("y_lt");
+
+    // Both defined
+    let val: BigUint = (BigUint::from(0xAAu64) << 64) | BigUint::from(0x55u64);
+    sim.modify(|io: &mut IOContext| {
+        io.set_four_state(id_a, val.clone(), BigUint::from(0u32));
+        io.set_four_state(id_b, val.clone(), BigUint::from(0u32));
+    })
+    .unwrap();
+    let (v_eq, m_eq) = sim.get_four_state(id_y_eq);
+    assert_eq!(v_eq, BigUint::from(1u32), "Equal values should be EQ=1");
+    assert_eq!(m_eq, BigUint::from(0u32));
+
+    // Upper word of a has X → both comparisons X
+    let mask_a = BigUint::from(0xFFu64) << 64;
+    sim.modify(|io: &mut IOContext| {
+        io.set_four_state(id_a, val.clone(), mask_a);
+    })
+    .unwrap();
+    let (_, m_eq) = sim.get_four_state(id_y_eq);
+    let (_, m_lt) = sim.get_four_state(id_y_lt);
+    assert_eq!(m_eq, BigUint::from(1u32), "Wide EQ with X should yield X");
+    assert_eq!(m_lt, BigUint::from(1u32), "Wide LT with X should yield X");
+}

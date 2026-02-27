@@ -24,44 +24,44 @@
 |------|--------|--------|------|
 | ADD  | [x] `test_four_state_arithmetic_ops` | [x] `test_four_state_wide_arith` | |
 | SUB  | [x] `test_four_state_arithmetic_ops` | [x] `test_four_state_wide_arith` | |
-| MUL  | [ ] | [ ] | 保守的 all-X を期待 |
-| DIV  | [ ] | [ ] | 保守的 all-X を期待 |
-| MOD  | [ ] | [ ] | 保守的 all-X を期待 |
+| MUL  | [x] `test_four_state_mul_with_x` | [ ] | 保守的 all-X |
+| DIV  | [x] `test_four_state_div_with_x` | [ ] | 保守的 all-X |
+| MOD  | [x] `test_four_state_mod_with_x` | [ ] | 保守的 all-X |
 
 ## 3. シフト演算 (Shift)
 
 | 条件 | SHL | SHR | SAR |
 |------|-----|-----|-----|
 | 定数シフト量 | [x] `test_four_state_shift_by_constant` | [x] 同左 | [x] `test_four_state_wide_signed` |
-| 変数シフト量 (確定) | [x] `test_four_state_wide_shifts` | [x] 同左 | [ ] |
-| シフト量に X | [x] `test_four_state_shift_by_x_amount` | [x] `test_four_state_wide_shifts` | [ ] |
+| 変数シフト量 (確定) | [x] `test_four_state_wide_shifts` | [x] 同左 | [x] `test_four_state_sar_x_shift_amount` (確定ケース) |
+| シフト量に X | [x] `test_four_state_shift_by_x_amount` | [x] `test_four_state_wide_shifts` | [x] `test_four_state_sar_x_shift_amount` |
 | データと量の両方に X | [ ] | [ ] | [ ] |
 
 ## 4. 比較演算 (Comparison)
 
 | 演算 | 単一幅 | ワイド | 備考 |
 |------|--------|--------|------|
-| EQ (`==`) | [x] `test_four_state_comparison_with_x` | [ ] | |
-| NE (`!=`) | [ ] | [ ] | |
-| LT (`<` unsigned) | [x] `test_four_state_comparison_with_x` | [ ] | |
-| GT (`>` unsigned) | [ ] | [ ] | |
-| LE (`<=` unsigned) | [ ] | [ ] | |
-| GE (`>=` unsigned) | [ ] | [ ] | |
-| LT (`<` signed) | [ ] | [ ] | |
-| GT (`>` signed) | [ ] | [ ] | |
-| LE (`<=` signed) | [ ] | [ ] | |
-| GE (`>=` signed) | [ ] | [ ] | |
+| EQ (`==`) | [x] `test_four_state_comparison_with_x` | [x] `test_four_state_wide_comparison_with_x` | |
+| NE (`!=`) | [x] `test_four_state_ne_with_x` | [ ] | |
+| LT (`<` unsigned) | [x] `test_four_state_comparison_with_x` | [x] `test_four_state_wide_comparison_with_x` | |
+| GT (`>` unsigned) | [x] `test_four_state_gt_with_x` | [ ] | |
+| LE (`<=` unsigned) | [x] `test_four_state_ge_le_with_x` | [ ] | |
+| GE (`>=` unsigned) | [x] `test_four_state_ge_le_with_x` | [ ] | |
+| LT (`<` signed) | [x] `test_four_state_signed_comparison_with_x` | [ ] | `signed logic<8>` |
+| GT (`>` signed) | [x] `test_four_state_signed_comparison_with_x` | [ ] | |
+| LE (`<=` signed) | [x] `test_four_state_signed_comparison_with_x` | [ ] | |
+| GE (`>=` signed) | [x] `test_four_state_signed_comparison_with_x` | [ ] | |
 
 ## 5. 単項演算 (Unary)
 
 | 演算 | 単一幅 | ワイド |
 |------|--------|--------|
 | Bitwise NOT (`~`) | [x] `test_four_state_unary_ops` | [ ] |
-| Negation (`-`) | [ ] | [ ] |
-| Logical NOT (`!`) | [ ] | [ ] |
+| Negation (`-`) | [x] `test_four_state_negation_with_x` | [ ] |
+| Logical NOT (`!`) | [x] `test_four_state_logical_not_with_x` | [ ] |
 | Reduction AND | [x] `test_four_state_unary_ops` (部分) | [ ] |
 | Reduction OR | [x] `test_four_state_unary_ops` (部分) | [ ] |
-| Reduction XOR | [ ] | [ ] |
+| Reduction XOR | [x] `test_four_state_reduction_xor_with_x` | [ ] |
 
 ## 6. 連結 (Concatenation)
 
@@ -69,7 +69,7 @@
 |----------|-----------|
 | 2要素 (同幅) | [x] `test_four_state_concat` |
 | 2要素 (ワイド混合) | [x] `test_four_state_wide_concat_mixed` |
-| 3要素以上 | [ ] |
+| 3要素以上 | [x] `test_four_state_concat_three_elements` |
 | 奇数幅 (例: 3bit + 5bit) | [ ] |
 | チャンク境界をまたぐ X | [ ] |
 
@@ -109,7 +109,7 @@
 | 1bit | [x] 比較演算結果で暗黙カバー | |
 | 8bit | [x] 複数テスト | |
 | 64bit | [x] `test_four_state_wide_128bit_simple` | 1チャンク上限 |
-| 65bit | [ ] | 2チャンク下限、最も壊れやすい境界 |
+| 65bit | [x] `test_four_state_65bit_boundary` | 2チャンク下限 |
 | 127bit | [ ] | |
 | 128bit | [x] 複数ワイドテスト | |
 
@@ -126,17 +126,17 @@
 ## 優先度ガイド
 
 ### P0 — コアセマンティクスの検証
-- [ ] MUL / DIV / MOD + X （単一幅）
-- [ ] 比較演算の網羅 (NE, GT, GE, LE + 符号付き)
-- [ ] Reduction XOR + X
-- [ ] 65bit 幅テスト
+- [x] MUL / DIV / MOD + X （単一幅）
+- [x] 比較演算の網羅 (NE, GT, GE, LE + 符号付き)
+- [x] Reduction XOR + X
+- [x] 65bit 幅テスト
 
 ### P1 — よくある HDL パターン
-- [ ] Negation (`-`) + X
-- [ ] Logical NOT (`!`) + X
-- [ ] SAR + X シフト量
-- [ ] 3要素以上の連結
-- [ ] ワイド比較 + X
+- [x] Negation (`-`) + X
+- [x] Logical NOT (`!`) + X
+- [x] SAR + X シフト量
+- [x] 3要素以上の連結
+- [x] ワイド比較 + X
 
 ### P2 — エッジケースの堅牢性
 - [ ] マルチビットセレクタ Mux
