@@ -34,6 +34,7 @@ cranelift-native = "0.128.0"
 insta = "1.46"
 criterion = "0.5"
 proptest = "1.10"
+test-case = "3"
 
 [[bench]]
 name = "simulation"

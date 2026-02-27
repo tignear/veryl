@@ -1042,6 +1042,20 @@ impl<'a> FfParser<'a> {
         context_width: Option<usize>,
     ) -> Result<(), ParserError> {
         let width = self.get_expression_width(expr);
+        // Reduction and logical-not operators reduce a multi-bit operand to 1 bit.
+        // The operand must be evaluated at its own natural width, not the (narrower)
+        // context width of the result — otherwise the input gets truncated before
+        // the reduction is applied.
+        let operand_context = match op {
+            Op::BitAnd
+            | Op::BitOr
+            | Op::BitXor
+            | Op::BitNand
+            | Op::BitNor
+            | Op::BitXnor
+            | Op::LogicNot => None,
+            _ => context_width,
+        };
         self.parse_expression(
             expr,
             targets,
@@ -1049,7 +1063,7 @@ impl<'a> FfParser<'a> {
             convert,
             sources,
             ir_builder,
-            context_width,
+            operand_context,
         )?;
         self.op_unary(op, width, ir_builder);
         Ok(())
