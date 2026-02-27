@@ -1,5 +1,5 @@
 use test_case::test_case;
-use veryl_simulator::{BigUint, Simulator};
+use veryl_simulator::{BigUint, IOContext, Simulator};
 
 // ---------------------------------------------------------------------------
 // Helper: combinational binary operator  (assign o = a {op} b)
@@ -331,4 +331,349 @@ fn comb_reduction(op: &str, in_ty: &str, out_ty: &str, a: u64, exp: u64) {
 #[test_case("~^", "logic<8>", "logic", 0x03, 1 ; "ff red xnor even")]
 fn ff_reduction(op: &str, in_ty: &str, out_ty: &str, a: u64, exp: u64) {
     check_ff_unary(op, in_ty, out_ty, a, exp);
+}
+
+// ###################################################################
+// 4-state (X-propagation) tests
+// ###################################################################
+
+// ---------------------------------------------------------------------------
+// Helper: comb binary with 4-state inputs
+// ---------------------------------------------------------------------------
+fn check_comb_binary_4s(
+    op: &str,
+    in_type: &str,
+    out_type: &str,
+    a_val: u64,
+    a_mask: u64,
+    b_val: u64,
+    b_mask: u64,
+    exp_val: u64,
+    exp_mask: u64,
+) {
+    let code = format!(
+        r#"
+        module Top (a: input {in_type}, b: input {in_type}, o: output {out_type}) {{
+            assign o = a {op} b;
+        }}
+    "#
+    );
+    let mut sim = Simulator::builder(&code, "Top")
+        .four_state(true)
+        .build()
+        .unwrap();
+    let sig_a = sim.signal("a");
+    let sig_b = sim.signal("b");
+    let sig_o = sim.signal("o");
+
+    sim.modify(|io: &mut IOContext| {
+        io.set_four_state(sig_a, BigUint::from(a_val), BigUint::from(a_mask));
+        io.set_four_state(sig_b, BigUint::from(b_val), BigUint::from(b_mask));
+    })
+    .unwrap();
+
+    let (v, m) = sim.get_four_state(sig_o);
+    assert_eq!(m, BigUint::from(exp_mask), "4s comb {op}: mask mismatch");
+    assert_eq!(v, BigUint::from(exp_val), "4s comb {op}: value mismatch");
+}
+
+// ---------------------------------------------------------------------------
+// Helper: ff binary with 4-state inputs
+// ---------------------------------------------------------------------------
+fn check_ff_binary_4s(
+    op: &str,
+    in_type: &str,
+    out_type: &str,
+    a_val: u64,
+    a_mask: u64,
+    b_val: u64,
+    b_mask: u64,
+    exp_val: u64,
+    exp_mask: u64,
+) {
+    let code = format!(
+        r#"
+        module Top (clk: input clock, a: input {in_type}, b: input {in_type}, o: output {out_type}) {{
+            var r: {out_type};
+            always_ff (clk) {{
+                r = a {op} b;
+            }}
+            assign o = r;
+        }}
+    "#
+    );
+    let mut sim = Simulator::builder(&code, "Top")
+        .four_state(true)
+        .build()
+        .unwrap();
+    let clk = sim.event("clk");
+    let sig_a = sim.signal("a");
+    let sig_b = sim.signal("b");
+    let sig_o = sim.signal("o");
+
+    sim.modify(|io: &mut IOContext| {
+        io.set_four_state(sig_a, BigUint::from(a_val), BigUint::from(a_mask));
+        io.set_four_state(sig_b, BigUint::from(b_val), BigUint::from(b_mask));
+    })
+    .unwrap();
+    sim.tick(clk).unwrap();
+
+    let (v, m) = sim.get_four_state(sig_o);
+    assert_eq!(m, BigUint::from(exp_mask), "4s ff {op}: mask mismatch");
+    assert_eq!(v, BigUint::from(exp_val), "4s ff {op}: value mismatch");
+}
+
+// ---------------------------------------------------------------------------
+// Helper: comb unary with 4-state input
+// ---------------------------------------------------------------------------
+fn check_comb_unary_4s(
+    op: &str,
+    in_type: &str,
+    out_type: &str,
+    a_val: u64,
+    a_mask: u64,
+    exp_val: u64,
+    exp_mask: u64,
+) {
+    let code = format!(
+        r#"
+        module Top (a: input {in_type}, o: output {out_type}) {{
+            assign o = {op}a;
+        }}
+    "#
+    );
+    let mut sim = Simulator::builder(&code, "Top")
+        .four_state(true)
+        .build()
+        .unwrap();
+    let sig_a = sim.signal("a");
+    let sig_o = sim.signal("o");
+
+    sim.modify(|io: &mut IOContext| {
+        io.set_four_state(sig_a, BigUint::from(a_val), BigUint::from(a_mask));
+    })
+    .unwrap();
+
+    let (v, m) = sim.get_four_state(sig_o);
+    assert_eq!(m, BigUint::from(exp_mask), "4s comb {op}: mask mismatch");
+    assert_eq!(v, BigUint::from(exp_val), "4s comb {op}: value mismatch");
+}
+
+// ---------------------------------------------------------------------------
+// Helper: ff unary with 4-state input
+// ---------------------------------------------------------------------------
+fn check_ff_unary_4s(
+    op: &str,
+    in_type: &str,
+    out_type: &str,
+    a_val: u64,
+    a_mask: u64,
+    exp_val: u64,
+    exp_mask: u64,
+) {
+    let code = format!(
+        r#"
+        module Top (clk: input clock, a: input {in_type}, o: output {out_type}) {{
+            var r: {out_type};
+            always_ff (clk) {{
+                r = {op}a;
+            }}
+            assign o = r;
+        }}
+    "#
+    );
+    let mut sim = Simulator::builder(&code, "Top")
+        .four_state(true)
+        .build()
+        .unwrap();
+    let clk = sim.event("clk");
+    let sig_a = sim.signal("a");
+    let sig_o = sim.signal("o");
+
+    sim.modify(|io: &mut IOContext| {
+        io.set_four_state(sig_a, BigUint::from(a_val), BigUint::from(a_mask));
+    })
+    .unwrap();
+    sim.tick(clk).unwrap();
+
+    let (v, m) = sim.get_four_state(sig_o);
+    assert_eq!(m, BigUint::from(exp_mask), "4s ff {op}: mask mismatch");
+    assert_eq!(v, BigUint::from(exp_val), "4s ff {op}: value mismatch");
+}
+
+// ===================================================================
+// 4-state: Bitwise — comb
+// Masks: AND/OR per-bit precise, XOR = l_m|r_m, XNOR = l_m|r_m
+// ===================================================================
+
+//                  op   in_ty       out_ty      a_v   a_m   b_v   b_m   e_v   e_m
+#[test_case("&",  "logic<8>", "logic<8>", 0x00, 0x00, 0x00, 0xFF, 0x00, 0x00 ; "4s and 0 and X is 0")]
+#[test_case("&",  "logic<8>", "logic<8>", 0xFF, 0x00, 0x00, 0xFF, 0x00, 0xFF ; "4s and 1 and X is X")]
+#[test_case("&",  "logic<8>", "logic<8>", 0xFF, 0x00, 0xA5, 0x00, 0xA5, 0x00 ; "4s and defined")]
+#[test_case("|",  "logic<8>", "logic<8>", 0xFF, 0x00, 0x00, 0xFF, 0xFF, 0x00 ; "4s or 1 or X is 1")]
+#[test_case("|",  "logic<8>", "logic<8>", 0x00, 0x00, 0x00, 0xFF, 0x00, 0xFF ; "4s or 0 or X is X")]
+#[test_case("|",  "logic<8>", "logic<8>", 0xA5, 0x00, 0x5A, 0x00, 0xFF, 0x00 ; "4s or defined")]
+#[test_case("^",  "logic<8>", "logic<8>", 0x55, 0x00, 0x00, 0xFF, 0x55, 0xFF ; "4s xor with X")]
+#[test_case("^",  "logic<8>", "logic<8>", 0x55, 0x00, 0xAA, 0x00, 0xFF, 0x00 ; "4s xor defined")]
+#[test_case("~^", "logic<8>", "logic<8>", 0xF0, 0x00, 0x00, 0xFF, 0x0F, 0xFF ; "4s xnor with X")]
+#[test_case("~^", "logic<8>", "logic<8>", 0xF0, 0x00, 0xFF, 0x00, 0xF0, 0x00 ; "4s xnor defined")]
+fn comb_bitwise_4s(
+    op: &str,
+    in_ty: &str,
+    out_ty: &str,
+    a_v: u64,
+    a_m: u64,
+    b_v: u64,
+    b_m: u64,
+    e_v: u64,
+    e_m: u64,
+) {
+    check_comb_binary_4s(op, in_ty, out_ty, a_v, a_m, b_v, b_m, e_v, e_m);
+}
+
+// ===================================================================
+// 4-state: Arithmetic — comb  (any X → all X, value zeroed)
+// ===================================================================
+
+#[test_case("+",  "logic<8>", "logic<8>", 10, 0x00, 0, 0x01, 0x00, 0xFF ; "4s add X input")]
+#[test_case("+",  "logic<8>", "logic<8>", 10, 0x00, 5, 0x00, 15,   0x00 ; "4s add defined")]
+#[test_case("-",  "logic<8>", "logic<8>", 10, 0x00, 0, 0x01, 0x00, 0xFF ; "4s sub X input")]
+#[test_case("*",  "logic<8>", "logic<8>",  7, 0x00, 0, 0x01, 0x00, 0xFF ; "4s mul X input")]
+fn comb_arith_4s(
+    op: &str,
+    in_ty: &str,
+    out_ty: &str,
+    a_v: u64,
+    a_m: u64,
+    b_v: u64,
+    b_m: u64,
+    e_v: u64,
+    e_m: u64,
+) {
+    check_comb_binary_4s(op, in_ty, out_ty, a_v, a_m, b_v, b_m, e_v, e_m);
+}
+
+// ===================================================================
+// 4-state: Comparison — comb  (any X → result X)
+// ===================================================================
+
+#[test_case("==", "logic<8>", "logic", 42, 0x00, 0, 0x01, 0, 1 ; "4s eq X input")]
+#[test_case("<:", "logic<8>", "logic", 10, 0x00, 0, 0x01, 0, 1 ; "4s lt X input")]
+#[test_case("==", "logic<8>", "logic", 42, 0x00, 42, 0x00, 1, 0 ; "4s eq defined")]
+fn comb_compare_4s(
+    op: &str,
+    in_ty: &str,
+    out_ty: &str,
+    a_v: u64,
+    a_m: u64,
+    b_v: u64,
+    b_m: u64,
+    e_v: u64,
+    e_m: u64,
+) {
+    check_comb_binary_4s(op, in_ty, out_ty, a_v, a_m, b_v, b_m, e_v, e_m);
+}
+
+// ===================================================================
+// 4-state: Shift — comb  (X in amount → all X)
+// ===================================================================
+
+#[test_case("<<", "logic<8>", "logic<8>", 0x01, 0x00, 0, 0xFF, 0x00, 0xFF ; "4s shl X amount")]
+#[test_case(">>", "logic<8>", "logic<8>", 0xFF, 0x00, 0, 0xFF, 0x00, 0xFF ; "4s shr X amount")]
+fn comb_shift_4s(
+    op: &str,
+    in_ty: &str,
+    out_ty: &str,
+    a_v: u64,
+    a_m: u64,
+    b_v: u64,
+    b_m: u64,
+    e_v: u64,
+    e_m: u64,
+) {
+    check_comb_binary_4s(op, in_ty, out_ty, a_v, a_m, b_v, b_m, e_v, e_m);
+}
+
+// ===================================================================
+// 4-state: Unary — comb
+// BitNot: mask preserved, value bits flipped
+// Reduction / LogicNot: any X → all X (conservative)
+// ===================================================================
+
+#[test_case("~",  "logic<8>", "logic<8>", 0xA5, 0x0F, 0x5A, 0x0F ; "4s bitnot partial X")]
+#[test_case("~",  "logic<8>", "logic<8>", 0xFF, 0x00, 0x00, 0x00 ; "4s bitnot defined")]
+#[test_case("!",  "logic<8>", "logic",    0x55, 0x01, 0x00, 0x01 ; "4s lognot X input")]
+fn comb_unary_4s(
+    op: &str,
+    in_ty: &str,
+    out_ty: &str,
+    a_v: u64,
+    a_m: u64,
+    e_v: u64,
+    e_m: u64,
+) {
+    check_comb_unary_4s(op, in_ty, out_ty, a_v, a_m, e_v, e_m);
+}
+
+// ===================================================================
+// 4-state: Reduction — comb  (any X → all X conservative)
+// ===================================================================
+
+#[test_case("&",  "logic<8>", "logic", 0xFF, 0x01, 0x00, 0x01 ; "4s red and X")]
+#[test_case("&",  "logic<8>", "logic", 0xFF, 0x00, 0x01, 0x00 ; "4s red and defined")]
+#[test_case("|",  "logic<8>", "logic", 0x01, 0x02, 0x00, 0x01 ; "4s red or X")]
+#[test_case("^",  "logic<8>", "logic", 0x03, 0x01, 0x00, 0x01 ; "4s red xor X")]
+#[test_case("^",  "logic<8>", "logic", 0x03, 0x00, 0x00, 0x00 ; "4s red xor defined")]
+#[test_case("~&", "logic<8>", "logic", 0xFF, 0x01, 0x00, 0x01 ; "4s red nand X")]
+#[test_case("~|", "logic<8>", "logic", 0x00, 0x01, 0x00, 0x01 ; "4s red nor X")]
+#[test_case("~^", "logic<8>", "logic", 0x03, 0x01, 0x00, 0x01 ; "4s red xnor X")]
+#[test_case("~^", "logic<8>", "logic", 0x03, 0x00, 0x01, 0x00 ; "4s red xnor defined")]
+fn comb_reduction_4s(
+    op: &str,
+    in_ty: &str,
+    out_ty: &str,
+    a_v: u64,
+    a_m: u64,
+    e_v: u64,
+    e_m: u64,
+) {
+    check_comb_unary_4s(op, in_ty, out_ty, a_v, a_m, e_v, e_m);
+}
+
+// ===================================================================
+// 4-state: FF path (representative)
+// ===================================================================
+
+#[test_case("&",  "logic<8>", "logic<8>", 0x00, 0x00, 0x00, 0xFF, 0x00, 0x00 ; "4s ff and 0 X")]
+#[test_case("|",  "logic<8>", "logic<8>", 0xFF, 0x00, 0x00, 0xFF, 0xFF, 0x00 ; "4s ff or 1 X")]
+#[test_case("+",  "logic<8>", "logic<8>",   10, 0x00,    5, 0x00,   15, 0x00 ; "4s ff add defined")]
+#[test_case("+",  "logic<8>", "logic<8>",   10, 0x00,    0, 0x01, 0x00, 0xFF ; "4s ff add X")]
+fn ff_binary_4s(
+    op: &str,
+    in_ty: &str,
+    out_ty: &str,
+    a_v: u64,
+    a_m: u64,
+    b_v: u64,
+    b_m: u64,
+    e_v: u64,
+    e_m: u64,
+) {
+    check_ff_binary_4s(op, in_ty, out_ty, a_v, a_m, b_v, b_m, e_v, e_m);
+}
+
+#[test_case("~",  "logic<8>", "logic<8>", 0xA5, 0x0F, 0x5A, 0x0F ; "4s ff bitnot partial X")]
+#[test_case("^",  "logic<8>", "logic",    0x03, 0x01, 0x00, 0x01 ; "4s ff red xor X")]
+#[test_case("~^", "logic<8>", "logic",    0x03, 0x00, 0x01, 0x00 ; "4s ff red xnor defined")]
+#[test_case("~^", "logic<8>", "logic",    0x03, 0x01, 0x00, 0x01 ; "4s ff red xnor X")]
+fn ff_unary_4s(
+    op: &str,
+    in_ty: &str,
+    out_ty: &str,
+    a_v: u64,
+    a_m: u64,
+    e_v: u64,
+    e_m: u64,
+) {
+    check_ff_unary_4s(op, in_ty, out_ty, a_v, a_m, e_v, e_m);
 }
