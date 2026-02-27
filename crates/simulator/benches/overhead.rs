@@ -49,7 +49,7 @@ fn benchmark_simulation_overhead(c: &mut Criterion) {
 
     // Benchmark 2: Simulation::step
     {
-        let mut sim = Simulation::builder(CODE, "Top").build_simulation().unwrap();
+        let mut sim = Simulation::builder(CODE, "Top").build().unwrap();
         sim.add_clock("clk", 10, 10);
 
         // Reset

@@ -1,5 +1,5 @@
 use insta::assert_snapshot;
-use veryl_simulator::{BigUint, Simulator, SimulatorBuilder};
+use veryl_simulator::{BigUint, Simulation, Simulator, SimulatorBuilder};
 
 fn setup_and_trace(code: &str, top: &str) -> veryl_simulator::CompilationTrace {
     let result = SimulatorBuilder::new(code, top)
@@ -222,8 +222,8 @@ fn test_internal_generated_clock() {
             }
         }
     "#;
-    let mut simulation = SimulatorBuilder::new(code, "Top")
-        .build_simulation()
+    let mut simulation = Simulation::builder(code, "Top")
+        .build()
         .unwrap();
 
     let d = simulation.signal("d");

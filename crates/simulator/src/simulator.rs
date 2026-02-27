@@ -28,8 +28,8 @@ impl std::fmt::Debug for Simulator {
 }
 
 impl Simulator {
-    pub fn builder<'a>(code: &'a str, top: &'a str) -> SimulatorBuilder<'a> {
-        SimulatorBuilder::new(code, top)
+    pub fn builder<'a>(code: &'a str, top: &'a str) -> SimulatorBuilder<'a, Simulator> {
+        SimulatorBuilder::<Simulator>::new(code, top)
     }
 
     pub(crate) fn with_backend_and_program(backend: JitBackend, program: Program) -> Self {

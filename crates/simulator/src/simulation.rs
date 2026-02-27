@@ -35,8 +35,8 @@ impl std::fmt::Debug for Simulation {
 }
 
 impl Simulation {
-    pub fn builder<'a>(code: &'a str, top: &'a str) -> crate::SimulatorBuilder<'a> {
-        crate::SimulatorBuilder::new(code, top)
+    pub fn builder<'a>(code: &'a str, top: &'a str) -> crate::SimulatorBuilder<'a, Simulation> {
+        crate::SimulatorBuilder::<Simulation>::new(code, top)
     }
 
     pub(crate) fn new(simulator: Simulator) -> Self {

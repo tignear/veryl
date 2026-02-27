@@ -42,7 +42,7 @@ fn test_cascade_race_condition() {
         }
     "#;
 
-    let mut sim = Simulation::builder(code, "Top").build_simulation().unwrap();
+    let mut sim = Simulation::builder(code, "Top").build().unwrap();
     let cnt1_out = sim.signal("cnt1_out");
     let cnt2_out = sim.signal("cnt2_out");
 
@@ -134,7 +134,7 @@ fn test_sequential_cascade_race_condition() {
         }
     "#;
 
-    let mut sim = Simulation::builder(code, "Top").build_simulation().unwrap();
+    let mut sim = Simulation::builder(code, "Top").build().unwrap();
     let cnt_out = sim.signal("cnt_out");
 
     // Reset

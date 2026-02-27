@@ -20,7 +20,7 @@ fn test_simulation_step() {
         }
     "#;
 
-    let mut vsim = Simulation::builder(code, "Top").build_simulation().unwrap();
+    let mut vsim = Simulation::builder(code, "Top").build().unwrap();
     vsim.add_clock("clk", 10, 0); // period 10, delay 0
     let rst = vsim.signal("rst");
     let cnt = vsim.signal("cnt");
@@ -55,7 +55,7 @@ fn test_next_event_time() {
             always_ff (clk) {}
         }
     "#;
-    let mut vsim = Simulation::builder(code, "Top").build_simulation().unwrap();
+    let mut vsim = Simulation::builder(code, "Top").build().unwrap();
     vsim.add_clock("clk", 100, 0); // period 100, delay 0
 
     assert_eq!(vsim.next_event_time(), Some(0));

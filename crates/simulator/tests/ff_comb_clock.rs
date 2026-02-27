@@ -36,7 +36,7 @@ fn test_ff_comb_clock_cascade() {
         }
     "#;
 
-    let mut sim = Simulation::builder(code, "Top").build_simulation().unwrap();
+    let mut sim = Simulation::builder(code, "Top").build().unwrap();
     let cnt_out = sim.signal("cnt_out");
 
     let en = sim.signal("en");

@@ -107,8 +107,13 @@ impl Default for SimulatorOptions {
     }
 }
 
-/// A fluent builder for configuring and initializing a [`Simulator`].
-pub struct SimulatorBuilder<'a> {
+/// A fluent builder for configuring and initializing a [`Simulator`] or
+/// [`Simulation`](crate::Simulation).
+///
+/// Use [`Simulator::builder()`] or [`Simulation::builder()`](crate::Simulation::builder)
+/// to obtain the appropriate variant. Both share the same configuration methods;
+/// only `.build()` differs in return type.
+pub struct SimulatorBuilder<'a, Target = Simulator> {
     code: &'a str,
     top: &'a str,
     ignored_loops: Vec<(
@@ -122,20 +127,11 @@ pub struct SimulatorBuilder<'a> {
     )>,
     options: SimulatorOptions,
     vcd_path: Option<std::path::PathBuf>,
+    _marker: std::marker::PhantomData<Target>,
 }
 
-impl<'a> SimulatorBuilder<'a> {
-    pub fn new(code: &'a str, top: &'a str) -> Self {
-        Self {
-            code,
-            top,
-            ignored_loops: Vec::new(),
-            true_loops: Vec::new(),
-            options: SimulatorOptions::default(),
-            vcd_path: None,
-        }
-    }
-
+/// Configuration methods shared by all builder variants.
+impl<'a, Target> SimulatorBuilder<'a, Target> {
     /// Enable VCD dumping to the specified file.
     pub fn vcd<P: AsRef<std::path::Path>>(mut self, path: P) -> Self {
         self.vcd_path = Some(path.as_ref().to_path_buf());
@@ -245,9 +241,23 @@ impl<'a> SimulatorBuilder<'a> {
         self.true_loops.push((from, to, max_iter));
         self
     }
+}
+
+impl<'a> SimulatorBuilder<'a, Simulator> {
+    pub fn new(code: &'a str, top: &'a str) -> Self {
+        Self {
+            code,
+            top,
+            ignored_loops: Vec::new(),
+            true_loops: Vec::new(),
+            options: SimulatorOptions::default(),
+            vcd_path: None,
+            _marker: std::marker::PhantomData,
+        }
+    }
+
     /// Compiles the Veryl source and constructs the core logic simulator.
     pub fn build(self) -> Result<Simulator, SimulatorError> {
-        // Compile the Veryl IR into SIR (Simulator Intermediate Representation).
         let program = compile_to_sir(
             self.code,
             self.top,
@@ -259,7 +269,6 @@ impl<'a> SimulatorBuilder<'a> {
             None,
         )
         .map_err(SimulatorError::SIRParser)?;
-        // Initialize the JIT-compilation engine and compile simulation units.
         let backend = JitBackend::new(&program, &self.options, None)?;
 
         let mut sim = Simulator::with_backend_and_program(backend, program);
@@ -268,16 +277,8 @@ impl<'a> SimulatorBuilder<'a> {
                 .map_err(|_| SimulatorError::Runtime(crate::RuntimeErrorCode::InternalError))?;
             sim.vcd_writer = Some(vcd_writer);
         }
-        // Ensure initial stabilization of combinational logic.
         sim.modify(|_| {}).map_err(SimulatorError::Runtime)?;
         Ok(sim)
-    }
-
-    /// Compiles the Veryl source and constructs the timed simulation wrapper.
-    pub fn build_simulation(mut self) -> Result<crate::Simulation, SimulatorError> {
-        self.options.emit_triggers = true;
-        let sim = self.build()?;
-        Ok(crate::Simulation::new(sim))
     }
 
     /// Compiles the Veryl source and constructs the core logic simulator,
@@ -312,5 +313,45 @@ impl<'a> SimulatorBuilder<'a> {
             res: sim_res,
             trace,
         }
+    }
+}
+
+impl<'a> SimulatorBuilder<'a, crate::Simulation> {
+    pub(crate) fn new(code: &'a str, top: &'a str) -> Self {
+        Self {
+            code,
+            top,
+            ignored_loops: Vec::new(),
+            true_loops: Vec::new(),
+            options: SimulatorOptions::default(),
+            vcd_path: None,
+            _marker: std::marker::PhantomData,
+        }
+    }
+
+    /// Compiles the Veryl source and constructs the timed simulation wrapper.
+    pub fn build(mut self) -> Result<crate::Simulation, SimulatorError> {
+        self.options.emit_triggers = true;
+        let program = compile_to_sir(
+            self.code,
+            self.top,
+            &self.ignored_loops,
+            &self.true_loops,
+            self.options.four_state,
+            self.options.optimize,
+            &self.options.trace,
+            None,
+        )
+        .map_err(SimulatorError::SIRParser)?;
+        let backend = JitBackend::new(&program, &self.options, None)?;
+
+        let mut sim = Simulator::with_backend_and_program(backend, program);
+        if let Some(path) = self.vcd_path {
+            let vcd_writer = crate::vcd::VcdWriter::new(path, &sim.program)
+                .map_err(|_| SimulatorError::Runtime(crate::RuntimeErrorCode::InternalError))?;
+            sim.vcd_writer = Some(vcd_writer);
+        }
+        sim.modify(|_| {}).map_err(SimulatorError::Runtime)?;
+        Ok(crate::Simulation::new(sim))
     }
 }

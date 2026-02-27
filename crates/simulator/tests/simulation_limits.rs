@@ -29,7 +29,7 @@ fn test_can_clock_division() {
         }
     "#;
 
-    let mut vsim = Simulation::builder(code, "Top").build_simulation().unwrap();
+    let mut vsim = Simulation::builder(code, "Top").build().unwrap();
     vsim.add_clock("clk", 10, 0);
     let rst = vsim.signal("rst");
     let cnt = vsim.signal("cnt");
@@ -52,7 +52,7 @@ fn test_can_delay_clock() {
             always_ff (clk) {}
         }
     "#;
-    let mut vsim = Simulation::builder(code, "Top").build_simulation().unwrap();
+    let mut vsim = Simulation::builder(code, "Top").build().unwrap();
 
     // Clock with period 10, starting its first rising edge at t=5.
     vsim.add_clock("clk", 10, 5);
@@ -83,7 +83,7 @@ fn test_can_schedule_reset() {
             assign cnt = counter;
         }
     "#;
-    let mut vsim = Simulation::builder(code, "Top").build_simulation().unwrap();
+    let mut vsim = Simulation::builder(code, "Top").build().unwrap();
     vsim.add_clock("clk", 10, 5); // Posedge at 5, 15, 25...
 
     // Schedule reset high at t=0, low at t=20
@@ -112,7 +112,7 @@ fn test_cannot_schedule_non_event() {
             assign out_data = in_data;
         }
     "#;
-    let mut vsim = Simulation::builder(code, "Top").build_simulation().unwrap();
+    let mut vsim = Simulation::builder(code, "Top").build().unwrap();
 
     // "in_data" is not an event because it doesn't trigger any always_ff
     let res = vsim.schedule("in_data", 100, 1);
@@ -150,7 +150,7 @@ fn test_mixed_edge_triggering() {
         }
     "#;
 
-    let mut vsim = Simulation::builder(code, "Top").build_simulation().unwrap();
+    let mut vsim = Simulation::builder(code, "Top").build().unwrap();
 
     // clk: posedge at 5, 15, 25...
     vsim.add_clock("clk", 10, 5);
@@ -209,7 +209,7 @@ fn test_multiple_clocks() {
         }
     "#;
 
-    let mut vsim = Simulation::builder(code, "Top").build_simulation().unwrap();
+    let mut vsim = Simulation::builder(code, "Top").build().unwrap();
     vsim.add_clock("clk0", 10, 5); // 5, 15, 25, 35, 45...
     vsim.add_clock("clk1", 20, 5); // 5, 25, 45...
 
@@ -254,7 +254,7 @@ fn test_regular_reset() {
         }
     "#;
 
-    let mut vsim = Simulation::builder(code, "Top").build_simulation().unwrap();
+    let mut vsim = Simulation::builder(code, "Top").build().unwrap();
     vsim.add_clock("clk", 10, 5);
 
     let rst = vsim.signal("rst");

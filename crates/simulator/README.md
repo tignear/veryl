@@ -63,10 +63,10 @@ assert_eq!(sim.get(&b), 100u32.into());
 For scenarios requiring periodic clocks and automated progress, use the `Simulation` wrapper.
 
 ```rust
-use veryl_simulator::SimulatorBuilder;
+use veryl_simulator::Simulation;
 
-let mut sim = SimulatorBuilder::new(code, "Top")
-    .build_simulation()
+let mut sim = Simulation::builder(code, "Top")
+    .build()
     .unwrap();
 
 // Add a clock with period 10 and initial delay 0
@@ -102,7 +102,7 @@ A fluent builder for configuring your simulation environment.
 
 - `new(code: &str, top: &str) -> Self`: Start building.
 - `build(self) -> Result<Simulator, ...>`: Returns the core logic engine.
-- `build_simulation(self) -> Result<Simulation, ...>`: Returns the timed wrapper.
+- `Simulation::builder(code, top).build()`: Returns the timed wrapper.
 - `optimize(self, enable: bool) -> Self`: Toggle SIRT optimizations.
 
 ### `Simulator` (Logic Engine)
