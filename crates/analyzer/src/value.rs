@@ -3434,6 +3434,83 @@ mod tests {
     }
 
     #[test]
+    fn eq_wildcard_definite_mismatch_with_x() {
+        // When LHS has X bits but there's also a definite mismatch at non-X positions,
+        // the definite mismatch should dominate (result = 0), not produce X.
+        // IEEE 1800: ==? compares non-wildcard positions; definite mismatch → 0.
+        let op = Op::EqWildcard;
+        let mut cache = MaskCache::default();
+
+        // 8'hx3 ==? 8'h30: lower nibble definite mismatch (3 vs 0), upper nibble LHS is X
+        let a = Value::from_str("8'hx3").unwrap();
+        let b = Value::from_str("8'h30").unwrap();
+        let r = op.eval_binary(&a, &b, Some(16), false, &mut cache);
+        assert_eq!(format!("{:b}", r), "16'b0000000000000000");
+
+        // 8'hx5 ==? 8'h36: lower nibble definite mismatch (5 vs 6), upper nibble X vs defined
+        let a = Value::from_str("8'hx5").unwrap();
+        let b = Value::from_str("8'h36").unwrap();
+        let r = op.eval_binary(&a, &b, Some(16), false, &mut cache);
+        assert_eq!(format!("{:b}", r), "16'b0000000000000000");
+
+        // Wide: 68-bit with definite mismatch + X elsewhere
+        let a = Value::from_str("68'hxxxxxxxxxxxxxxxx3").unwrap();
+        let b = Value::from_str("68'h33333333333333330").unwrap();
+        let r = op.eval_binary(&a, &b, Some(68), false, &mut cache);
+        assert_eq!(format!("{:x}", r), "68'h00000000000000000");
+    }
+
+    #[test]
+    fn ne_wildcard_definite_mismatch_with_x() {
+        // When LHS has X bits but there's also a definite mismatch at non-X positions,
+        // the definite mismatch should dominate (result = 1 for !=?).
+        let op = Op::NeWildcard;
+        let mut cache = MaskCache::default();
+
+        // 8'hx3 !=? 8'h30: lower nibble definite mismatch → 1
+        let a = Value::from_str("8'hx3").unwrap();
+        let b = Value::from_str("8'h30").unwrap();
+        let r = op.eval_binary(&a, &b, Some(16), false, &mut cache);
+        assert_eq!(format!("{:b}", r), "16'b0000000000000001");
+
+        // Wide: 68-bit with definite mismatch + X elsewhere
+        let a = Value::from_str("68'hxxxxxxxxxxxxxxxx3").unwrap();
+        let b = Value::from_str("68'h33333333333333330").unwrap();
+        let r = op.eval_binary(&a, &b, Some(68), false, &mut cache);
+        assert_eq!(format!("{:x}", r), "68'h00000000000000001");
+    }
+
+    #[test]
+    fn reduction_or_dominant_one() {
+        // IEEE 1800 dominant-value: |a is definite 1 if any bit is definite 1
+        let op = Op::BitOr;
+        let mut cache = MaskCache::default();
+
+        let v = Value::from_str("8'h1x").unwrap();
+        let r = op.eval_unary(&v, Some(1), false, &mut cache);
+        assert_eq!(format!("{:b}", r), "1'b1");
+
+        let v = Value::from_str("128'h00000000000000011xxxxxxxxxxxxxxxx").unwrap();
+        let r = op.eval_unary(&v, Some(1), false, &mut cache);
+        assert_eq!(format!("{:b}", r), "1'b1");
+    }
+
+    #[test]
+    fn reduction_and_dominant_zero() {
+        // IEEE 1800 dominant-value: &a is definite 0 if any bit is definite 0
+        let op = Op::BitAnd;
+        let mut cache = MaskCache::default();
+
+        let v = Value::from_str("8'hex").unwrap();
+        let r = op.eval_unary(&v, Some(1), false, &mut cache);
+        assert_eq!(format!("{:b}", r), "1'b0");
+
+        let v = Value::from_str("128'hfffffffffffffffefxxxxxxxxxxxxxxxx").unwrap();
+        let r = op.eval_unary(&v, Some(1), false, &mut cache);
+        assert_eq!(format!("{:b}", r), "1'b0");
+    }
+
+    #[test]
     fn binary_greater() {
         //x = 8'h03  > 8'h01 ; $display("%b", x); // 0000000000000001
         //x = 8'hf1  > 8'h02 ; $display("%b", x); // 0000000000000001
