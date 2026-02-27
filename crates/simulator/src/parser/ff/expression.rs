@@ -369,8 +369,10 @@ impl<'a> FfParser<'a> {
                     BinaryOp::GeU
                 }
             }
-            Op::Eq | Op::EqWildcard => BinaryOp::Eq,
-            Op::Ne | Op::NeWildcard => BinaryOp::Ne,
+            Op::Eq => BinaryOp::Eq,
+            Op::EqWildcard => BinaryOp::EqWildcard,
+            Op::Ne => BinaryOp::Ne,
+            Op::NeWildcard => BinaryOp::NeWildcard,
             Op::LogicAnd => BinaryOp::LogicAnd,
             Op::LogicOr => BinaryOp::LogicOr,
             Op::LogicNot => {

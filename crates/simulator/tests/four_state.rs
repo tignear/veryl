@@ -2100,16 +2100,14 @@ fn test_four_state_wide_reduction_with_x() {
     })
     .unwrap();
 
-    // Reduction AND: some bits are X, no definite 0 → result X
+    // Reduction AND: upper word bits 72-127 are definite 0 → dominant-value = definite 0
     let (_, m_rand) = sim.get_four_state(id_rand);
-    assert_eq!(m_rand, BigUint::from(1u32), "Wide &a with X (no definite 0) should be X");
+    assert_eq!(m_rand, BigUint::from(0u32), "Wide &a with definite 0 bits should be defined (dominant-value)");
 
-    // Reduction OR: lower word has definite 1s
+    // Reduction OR: lower word has definite 1s → dominant-value = definite 1
     // IEEE 1800: |a = 1 if any bit is definite 1 (even if other bits are X)
-    // Current implementation: conservative — any X in any chunk → result X
-    // TODO: implement dominant-value optimization for wide reduction OR
     let (_, m_ror) = sim.get_four_state(id_ror);
-    assert_eq!(m_ror, BigUint::from(1u32), "Wide |a: current impl is conservative (X)");
+    assert_eq!(m_ror, BigUint::from(0u32), "Wide |a with definite 1 bits should be defined (dominant-value)");
 
     // Reduction XOR: any X bit → result X
     let (_, m_rxor) = sim.get_four_state(id_rxor);
@@ -2265,4 +2263,217 @@ fn test_four_state_shift_both_x() {
     let (v, m) = sim.get_four_state(id_y);
     assert_eq!(m, BigUint::from(0xFFu32), "Shift with X in both data and amount → all-X");
     assert_eq!(v, BigUint::from(0u32));
+}
+
+// ==========================================================================
+// Case statement with 4-state (EqWildcard)
+// ==========================================================================
+#[test]
+fn test_four_state_case_defined_selector() {
+    let code = r#"
+        module Top (
+            sel: input logic<2>,
+            y: output logic<8>
+        ) {
+            assign y = case sel {
+                2'd0: 8'd10,
+                2'd1: 8'd20,
+                2'd2: 8'd30,
+                default: 8'd99,
+            };
+        }
+    "#;
+    let mut sim = SimulatorBuilder::new(code, "Top")
+        .four_state(true)
+        .build()
+        .unwrap();
+
+    let id_sel = sim.signal("sel");
+    let id_y = sim.signal("y");
+
+    // sel = 1 (defined) → should match arm 1 and return 20
+    sim.modify(|io: &mut IOContext| {
+        io.set_four_state(id_sel, BigUint::from(1u32), BigUint::from(0u32));
+    })
+    .unwrap();
+    let (v, m) = sim.get_four_state(id_y);
+    assert_eq!(m, BigUint::from(0u32), "Defined selector should produce defined result");
+    assert_eq!(v, BigUint::from(20u32), "sel=1 should select value 20");
+}
+
+#[test]
+fn test_four_state_case_x_in_selector() {
+    let code = r#"
+        module Top (
+            sel: input logic<2>,
+            y: output logic<8>
+        ) {
+            assign y = case sel {
+                2'd0: 8'd10,
+                2'd1: 8'd20,
+                default: 8'd99,
+            };
+        }
+    "#;
+    let mut sim = SimulatorBuilder::new(code, "Top")
+        .four_state(true)
+        .build()
+        .unwrap();
+
+    let id_sel = sim.signal("sel");
+    let id_y = sim.signal("y");
+
+    // sel has X → EqWildcard comparison yields X → should hit default
+    sim.modify(|io: &mut IOContext| {
+        io.set_four_state(id_sel, BigUint::from(1u32), BigUint::from(1u32)); // bit 0 is X
+    })
+    .unwrap();
+    let (_, m) = sim.get_four_state(id_y);
+    // With X selector, the comparison results are X, so the mux selects conservatively
+    assert_ne!(
+        m,
+        BigUint::from(0u32),
+        "Case with X selector should produce X in output (conservative mux)"
+    );
+}
+
+// ==========================================================================
+// Reduction OR/AND dominant-value semantics
+// ==========================================================================
+#[test]
+fn test_four_state_reduction_or_dominant_one() {
+    let code = r#"
+        module Top (
+            a: input logic<8>,
+            y: output logic
+        ) {
+            assign y = |a;
+        }
+    "#;
+    let mut sim = SimulatorBuilder::new(code, "Top")
+        .four_state(true)
+        .build()
+        .unwrap();
+
+    let id_a = sim.signal("a");
+    let id_y = sim.signal("y");
+
+    // Value = 0x01, Mask = 0xF0 (upper nibble X, but bit 0 is definite 1)
+    // IEEE 1800: |a should be definite 1 when any bit is definite 1
+    sim.modify(|io: &mut IOContext| {
+        io.set_four_state(id_a, BigUint::from(0x01u32), BigUint::from(0xF0u32));
+    })
+    .unwrap();
+    let (v, m) = sim.get_four_state(id_y);
+    assert_eq!(m, BigUint::from(0u32), "Reduction OR with definite 1 should yield defined result");
+    assert_eq!(v, BigUint::from(1u32), "Reduction OR with definite 1 should yield 1");
+
+    // Value = 0x00, Mask = 0x0F (lower nibble X, upper nibble all 0)
+    // No definite 1 exists → result should be X
+    sim.modify(|io: &mut IOContext| {
+        io.set_four_state(id_a, BigUint::from(0x00u32), BigUint::from(0x0Fu32));
+    })
+    .unwrap();
+    let (_, m) = sim.get_four_state(id_y);
+    assert_eq!(m, BigUint::from(1u32), "Reduction OR with no definite 1 but X bits should yield X");
+}
+
+#[test]
+fn test_four_state_reduction_and_dominant_zero() {
+    let code = r#"
+        module Top (
+            a: input logic<8>,
+            y: output logic
+        ) {
+            assign y = &a;
+        }
+    "#;
+    let mut sim = SimulatorBuilder::new(code, "Top")
+        .four_state(true)
+        .build()
+        .unwrap();
+
+    let id_a = sim.signal("a");
+    let id_y = sim.signal("y");
+
+    // Value = 0xFE, Mask = 0xF0 (upper nibble X, but bit 0 is definite 0)
+    // IEEE 1800: &a should be definite 0 when any bit is definite 0
+    sim.modify(|io: &mut IOContext| {
+        io.set_four_state(id_a, BigUint::from(0x0Eu32), BigUint::from(0xF0u32));
+    })
+    .unwrap();
+    let (v, m) = sim.get_four_state(id_y);
+    assert_eq!(m, BigUint::from(0u32), "Reduction AND with definite 0 should yield defined result");
+    assert_eq!(v, BigUint::from(0u32), "Reduction AND with definite 0 should yield 0");
+
+    // Value = 0xF0, Mask = 0x0F (lower nibble X, upper nibble all 1)
+    // All defined bits are 1, but X bits exist → result should be X
+    sim.modify(|io: &mut IOContext| {
+        io.set_four_state(id_a, BigUint::from(0xF0u32), BigUint::from(0x0Fu32));
+    })
+    .unwrap();
+    let (_, m) = sim.get_four_state(id_y);
+    assert_eq!(m, BigUint::from(1u32), "Reduction AND with no definite 0 but X bits should yield X");
+}
+
+#[test]
+fn test_four_state_wide_reduction_or_dominant() {
+    let code = r#"
+        module Top (
+            a: input logic<128>,
+            y: output logic
+        ) {
+            assign y = |a;
+        }
+    "#;
+    let mut sim = SimulatorBuilder::new(code, "Top")
+        .four_state(true)
+        .build()
+        .unwrap();
+
+    let id_a = sim.signal("a");
+    let id_y = sim.signal("y");
+
+    // Lower 64-bit chunk has definite 1 (bit 0), upper chunk is all X
+    // |a should be definite 1 due to dominant-value
+    let val = BigUint::from(1u32); // bit 0 = 1
+    let mask = BigUint::from(0u32) | (BigUint::from(u64::MAX) << 64); // upper chunk all X
+    sim.modify(|io: &mut IOContext| {
+        io.set_four_state(id_a, val, mask);
+    })
+    .unwrap();
+    let (v, m) = sim.get_four_state(id_y);
+    assert_eq!(m, BigUint::from(0u32), "Wide reduction OR: definite 1 in any chunk → defined result");
+    assert_eq!(v, BigUint::from(1u32), "Wide reduction OR: definite 1 in any chunk → 1");
+}
+
+#[test]
+fn test_four_state_wide_reduction_and_dominant() {
+    let code = r#"
+        module Top (
+            a: input logic<128>,
+            y: output logic
+        ) {
+            assign y = &a;
+        }
+    "#;
+    let mut sim = SimulatorBuilder::new(code, "Top")
+        .four_state(true)
+        .build()
+        .unwrap();
+
+    let id_a = sim.signal("a");
+    let id_y = sim.signal("y");
+
+    // Lower 64-bit chunk has definite 0 (bit 0), upper chunk is all X
+    // &a should be definite 0 due to dominant-value
+    let val = BigUint::from(0xFFFFFFFFFFFFFFFEu64); // bit 0 = 0
+    let mask = BigUint::from(0u32) | (BigUint::from(u64::MAX) << 64); // upper chunk all X
+    sim.modify(|io: &mut IOContext| {
+        io.set_four_state(id_a, val, mask);
+    })
+    .unwrap();
+    let (v, m) = sim.get_four_state(id_y);
+    assert_eq!(m, BigUint::from(0u32), "Wide reduction AND: definite 0 in any chunk → defined result");
+    assert_eq!(v, BigUint::from(0u32), "Wide reduction AND: definite 0 in any chunk → 0");
 }

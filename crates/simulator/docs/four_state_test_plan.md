@@ -144,7 +144,7 @@
 - [x] FF 内条件分岐 + X
 - [x] 127bit / 奇数幅の連結
 
-## 既知の問題
+## 修正済みの問題
 
-- **`case` 文 + 4-state**: `case` 文の selector が確定値でも default に落ちる場合がある（4-state モードのみ）。原因: `Op::EqWildcard` が `BinaryOp::Eq` にマッピングされ、4-state の保守的マスク計算で比較結果が X 扱いになる。`if/else` による比較は正常動作する。修正には `BinaryOp::EqWildcard` の新設が必要。
-- **ワイド Reduction OR の保守的実装**: IEEE 1800 では `|a` は確定 1 ビットが存在すれば結果は確定 1 だが、現実装はいずれかのチャンクに X があれば結果を X とする保守的動作。
+- **`case` 文 + 4-state** (修正済み): `Op::EqWildcard` が `BinaryOp::Eq` にマッピングされていたため、4-state の保守的マスク計算で比較結果が X 扱いになっていた。`BinaryOp::EqWildcard` / `BinaryOp::NeWildcard` を新設し、IEEE 1800 のワイルドカードセマンティクスを実装。テスト: `test_four_state_case_defined_selector`, `test_four_state_case_x_in_selector`。
+- **Reduction OR/AND の保守的実装** (修正済み): IEEE 1800 の dominant-value セマンティクスを実装。`|a` は確定 1 ビットが存在すれば結果は確定 1、`&a` は確定 0 ビットが存在すれば結果は確定 0。テスト: `test_four_state_reduction_or_dominant_one`, `test_four_state_reduction_and_dominant_zero`, `test_four_state_wide_reduction_or_dominant`, `test_four_state_wide_reduction_and_dominant`。

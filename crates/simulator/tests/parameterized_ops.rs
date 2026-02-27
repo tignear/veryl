@@ -624,7 +624,8 @@ fn comb_unary_4s(
 
 #[test_case("&",  "logic<8>", "logic", 0xFF, 0x01, 0x00, 0x01 ; "4s red and X")]
 #[test_case("&",  "logic<8>", "logic", 0xFF, 0x00, 0x01, 0x00 ; "4s red and defined")]
-#[test_case("|",  "logic<8>", "logic", 0x01, 0x02, 0x00, 0x01 ; "4s red or X")]
+#[test_case("|",  "logic<8>", "logic", 0x01, 0x02, 0x01, 0x00 ; "4s red or dominant")]
+#[test_case("|",  "logic<8>", "logic", 0x00, 0x02, 0x00, 0x01 ; "4s red or X")]
 #[test_case("^",  "logic<8>", "logic", 0x03, 0x01, 0x00, 0x01 ; "4s red xor X")]
 #[test_case("^",  "logic<8>", "logic", 0x03, 0x00, 0x00, 0x00 ; "4s red xor defined")]
 #[test_case("~&", "logic<8>", "logic", 0xFF, 0x01, 0x00, 0x01 ; "4s red nand X")]

@@ -71,6 +71,11 @@ pub fn emit_wide_binary(
         BinaryOp::LogicAnd | BinaryOp::LogicOr => {
             unreachable!("LogicAnd/LogicOr must be handled by emit_wide_logic_andor")
         }
+
+        // EqWildcard/NeWildcard: value computation is same as Eq/Ne.
+        // Wildcard mask semantics are handled separately in arith.rs.
+        BinaryOp::EqWildcard => emit_wide_unsigned_cmp(builder, &BinaryOp::Eq, l_chunks, r_chunks, num_chunks),
+        BinaryOp::NeWildcard => emit_wide_unsigned_cmp(builder, &BinaryOp::Ne, l_chunks, r_chunks, num_chunks),
     }
 }
 

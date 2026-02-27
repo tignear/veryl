@@ -144,6 +144,8 @@ impl<A> SLTNode<A> {
                     crate::ir::BinaryOp::GeU | crate::ir::BinaryOp::GeS => ">=",
                     crate::ir::BinaryOp::LogicAnd => "&&",
                     crate::ir::BinaryOp::LogicOr => "||",
+                    crate::ir::BinaryOp::EqWildcard => "==?",
+                    crate::ir::BinaryOp::NeWildcard => "!=?",
                 };
                 write!(f, " {} ", op_str)?;
                 write!(f, "n{}:", rhs.0)?;
@@ -1929,8 +1931,10 @@ pub fn convert_binary_op(op: &Op, use_signed: bool) -> BinaryOp {
         Op::LogicShiftL | Op::ArithShiftL => BinaryOp::Shl,
         Op::LogicShiftR => BinaryOp::Shr,
         Op::ArithShiftR => BinaryOp::Sar,
-        Op::Eq | Op::EqWildcard => BinaryOp::Eq,
-        Op::Ne | Op::NeWildcard => BinaryOp::Ne,
+        Op::Eq => BinaryOp::Eq,
+        Op::EqWildcard => BinaryOp::EqWildcard,
+        Op::Ne => BinaryOp::Ne,
+        Op::NeWildcard => BinaryOp::NeWildcard,
         Op::Less => {
             if use_signed {
                 BinaryOp::LtS

@@ -576,6 +576,8 @@ pub enum BinaryOp {
     GeS, // Greater Equal
     LogicAnd,
     LogicOr,
+    EqWildcard,
+    NeWildcard,
 }
 
 impl fmt::Display for BinaryOp {
@@ -604,6 +606,8 @@ impl fmt::Display for BinaryOp {
             BinaryOp::GeS => "GeS",
             BinaryOp::LogicAnd => "LogicAnd",
             BinaryOp::LogicOr => "LogicOr",
+            BinaryOp::EqWildcard => "EqWildcard",
+            BinaryOp::NeWildcard => "NeWildcard",
         };
         write!(f, "{}", op_str)
     }
