@@ -22,3 +22,4 @@ veryl_testcase.*
 /crates/std/veryl/*.f
 /crates/std/veryl/target/
 .build/
+*.snap.new

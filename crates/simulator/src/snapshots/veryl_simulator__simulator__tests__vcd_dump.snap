@@ -1,0 +1,6 @@
+---
+source: crates/simulator/src/simulator.rs
+expression: bytes
+extension: vcd
+snapshot_kind: binary
+---

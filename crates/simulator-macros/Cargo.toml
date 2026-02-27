@@ -1,0 +1,27 @@
+[package]
+name = "veryl-simulator-macros"
+version = "0.18.0"
+authors.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+license.workspace = true
+readme.workspace = true
+description.workspace = true
+edition.workspace = true
+
+[lib]
+proc-macro = true
+
+[dependencies]
+proc-macro2 = "1.0"
+quote = "1.0"
+syn = { version = "2.0", features = ["full", "extra-traits"] }
+veryl-analyzer = { version = "0.18.0", path = "../analyzer" }
+veryl-metadata = { version = "0.18.0", path = "../metadata" }
+veryl-parser = { version = "0.18.0", path = "../parser" }
+malachite-bigint = "0.9.1"
+
+[dev-dependencies]
+prettyplease = "0.2.37"
+insta = "1.39.0"

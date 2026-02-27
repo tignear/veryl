@@ -8,11 +8,37 @@ categories.workspace  = true
 license.workspace     = true
 readme.workspace      = true
 description.workspace = true
-edition.workspace     = true
-
+edition.workspace = true
 [dependencies]
-toml           = {workspace = true}
-veryl-analyzer = {version = "0.18.0", path = "../analyzer"}
-veryl-metadata = {version = "0.18.0", path = "../metadata"}
-veryl-parser   = {version = "0.18.0", path = "../parser"}
-veryl-path     = {version = "0.18.0", path = "../path"}
+toml = { workspace = true }
+veryl-analyzer = { version = "0.18.0", path = "../analyzer" }
+veryl-metadata = { version = "0.18.0", path = "../metadata" }
+veryl-parser = { version = "0.18.0", path = "../parser" }
+veryl-path = { version = "0.18.0", path = "../path" }
+veryl-simulator-macros = { version = "0.18.0", path = "../simulator-macros" }
+fxhash = { workspace = true }
+thiserror = { workspace = true }
+clap = { workspace = true }
+miette = { workspace = true }
+malachite-bigint = "0.9.1"
+num-traits = { workspace = true }
+bit-set = { workspace = true }
+itertools = { workspace = true }
+chrono = "0.4"
+cranelift = "0.128.0"
+cranelift-module = "0.128.0"
+cranelift-jit = "0.128.0"
+cranelift-frontend = "0.128.0"
+cranelift-native = "0.128.0"
+[dev-dependencies]
+insta = "1.46"
+criterion = "0.5"
+proptest = "1.10"
+
+[[bench]]
+name = "simulation"
+harness = false
+
+[[bench]]
+name = "overhead"
+harness = false

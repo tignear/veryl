@@ -1,0 +1,9 @@
+target/
+.git/
+testcases/
+.build/
+.cargo/
+.devcontainer/
+**/*.exe
+**/*.pdb
+**/*.obj
