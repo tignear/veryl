@@ -25,3 +25,4 @@ veryl_testcase.*
 /crates/std/veryl/target/
 .build/
 *.snap.new
+.pnpm-store/
