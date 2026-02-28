@@ -2477,3 +2477,266 @@ fn test_four_state_wide_reduction_and_dominant() {
     assert_eq!(m, BigUint::from(0u32), "Wide reduction AND: definite 0 in any chunk → defined result");
     assert_eq!(v, BigUint::from(0u32), "Wide reduction AND: definite 0 in any chunk → 0");
 }
+
+// ==========================================================================
+// IEEE 1800 LogicAnd (&&) dominant-value: 0 && x = 0
+// ==========================================================================
+#[test]
+fn test_four_state_logic_and_dominant_zero() {
+    let code = r#"
+        module Top (
+            a: input logic<8>,
+            b: input logic<8>,
+            y: output logic
+        ) {
+            assign y = a && b;
+        }
+    "#;
+    let mut sim = SimulatorBuilder::new(code, "Top")
+        .four_state(true)
+        .build()
+        .unwrap();
+
+    let id_a = sim.signal("a");
+    let id_b = sim.signal("b");
+    let id_y = sim.signal("y");
+
+    // 0 && X = 0 (definite)
+    sim.modify(|io: &mut IOContext| {
+        io.set_four_state(id_a, BigUint::from(0u32), BigUint::from(0u32)); // definite 0
+        io.set_four_state(id_b, BigUint::from(0u32), BigUint::from(0xFFu32)); // all X
+    })
+    .unwrap();
+    let (v, m) = sim.get_four_state(id_y);
+    assert_eq!(m, BigUint::from(0u32), "0 && X should be definite (mask=0)");
+    assert_eq!(v, BigUint::from(0u32), "0 && X = 0");
+
+    // X && 0 = 0 (definite)
+    sim.modify(|io: &mut IOContext| {
+        io.set_four_state(id_a, BigUint::from(0u32), BigUint::from(0xFFu32)); // all X
+        io.set_four_state(id_b, BigUint::from(0u32), BigUint::from(0u32)); // definite 0
+    })
+    .unwrap();
+    let (v, m) = sim.get_four_state(id_y);
+    assert_eq!(m, BigUint::from(0u32), "X && 0 should be definite (mask=0)");
+    assert_eq!(v, BigUint::from(0u32), "X && 0 = 0");
+
+    // 1 && X = X
+    sim.modify(|io: &mut IOContext| {
+        io.set_four_state(id_a, BigUint::from(1u32), BigUint::from(0u32)); // definite 1
+        io.set_four_state(id_b, BigUint::from(0u32), BigUint::from(0xFFu32)); // all X
+    })
+    .unwrap();
+    let (_, m) = sim.get_four_state(id_y);
+    assert_ne!(m, BigUint::from(0u32), "1 && X should be X (mask!=0)");
+
+    // X && 1 = X
+    sim.modify(|io: &mut IOContext| {
+        io.set_four_state(id_a, BigUint::from(0u32), BigUint::from(0xFFu32)); // all X
+        io.set_four_state(id_b, BigUint::from(1u32), BigUint::from(0u32)); // definite 1
+    })
+    .unwrap();
+    let (_, m) = sim.get_four_state(id_y);
+    assert_ne!(m, BigUint::from(0u32), "X && 1 should be X (mask!=0)");
+
+    // 1 && 1 = 1 (definite)
+    sim.modify(|io: &mut IOContext| {
+        io.set_four_state(id_a, BigUint::from(1u32), BigUint::from(0u32));
+        io.set_four_state(id_b, BigUint::from(1u32), BigUint::from(0u32));
+    })
+    .unwrap();
+    let (v, m) = sim.get_four_state(id_y);
+    assert_eq!(m, BigUint::from(0u32), "1 && 1 should be definite");
+    assert_eq!(v, BigUint::from(1u32), "1 && 1 = 1");
+}
+
+// ==========================================================================
+// IEEE 1800 LogicOr (||) dominant-value: 1 || x = 1
+// ==========================================================================
+#[test]
+fn test_four_state_logic_or_dominant_one() {
+    let code = r#"
+        module Top (
+            a: input logic<8>,
+            b: input logic<8>,
+            y: output logic
+        ) {
+            assign y = a || b;
+        }
+    "#;
+    let mut sim = SimulatorBuilder::new(code, "Top")
+        .four_state(true)
+        .build()
+        .unwrap();
+
+    let id_a = sim.signal("a");
+    let id_b = sim.signal("b");
+    let id_y = sim.signal("y");
+
+    // 1 || X = 1 (definite)
+    sim.modify(|io: &mut IOContext| {
+        io.set_four_state(id_a, BigUint::from(1u32), BigUint::from(0u32)); // definite 1
+        io.set_four_state(id_b, BigUint::from(0u32), BigUint::from(0xFFu32)); // all X
+    })
+    .unwrap();
+    let (v, m) = sim.get_four_state(id_y);
+    assert_eq!(m, BigUint::from(0u32), "1 || X should be definite (mask=0)");
+    assert_eq!(v, BigUint::from(1u32), "1 || X = 1");
+
+    // X || 1 = 1 (definite)
+    sim.modify(|io: &mut IOContext| {
+        io.set_four_state(id_a, BigUint::from(0u32), BigUint::from(0xFFu32)); // all X
+        io.set_four_state(id_b, BigUint::from(1u32), BigUint::from(0u32)); // definite 1
+    })
+    .unwrap();
+    let (v, m) = sim.get_four_state(id_y);
+    assert_eq!(m, BigUint::from(0u32), "X || 1 should be definite (mask=0)");
+    assert_eq!(v, BigUint::from(1u32), "X || 1 = 1");
+
+    // 0 || X = X
+    sim.modify(|io: &mut IOContext| {
+        io.set_four_state(id_a, BigUint::from(0u32), BigUint::from(0u32)); // definite 0
+        io.set_four_state(id_b, BigUint::from(0u32), BigUint::from(0xFFu32)); // all X
+    })
+    .unwrap();
+    let (_, m) = sim.get_four_state(id_y);
+    assert_ne!(m, BigUint::from(0u32), "0 || X should be X (mask!=0)");
+
+    // X || 0 = X
+    sim.modify(|io: &mut IOContext| {
+        io.set_four_state(id_a, BigUint::from(0u32), BigUint::from(0xFFu32)); // all X
+        io.set_four_state(id_b, BigUint::from(0u32), BigUint::from(0u32)); // definite 0
+    })
+    .unwrap();
+    let (_, m) = sim.get_four_state(id_y);
+    assert_ne!(m, BigUint::from(0u32), "X || 0 should be X (mask!=0)");
+
+    // 0 || 0 = 0 (definite)
+    sim.modify(|io: &mut IOContext| {
+        io.set_four_state(id_a, BigUint::from(0u32), BigUint::from(0u32));
+        io.set_four_state(id_b, BigUint::from(0u32), BigUint::from(0u32));
+    })
+    .unwrap();
+    let (v, m) = sim.get_four_state(id_y);
+    assert_eq!(m, BigUint::from(0u32), "0 || 0 should be definite");
+    assert_eq!(v, BigUint::from(0u32), "0 || 0 = 0");
+}
+
+// ==========================================================================
+// IEEE 1800 EqWildcard (==?) with LHS value at wildcard positions
+// ==========================================================================
+#[test]
+fn test_four_state_eq_wildcard_value_at_wildcard_pos() {
+    // Test that LHS values at RHS wildcard (X) positions are correctly ignored
+    let code = r#"
+        module Top (
+            a: input logic<4>,
+            b: input logic<4>,
+            y: output logic
+        ) {
+            assign y = a ==? b;
+        }
+    "#;
+    let mut sim = SimulatorBuilder::new(code, "Top")
+        .four_state(true)
+        .build()
+        .unwrap();
+
+    let id_a = sim.signal("a");
+    let id_b = sim.signal("b");
+    let id_y = sim.signal("y");
+
+    // LHS = 4'b1110 (definite), RHS = 4'b1x1x (mask=0b0101)
+    // Non-wildcard positions (bits 1,3): LHS[1]=1=RHS[1], LHS[3]=1=RHS[3] → match
+    // IEEE 1800: ==? should return 1 (definite true)
+    sim.modify(|io: &mut IOContext| {
+        io.set_four_state(id_a, BigUint::from(0b1110u32), BigUint::from(0u32)); // definite
+        io.set_four_state(id_b, BigUint::from(0b1010u32), BigUint::from(0b0101u32)); // bits 0,2 are X
+    })
+    .unwrap();
+    let (v, m) = sim.get_four_state(id_y);
+    assert_eq!(m, BigUint::from(0u32), "==? with matching non-wildcard bits should be definite");
+    assert_eq!(v, BigUint::from(1u32), "==? with matching non-wildcard bits should be 1");
+
+    // LHS = 4'b1100 (definite), RHS = 4'b1x1x (mask=0b0101)
+    // Non-wildcard positions: bit 1: LHS[1]=0, RHS[1]=1 → mismatch
+    // IEEE 1800: ==? should return 0 (definite false)
+    sim.modify(|io: &mut IOContext| {
+        io.set_four_state(id_a, BigUint::from(0b1100u32), BigUint::from(0u32));
+        io.set_four_state(id_b, BigUint::from(0b1010u32), BigUint::from(0b0101u32));
+    })
+    .unwrap();
+    let (v, m) = sim.get_four_state(id_y);
+    assert_eq!(m, BigUint::from(0u32), "==? with definite mismatch should be definite");
+    assert_eq!(v, BigUint::from(0u32), "==? with mismatch at non-wildcard should be 0");
+
+    // LHS has X at non-wildcard position, no definite mismatch
+    // LHS = 4'bxx10, RHS = 4'b1x1x → compare at bits 1,3
+    // bit 1: LHS[1]=1 (definite), RHS[1]=1 → match
+    // bit 3: LHS[3]=X → unknown
+    // IEEE 1800: ==? should return X
+    sim.modify(|io: &mut IOContext| {
+        io.set_four_state(id_a, BigUint::from(0b0010u32), BigUint::from(0b1100u32)); // bits 2,3 = X
+        io.set_four_state(id_b, BigUint::from(0b1010u32), BigUint::from(0b0101u32)); // bits 0,2 = X
+    })
+    .unwrap();
+    let (_, m) = sim.get_four_state(id_y);
+    assert_ne!(m, BigUint::from(0u32), "==? with LHS X at non-wildcard should be X");
+
+    // Definite mismatch takes priority over LHS X elsewhere
+    // LHS = 4'bxx00, RHS = 4'b1x1x → compare at bits 1,3
+    // bit 1: LHS[1]=0, RHS[1]=1 → definite mismatch
+    // bit 3: LHS[3]=X → unknown, but mismatch already found
+    // IEEE 1800: ==? should return 0 (definite false)
+    sim.modify(|io: &mut IOContext| {
+        io.set_four_state(id_a, BigUint::from(0b0000u32), BigUint::from(0b1100u32)); // bits 2,3 = X
+        io.set_four_state(id_b, BigUint::from(0b1010u32), BigUint::from(0b0101u32)); // bits 0,2 = X
+    })
+    .unwrap();
+    let (v, m) = sim.get_four_state(id_y);
+    assert_eq!(m, BigUint::from(0u32), "==? with definite mismatch should be definite even with X elsewhere");
+    assert_eq!(v, BigUint::from(0u32), "==? with definite mismatch = 0");
+}
+
+#[test]
+fn test_four_state_ne_wildcard_value_at_wildcard_pos() {
+    let code = r#"
+        module Top (
+            a: input logic<4>,
+            b: input logic<4>,
+            y: output logic
+        ) {
+            assign y = a !=? b;
+        }
+    "#;
+    let mut sim = SimulatorBuilder::new(code, "Top")
+        .four_state(true)
+        .build()
+        .unwrap();
+
+    let id_a = sim.signal("a");
+    let id_b = sim.signal("b");
+    let id_y = sim.signal("y");
+
+    // LHS = 4'b1110 (definite), RHS = 4'b1x1x (mask=0b0101)
+    // All non-wildcard positions match → !=? should return 0 (definite false)
+    sim.modify(|io: &mut IOContext| {
+        io.set_four_state(id_a, BigUint::from(0b1110u32), BigUint::from(0u32));
+        io.set_four_state(id_b, BigUint::from(0b1010u32), BigUint::from(0b0101u32));
+    })
+    .unwrap();
+    let (v, m) = sim.get_four_state(id_y);
+    assert_eq!(m, BigUint::from(0u32), "!=? with all matching should be definite");
+    assert_eq!(v, BigUint::from(0u32), "!=? with all matching = 0");
+
+    // LHS = 4'b1100, RHS = 4'b1x1x → mismatch at bit 1
+    // !=? should return 1 (definite true)
+    sim.modify(|io: &mut IOContext| {
+        io.set_four_state(id_a, BigUint::from(0b1100u32), BigUint::from(0u32));
+        io.set_four_state(id_b, BigUint::from(0b1010u32), BigUint::from(0b0101u32));
+    })
+    .unwrap();
+    let (v, m) = sim.get_four_state(id_y);
+    assert_eq!(m, BigUint::from(0u32), "!=? with definite mismatch should be definite");
+    assert_eq!(v, BigUint::from(1u32), "!=? with mismatch = 1");
+}

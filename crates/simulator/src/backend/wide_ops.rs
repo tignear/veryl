@@ -294,7 +294,7 @@ pub(crate) fn emit_wide_shift(
     res
 }
 
-fn emit_wide_unsigned_cmp(
+pub(crate) fn emit_wide_unsigned_cmp(
     builder: &mut FunctionBuilder,
     op: &BinaryOp,
     l_chunks: &[Value],

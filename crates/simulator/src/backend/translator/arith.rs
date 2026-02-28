@@ -236,7 +236,7 @@ impl SIRTranslator {
                 builder.ins().select(b1_res, one, zero)
             };
 
-            let res_v = match op {
+            let mut res_v = match op {
                 BinaryOp::Add => state.builder.ins().iadd(l, r),
                 BinaryOp::Sub => state.builder.ins().isub(l, r),
                 BinaryOp::Mul => state.builder.ins().imul(l, r),
@@ -378,18 +378,113 @@ impl SIRTranslator {
                     }
                     BinaryOp::EqWildcard | BinaryOp::NeWildcard => {
                         // IEEE 1800 ==?/!=?: RHS X/Z bits are wildcards (don't care).
-                        // compare_mask = ~r_m (positions where RHS is defined)
-                        let compare_mask = state.builder.ins().bnot(r_m);
-                        // LHS X at compared positions
-                        let l_x_at_compared = state.builder.ins().band(l_m, compare_mask);
                         let zero = state.builder.ins().iconst(common_ty, 0);
-                        let has_x =
-                            state
-                                .builder
-                                .ins()
-                                .icmp(IntCC::NotEqual, l_x_at_compared, zero);
+                        let compare_mask = state.builder.ins().bnot(r_m);
+                        let l_definite = state.builder.ins().bnot(l_m);
+
+                        // Positions where both LHS is definite AND RHS is non-wildcard
+                        let definite_compare =
+                            state.builder.ins().band(compare_mask, l_definite);
+
+                        // Check for definite mismatch at those positions
+                        let l_xor_r = state.builder.ins().bxor(l, r);
+                        let mismatch_bits =
+                            state.builder.ins().band(l_xor_r, definite_compare);
+                        let has_definite_mismatch = state.builder.ins().icmp(
+                            IntCC::NotEqual,
+                            mismatch_bits,
+                            zero,
+                        );
+
+                        // LHS X at non-wildcard positions
+                        let x_at_compared = state.builder.ins().band(l_m, compare_mask);
+                        let has_x_at_compared = state.builder.ins().icmp(
+                            IntCC::NotEqual,
+                            x_at_compared,
+                            zero,
+                        );
+
+                        // Mask: definite mismatch → 0 (definite); X at compared → all-X; else → 0
                         let all_ones = state.builder.ins().iconst(common_ty, -1);
-                        state.builder.ins().select(has_x, all_ones, zero)
+                        let x_mask = state
+                            .builder
+                            .ins()
+                            .select(has_x_at_compared, all_ones, zero);
+                        let mask = state
+                            .builder
+                            .ins()
+                            .select(has_definite_mismatch, zero, x_mask);
+
+                        // Override value: compare only at definite non-wildcard positions
+                        let l_eff = state.builder.ins().band(l, definite_compare);
+                        let r_eff = state.builder.ins().band(r, definite_compare);
+                        let cmp_result = state.builder.ins().icmp(
+                            if matches!(op, BinaryOp::EqWildcard) {
+                                IntCC::Equal
+                            } else {
+                                IntCC::NotEqual
+                            },
+                            l_eff,
+                            r_eff,
+                        );
+                        let one = state.builder.ins().iconst(common_ty, 1);
+                        res_v = state.builder.ins().select(cmp_result, one, zero);
+
+                        mask
+                    }
+                    BinaryOp::LogicAnd => {
+                        // IEEE 1800: 0 is dominant for && (0 && x = 0)
+                        let zero = state.builder.ins().iconst(common_ty, 0);
+                        // Definite false: value=0 AND mask=0 → (v | m) == 0
+                        let l_val_or_mask = state.builder.ins().bor(l, l_m);
+                        let r_val_or_mask = state.builder.ins().bor(r, r_m);
+                        let l_def_false = state
+                            .builder
+                            .ins()
+                            .icmp(IntCC::Equal, l_val_or_mask, zero);
+                        let r_def_false = state
+                            .builder
+                            .ins()
+                            .icmp(IntCC::Equal, r_val_or_mask, zero);
+                        let either_def_false =
+                            state.builder.ins().bor(l_def_false, r_def_false);
+
+                        let any_x_l =
+                            state.builder.ins().icmp(IntCC::NotEqual, l_m, zero);
+                        let any_x_r =
+                            state.builder.ins().icmp(IntCC::NotEqual, r_m, zero);
+                        let any_x = state.builder.ins().bor(any_x_l, any_x_r);
+                        let all_ones = state.builder.ins().iconst(common_ty, -1);
+                        let conservative =
+                            state.builder.ins().select(any_x, all_ones, zero);
+                        state
+                            .builder
+                            .ins()
+                            .select(either_def_false, zero, conservative)
+                    }
+                    BinaryOp::LogicOr => {
+                        // IEEE 1800: 1 is dominant for || (1 || x = 1)
+                        let zero = state.builder.ins().iconst(common_ty, 0);
+                        // Definite true: at least one definite-1 bit (v != 0, since normalized)
+                        let l_def_true =
+                            state.builder.ins().icmp(IntCC::NotEqual, l, zero);
+                        let r_def_true =
+                            state.builder.ins().icmp(IntCC::NotEqual, r, zero);
+                        let either_def_true =
+                            state.builder.ins().bor(l_def_true, r_def_true);
+
+                        let any_x_l =
+                            state.builder.ins().icmp(IntCC::NotEqual, l_m, zero);
+                        let any_x_r =
+                            state.builder.ins().icmp(IntCC::NotEqual, r_m, zero);
+                        let any_x = state.builder.ins().bor(any_x_l, any_x_r);
+                        let all_ones = state.builder.ins().iconst(common_ty, -1);
+                        let conservative =
+                            state.builder.ins().select(any_x, all_ones, zero);
+                        state
+                            .builder
+                            .ins()
+                            .select(either_def_true, zero, conservative)
                     }
                     _ => {
                         let zero = state.builder.ins().iconst(common_ty, 0);
@@ -535,24 +630,173 @@ impl SIRTranslator {
                             .collect()
                     }
                     BinaryOp::EqWildcard | BinaryOp::NeWildcard => {
-                        // IEEE 1800 ==?/!=?: RHS X/Z bits are wildcards.
-                        // Only LHS X at non-wildcard positions contributes to result X.
+                        // IEEE 1800 ==?/!=?: RHS X/Z bits are wildcards (don't care).
+                        // Compare only at positions where both LHS is definite and RHS is non-wildcard.
+                        let mut accumulated_mismatch =
+                            state.builder.ins().iconst(types::I64, 0);
                         let mut accumulated_x = state.builder.ins().iconst(types::I64, 0);
+
+                        let effective_l: Vec<Value> = (0..num_chunks)
+                            .map(|i| {
+                                let lv = get_chunk_as_i64(state.builder, &l_chunks, i);
+                                let lm = get_chunk_as_i64(state.builder, &l_masks, i);
+                                let rm = get_chunk_as_i64(state.builder, &r_masks, i);
+                                let compare_mask = state.builder.ins().bnot(rm);
+                                let l_definite = state.builder.ins().bnot(lm);
+                                let definite_compare =
+                                    state.builder.ins().band(compare_mask, l_definite);
+                                state.builder.ins().band(lv, definite_compare)
+                            })
+                            .collect();
+                        let effective_r: Vec<Value> = (0..num_chunks)
+                            .map(|i| {
+                                let rv = get_chunk_as_i64(state.builder, &r_chunks, i);
+                                let lm = get_chunk_as_i64(state.builder, &l_masks, i);
+                                let rm = get_chunk_as_i64(state.builder, &r_masks, i);
+                                let compare_mask = state.builder.ins().bnot(rm);
+                                let l_definite = state.builder.ins().bnot(lm);
+                                let definite_compare =
+                                    state.builder.ins().band(compare_mask, l_definite);
+                                state.builder.ins().band(rv, definite_compare)
+                            })
+                            .collect();
+
                         for i in 0..num_chunks {
+                            let lv = get_chunk_as_i64(state.builder, &l_chunks, i);
+                            let rv = get_chunk_as_i64(state.builder, &r_chunks, i);
                             let lm = get_chunk_as_i64(state.builder, &l_masks, i);
                             let rm = get_chunk_as_i64(state.builder, &r_masks, i);
                             let compare_mask = state.builder.ins().bnot(rm);
-                            let chunk_x = state.builder.ins().band(lm, compare_mask);
-                            accumulated_x = state.builder.ins().bor(accumulated_x, chunk_x);
+                            let l_definite = state.builder.ins().bnot(lm);
+                            let definite_compare =
+                                state.builder.ins().band(compare_mask, l_definite);
+                            let xor_bits = state.builder.ins().bxor(lv, rv);
+                            let mismatch =
+                                state.builder.ins().band(xor_bits, definite_compare);
+                            accumulated_mismatch =
+                                state.builder.ins().bor(accumulated_mismatch, mismatch);
+                            let x_at = state.builder.ins().band(lm, compare_mask);
+                            accumulated_x =
+                                state.builder.ins().bor(accumulated_x, x_at);
                         }
+
                         let zero = state.builder.ins().iconst(types::I64, 0);
-                        let has_x =
-                            state
+                        let has_mismatch = state.builder.ins().icmp(
+                            IntCC::NotEqual,
+                            accumulated_mismatch,
+                            zero,
+                        );
+                        let has_x = state.builder.ins().icmp(
+                            IntCC::NotEqual,
+                            accumulated_x,
+                            zero,
+                        );
+                        let all_ones = state.builder.ins().iconst(types::I64, -1i64);
+                        let x_mask =
+                            state.builder.ins().select(has_x, all_ones, zero);
+                        let mask_val =
+                            state.builder.ins().select(has_mismatch, zero, x_mask);
+
+                        // Override value: recompute with masked operands
+                        let cmp_op = if matches!(op, BinaryOp::EqWildcard) {
+                            &BinaryOp::Eq
+                        } else {
+                            &BinaryOp::Ne
+                        };
+                        let mut new_res = wide_ops::emit_wide_unsigned_cmp(
+                            state.builder,
+                            cmp_op,
+                            &effective_l,
+                            &effective_r,
+                            num_chunks,
+                        );
+                        new_res.truncate(final_num_chunks);
+                        while new_res.len() < final_num_chunks {
+                            new_res
+                                .push(state.builder.ins().iconst(types::I64, 0));
+                        }
+                        res_chunks = new_res;
+
+                        vec![mask_val; final_num_chunks]
+                    }
+                    BinaryOp::LogicAnd | BinaryOp::LogicOr => {
+                        // IEEE 1800 dominant-value: 0 for &&, 1 for ||
+                        let mut l_val_or =
+                            state.builder.ins().iconst(types::I64, 0);
+                        let mut r_val_or =
+                            state.builder.ins().iconst(types::I64, 0);
+                        let mut l_mask_or =
+                            state.builder.ins().iconst(types::I64, 0);
+                        let mut r_mask_or =
+                            state.builder.ins().iconst(types::I64, 0);
+                        for i in 0..num_chunks {
+                            let lv =
+                                get_chunk_as_i64(state.builder, &l_chunks, i);
+                            let rv =
+                                get_chunk_as_i64(state.builder, &r_chunks, i);
+                            let lm =
+                                get_chunk_as_i64(state.builder, &l_masks, i);
+                            let rm =
+                                get_chunk_as_i64(state.builder, &r_masks, i);
+                            l_val_or =
+                                state.builder.ins().bor(l_val_or, lv);
+                            r_val_or =
+                                state.builder.ins().bor(r_val_or, rv);
+                            l_mask_or =
+                                state.builder.ins().bor(l_mask_or, lm);
+                            r_mask_or =
+                                state.builder.ins().bor(r_mask_or, rm);
+                        }
+
+                        let zero = state.builder.ins().iconst(types::I64, 0);
+                        let any_x_all = state
+                            .builder
+                            .ins()
+                            .bor(l_mask_or, r_mask_or);
+                        let has_x = state.builder.ins().icmp(
+                            IntCC::NotEqual,
+                            any_x_all,
+                            zero,
+                        );
+                        let all_ones =
+                            state.builder.ins().iconst(types::I64, -1i64);
+                        let conservative =
+                            state.builder.ins().select(has_x, all_ones, zero);
+
+                        let dominant = if matches!(op, BinaryOp::LogicAnd) {
+                            // 0 is dominant: check if either operand is definite false
+                            // definite false = (v | m) == 0
+                            let l_vm =
+                                state.builder.ins().bor(l_val_or, l_mask_or);
+                            let r_vm =
+                                state.builder.ins().bor(r_val_or, r_mask_or);
+                            let l_def_false = state
                                 .builder
                                 .ins()
-                                .icmp(IntCC::NotEqual, accumulated_x, zero);
-                        let all_ones = state.builder.ins().iconst(types::I64, -1i64);
-                        let mask_val = state.builder.ins().select(has_x, all_ones, zero);
+                                .icmp(IntCC::Equal, l_vm, zero);
+                            let r_def_false = state
+                                .builder
+                                .ins()
+                                .icmp(IntCC::Equal, r_vm, zero);
+                            state.builder.ins().bor(l_def_false, r_def_false)
+                        } else {
+                            // 1 is dominant: check if either operand is definite true
+                            // definite true = v != 0 (since normalized, v != 0 means definite 1)
+                            let l_def_true = state
+                                .builder
+                                .ins()
+                                .icmp(IntCC::NotEqual, l_val_or, zero);
+                            let r_def_true = state
+                                .builder
+                                .ins()
+                                .icmp(IntCC::NotEqual, r_val_or, zero);
+                            state.builder.ins().bor(l_def_true, r_def_true)
+                        };
+
+                        let mask_val = state
+                            .builder
+                            .ins()
+                            .select(dominant, zero, conservative);
                         vec![mask_val; final_num_chunks]
                     }
                     // All other ops: conservative — if any mask chunk is non-zero, result is all-X
@@ -574,6 +818,17 @@ impl SIRTranslator {
                 res_masks.truncate(final_num_chunks);
                 while res_masks.len() < final_num_chunks {
                     res_masks.push(state.builder.ins().iconst(types::I64, 0));
+                }
+
+                // Mask width normalization: clear bits beyond d_width in the last chunk
+                let last_chunk_bits = d_width % 64;
+                if last_chunk_bits != 0 && !res_masks.is_empty() {
+                    let width_mask_val = ((1u64 << last_chunk_bits) - 1) as i64;
+                    let width_mask =
+                        state.builder.ins().iconst(types::I64, width_mask_val);
+                    let last_idx = res_masks.len() - 1;
+                    res_masks[last_idx] =
+                        state.builder.ins().band(res_masks[last_idx], width_mask);
                 }
 
                 // IEEE 1800 normalization: v &= ~m per chunk
@@ -886,6 +1141,17 @@ impl SIRTranslator {
                 res_masks.truncate(final_num_chunks);
                 while res_masks.len() < final_num_chunks {
                     res_masks.push(state.builder.ins().iconst(types::I64, 0));
+                }
+
+                // Mask width normalization: clear bits beyond d_width in the last chunk
+                let last_chunk_bits = d_width % 64;
+                if last_chunk_bits != 0 && !res_masks.is_empty() {
+                    let width_mask_val = ((1u64 << last_chunk_bits) - 1) as i64;
+                    let width_mask =
+                        state.builder.ins().iconst(types::I64, width_mask_val);
+                    let last_idx = res_masks.len() - 1;
+                    res_masks[last_idx] =
+                        state.builder.ins().band(res_masks[last_idx], width_mask);
                 }
 
                 // IEEE 1800 normalization: v &= ~m per chunk
