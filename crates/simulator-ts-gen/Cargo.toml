@@ -1,0 +1,19 @@
+[package]
+name                  = "veryl-simulator-ts-gen"
+version               = "0.18.0"
+authors.workspace     = true
+repository.workspace  = true
+keywords.workspace    = true
+categories.workspace  = true
+license.workspace     = true
+readme.workspace      = true
+description.workspace = true
+edition.workspace     = true
+
+[dependencies]
+veryl-analyzer = { version = "0.18.0", path = "../analyzer" }
+veryl-parser = { version = "0.18.0", path = "../parser" }
+
+[dev-dependencies]
+insta = "1.46"
+veryl-metadata = { version = "0.18.0", path = "../metadata" }

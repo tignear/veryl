@@ -1,0 +1,26 @@
+[package]
+name                  = "veryl-simulator-napi"
+version               = "0.18.0"
+authors.workspace     = true
+repository.workspace  = true
+keywords.workspace    = true
+categories.workspace  = true
+license.workspace     = true
+readme.workspace      = true
+description.workspace = true
+edition.workspace     = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+napi = { version = "3", features = ["napi8", "serde-json"] }
+napi-derive = "3"
+veryl-simulator = { version = "0.18.0", path = "../simulator" }
+veryl-analyzer = { version = "0.18.0", path = "../analyzer" }
+veryl-parser = { version = "0.18.0", path = "../parser" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[build-dependencies]
+napi-build = "2"

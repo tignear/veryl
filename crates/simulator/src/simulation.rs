@@ -1,7 +1,9 @@
 use crate::{
     RuntimeErrorCode, Simulator,
+    backend::MemoryLayout,
     ir::{DomainKind, SignalRef},
     scheduler::{Scheduler, SimEvent},
+    simulator::{NamedEvent, NamedSignal},
 };
 
 /// A timed simulation wrapper around the core logic engine.
@@ -403,5 +405,84 @@ impl Simulation {
     /// Returns the time of the next scheduled event, if any.
     pub fn next_event_time(&self) -> Option<u64> {
         self.scheduler.next_event_time()
+    }
+
+    /// Directly execute combinational logic evaluation.
+    pub fn eval_comb(&mut self) -> Result<(), RuntimeErrorCode> {
+        self.simulator.eval_comb()
+    }
+
+    /// Returns a raw pointer to the JIT memory and its total size in bytes.
+    pub fn memory_as_ptr(&self) -> (*const u8, usize) {
+        self.simulator.memory_as_ptr()
+    }
+
+    /// Returns a mutable raw pointer to the JIT memory and its total size in bytes.
+    pub fn memory_as_mut_ptr(&mut self) -> (*mut u8, usize) {
+        self.simulator.memory_as_mut_ptr()
+    }
+
+    /// Returns the stable region size in bytes.
+    pub fn stable_region_size(&self) -> usize {
+        self.simulator.stable_region_size()
+    }
+
+    /// Returns a reference to the memory layout.
+    pub fn layout(&self) -> &MemoryLayout {
+        self.simulator.layout()
+    }
+
+    /// Returns all ports of the top-level module.
+    pub fn named_signals(&self) -> Vec<NamedSignal> {
+        self.simulator.named_signals()
+    }
+
+    /// Returns all events with their IDs and event references.
+    pub fn named_events(&self) -> Vec<NamedEvent> {
+        self.simulator.named_events()
+    }
+
+    /// Register a clock signal by event ID.
+    pub fn add_clock_by_id(&mut self, event_id: u32, period: u64, initial_delay: u64) {
+        let addr = self.simulator.backend.id_to_addr[event_id as usize];
+        let signal = self.simulator.backend.resolve_signal(&addr);
+        if let Some(ev) = self.simulator.backend.resolve_event_opt(&addr) {
+            if ev.id >= self.scheduler.clocks.len() {
+                self.scheduler.clocks.resize(ev.id + 1, None);
+            }
+            self.scheduler.clocks[ev.id] = Some(crate::scheduler::ClockDef { period });
+            self.scheduler.push(SimEvent {
+                time: initial_delay,
+                event_ref: ev,
+                signal,
+                next_val: 1,
+            });
+        }
+    }
+
+    /// Schedule a one-shot event by event ID.
+    pub fn schedule_by_id(
+        &mut self,
+        event_id: u32,
+        time: u64,
+        value: u64,
+    ) -> Result<(), RuntimeErrorCode> {
+        let addr = self.simulator.backend.id_to_addr[event_id as usize];
+        let signal = self.simulator.backend.resolve_signal(&addr);
+        let ev_opt = self.simulator.backend.resolve_event_opt(&addr);
+        if let Some(ev) = ev_opt {
+            self.scheduler.push(SimEvent {
+                time,
+                event_ref: ev,
+                signal,
+                next_val: value as u8,
+            });
+            Ok(())
+        } else {
+            Err(RuntimeErrorCode::NotAnEvent(format!(
+                "event_id={}",
+                event_id
+            )))
+        }
     }
 }

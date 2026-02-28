@@ -5,7 +5,7 @@ mod translator;
 mod wide_ops;
 
 use jit_engine::JitEngine;
-pub(super) use memory_layout::{MemoryLayout, get_byte_size};
+pub use memory_layout::{MemoryLayout, get_byte_size};
 pub use runtime::SimulatorErrorCode;
 pub use runtime::{EventRef, JitBackend};
 pub(super) use translator::SIRTranslator;

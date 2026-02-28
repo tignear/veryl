@@ -472,12 +472,31 @@ fn module_variables(registry: &ModuleRegistry) -> HashMap<StrId, HashMap<VarPath
                     id: *id,
                     is_4state: is_4state_type(&varibale.r#type.kind),
                     kind: type_kind_to_domain_kind(&varibale.r#type.kind),
+                    var_kind: varibale.kind,
+                    type_kind: type_kind_to_port_type_kind(&varibale.r#type.kind),
                 },
             );
         }
         res.insert(*name, variables);
     }
     res
+}
+
+fn type_kind_to_port_type_kind(kind: &veryl_analyzer::ir::TypeKind) -> crate::ir::PortTypeKind {
+    use veryl_analyzer::ir::TypeKind;
+    match kind {
+        TypeKind::Clock | TypeKind::ClockPosedge | TypeKind::ClockNegedge => {
+            crate::ir::PortTypeKind::Clock
+        }
+        TypeKind::Reset
+        | TypeKind::ResetAsyncHigh
+        | TypeKind::ResetAsyncLow
+        | TypeKind::ResetSyncHigh
+        | TypeKind::ResetSyncLow => crate::ir::PortTypeKind::Reset,
+        TypeKind::Logic => crate::ir::PortTypeKind::Logic,
+        TypeKind::Bit => crate::ir::PortTypeKind::Bit,
+        _ => crate::ir::PortTypeKind::Other,
+    }
 }
 
 fn type_kind_to_domain_kind(kind: &veryl_analyzer::ir::TypeKind) -> DomainKind {

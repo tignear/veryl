@@ -16,6 +16,15 @@ pub enum DomainKind {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PortTypeKind {
+    Clock,
+    Reset,
+    Logic,
+    Bit,
+    Other,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct TriggerIdWithKind {
     pub kind: DomainKind,
     pub id: usize,
@@ -27,6 +36,8 @@ pub struct VariableInfo {
     pub id: VarId,
     pub is_4state: bool,
     pub kind: DomainKind,
+    pub var_kind: veryl_analyzer::ir::VarKind,
+    pub type_kind: PortTypeKind,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -272,9 +283,9 @@ impl fmt::Display for AbsoluteAddr {
 /// for essentially zero-cost reads and writes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct SignalRef {
-    pub(crate) offset: usize,
-    pub(crate) width: usize,
-    pub(crate) is_4state: bool,
+    pub offset: usize,
+    pub width: usize,
+    pub is_4state: bool,
 }
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 pub struct InstancePath(pub Vec<(StrId, usize)>);

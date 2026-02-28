@@ -670,7 +670,7 @@ impl fmt::Display for VarSelect {
     }
 }
 
-#[derive(Copy, Clone, PartialEq, Eq)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum VarKind {
     Param,
     Const,

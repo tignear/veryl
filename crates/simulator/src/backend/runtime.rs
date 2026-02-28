@@ -531,6 +531,28 @@ impl JitBackend {
         self.run_sim_func(event.func)
     }
 
+    /// Returns a raw pointer to the JIT memory and its total size in bytes.
+    pub fn memory_as_ptr(&self) -> (*const u8, usize) {
+        let size = self.engine.translator.layout.merged_total_size;
+        (self.memory.as_ptr() as *const u8, size)
+    }
+
+    /// Returns a mutable raw pointer to the JIT memory and its total size in bytes.
+    pub fn memory_as_mut_ptr(&mut self) -> (*mut u8, usize) {
+        let size = self.engine.translator.layout.merged_total_size;
+        (self.memory.as_mut_ptr() as *mut u8, size)
+    }
+
+    /// Returns the stable region size in bytes.
+    pub fn stable_region_size(&self) -> usize {
+        self.engine.translator.layout.total_size
+    }
+
+    /// Returns a reference to the memory layout.
+    pub fn layout(&self) -> &MemoryLayout {
+        &self.engine.translator.layout
+    }
+
     pub fn num_events(&self) -> usize {
         let mut max_id = 0;
         for ev in self.event_map.values() {

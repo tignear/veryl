@@ -11,6 +11,8 @@ members = [
     "crates/parser",
     "crates/path",
     "crates/simulator",
+    "crates/simulator-napi",
+    "crates/simulator-ts-gen",
     "crates/sourcemap",
     "crates/std",
     "crates/tests",

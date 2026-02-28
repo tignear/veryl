@@ -30,10 +30,11 @@ impl<'a> IOContext<'a> {
 }
 
 pub use backend::EventRef;
+pub use backend::{MemoryLayout, get_byte_size};
 pub use debug::{CompilationTrace, TraceOptions};
 pub(crate) use fxhash::FxHashMap as HashMap;
 pub(crate) use fxhash::FxHashSet as HashSet;
-pub use ir::{AbsoluteAddr, SignalRef};
+pub use ir::{AbsoluteAddr, PortTypeKind, SignalRef};
 pub use malachite_bigint::BigUint;
 pub use parser::ParserError;
 pub use parser::SchedulerError;
@@ -42,6 +43,7 @@ pub use simulator::Simulator;
 pub use simulator::SimulatorBuilder;
 pub use simulator::SimulatorError;
 pub use simulator::SimulatorOptions;
+pub use simulator::{NamedEvent, NamedSignal};
 pub use veryl_simulator_macros::veryl_test;
 
 #[cfg(test)]
