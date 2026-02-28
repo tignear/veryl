@@ -11,9 +11,15 @@ description.workspace = true
 edition.workspace     = true
 
 [dependencies]
-veryl-analyzer = { version = "0.18.0", path = "../analyzer" }
-veryl-parser = { version = "0.18.0", path = "../parser" }
+clap            = {workspace = true}
+miette          = {workspace = true}
+veryl-analyzer  = { version = "0.18.0", path = "../analyzer" }
+veryl-metadata  = { version = "0.18.0", path = "../metadata" }
+veryl-parser    = { version = "0.18.0", path = "../parser" }
 
 [dev-dependencies]
 insta = "1.46"
-veryl-metadata = { version = "0.18.0", path = "../metadata" }
+
+[[bin]]
+name = "veryl-gen-ts"
+path = "src/main.rs"

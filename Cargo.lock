@@ -6281,7 +6281,9 @@ dependencies = [
 name = "veryl-simulator-ts-gen"
 version = "0.18.0"
 dependencies = [
+ "clap",
  "insta",
+ "miette",
  "veryl-analyzer",
  "veryl-metadata",
  "veryl-parser",
