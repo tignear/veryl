@@ -227,8 +227,30 @@ pub fn eval_array_literal(
                     return Err(ir_error!(token));
                 }
             } else if *target_len != len {
-                // TODO mismatch dimension error
-                return Err(ir_error!(token));
+                if len == 1 {
+                    // Single-element literal with no `default:` keyword: fill remaining
+                    // positions with the same value (SV `'{val}` fill semantics).
+                    let base = ret.clone();
+                    while index < *target_len {
+                        let mut exprs: Vec<ArrayLiteralExpression> = base
+                            .iter()
+                            .map(|e| {
+                                let mut e = e.clone();
+                                if is_array && !e.index.is_empty() {
+                                    e.index[0] = index;
+                                } else if !is_array && !e.select.is_empty() {
+                                    e.select[0] = index;
+                                }
+                                e
+                            })
+                            .collect();
+                        ret.append(&mut exprs);
+                        index += 1;
+                    }
+                } else {
+                    // TODO mismatch dimension error
+                    return Err(ir_error!(token));
+                }
             }
         } else {
             // TODO target_len is unknown
