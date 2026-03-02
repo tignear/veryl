@@ -1132,7 +1132,13 @@ pub fn eval_function_call(
                 context.insert_ir_error::<()>(&Err(ir_error!(token)));
                 Ok(ir::Expression::Term(Box::new(ir::Factor::Value(x))))
             }
-            SymbolKind::ProtoFunction(_) => Err(ir_error!(token)),
+            SymbolKind::ProtoFunction(_) => {
+                let ret =
+                    function_call(context, value.expression_identifier.as_ref(), args, token)?;
+                Ok(ir::Expression::Term(Box::new(ir::Factor::FunctionCall(
+                    ret,
+                ))))
+            }
             _ => {
                 let name = symbol.found.token.text.to_string();
                 let kind = symbol.found.kind.to_kind_name();
@@ -1361,10 +1367,27 @@ pub fn eval_external_symbol(
                 ));
             }
         }
-        SymbolKind::ProtoConst(x) if allow_unknown_value => {
-            let r#type = x.r#type.to_ir_type(context, TypePosition::Variable)?;
-            let mut x = Comptime::from_type(r#type, ClockDomain::None, token);
+        SymbolKind::ProtoConst(proto_x) => {
+            // Try to resolve through generic map to find the concrete Parameter value
+            let resolved = context.resolve_path(path);
+            if let Ok(resolved_symbol) = symbol_table::resolve(&resolved) {
+                if let SymbolKind::Parameter(x) = &resolved_symbol.found.kind {
+                    if let Some(expr) = &x.value {
+                        let r#type = x.r#type.to_ir_type(context, TypePosition::Variable)?;
+                        let (mut comptime, _) =
+                            context.block(|c| eval_expr(c, Some(r#type), expr, false))?;
 
+                        if let Some(width) = comptime.r#type.total_width() {
+                            comptime.value.expand_value(width);
+                        }
+
+                        return Ok(ir::Factor::Value(comptime));
+                    }
+                }
+            }
+            // Fallback: in generic templates, return type-only Comptime
+            let r#type = proto_x.r#type.to_ir_type(context, TypePosition::Variable)?;
+            let mut x = Comptime::from_type(r#type, ClockDomain::None, token);
             x.is_const = true;
             x.is_global = true;
 

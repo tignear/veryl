@@ -331,7 +331,18 @@ impl Conv<&IdentifierStatement> for ir::StatementBlock {
                             unreachable!();
                         }
                     }
-                    SymbolKind::ProtoFunction(_) | SymbolKind::SystemVerilog => {
+                    SymbolKind::ProtoFunction(_) => {
+                        let ret = function_call(
+                            context,
+                            value.expression_identifier.as_ref(),
+                            args,
+                            token,
+                        )?;
+                        Ok(ir::StatementBlock(vec![ir::Statement::FunctionCall(
+                            Box::new(ret),
+                        )]))
+                    }
+                    SymbolKind::SystemVerilog => {
                         Err(ir_error!(token))
                     }
                     _ => {
