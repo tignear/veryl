@@ -362,7 +362,7 @@ impl Op {
                     }
 
                     dst.r#type = y_value.clone();
-                } else {
+                } else if !y.value.is_unknown() {
                     dst.r#type = self.invalid_operand(context, y);
                 }
             }
