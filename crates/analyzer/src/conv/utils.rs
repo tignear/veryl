@@ -821,7 +821,11 @@ pub fn eval_type(
                     }
                     GenericBoundKind::Type => {
                         if let Some(x) = &x.default_value {
-                            return eval_type(context, x, pos);
+                            let mut r#type = eval_type(context, x, pos)?;
+                            width.append(&mut r#type.width);
+                            array.append(&mut r#type.array);
+                            signed = r#type.signed;
+                            r#type.kind
                         } else {
                             ir::TypeKind::Unknown
                         }
@@ -839,6 +843,9 @@ pub fn eval_type(
 
                             let (comptime, _) = expr?;
                             if let ValueVariant::Type(x) = &comptime.value {
+                                width.append(&mut x.width.clone());
+                                array.append(&mut x.array.clone());
+                                signed = x.signed;
                                 x.kind.clone()
                             } else {
                                 ir::TypeKind::Unknown
