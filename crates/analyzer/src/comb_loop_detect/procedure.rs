@@ -15,10 +15,11 @@ use crate::ir::VarId;
 use crate::ir::{
     ArrayLiteralItem, AssignDestination, CaseStatement, Expression, Factor, ForBound, ForRange,
     ForStatement, FunctionCall, IfStatement, MemberSelectDomain, Module, Op, Statement,
-    SystemFunctionKind, VarIndex, VarPath, VarSelect,
+    SystemFunctionKind, TypeKind, VarIndex, VarPath, VarSelect,
 };
 use crate::value::Value;
 use crate::{HashMap, HashSet};
+use std::collections::BTreeMap;
 use std::rc::Rc;
 
 fn translate_array_span(span: ArraySpan, offset: isize) -> Option<ArraySpan> {
@@ -73,6 +74,66 @@ fn packed_mask_overlaps(mask: &crate::BigUint, span: PackedSpan) -> bool {
 
 fn translate_packed_span(span: PackedSpan, offset: isize) -> Option<PackedSpan> {
     PackedSpan::new(translate_position(span.start, offset)?, span.length)
+}
+
+/// Whether an inclusive interval is already contained in a normalized set of
+/// disjoint inclusive intervals.
+fn case_interval_is_covered(covered: &BTreeMap<usize, usize>, (low, high): (usize, usize)) -> bool {
+    let mut cursor = low;
+    if let Some((_, &end)) = covered.range(..=cursor).next_back()
+        && end >= cursor
+    {
+        if end >= high {
+            return true;
+        }
+        let Some(next) = end.checked_add(1) else {
+            return true;
+        };
+        cursor = next;
+    }
+
+    for (&start, &end) in covered.range(cursor..=high) {
+        if start > cursor {
+            return false;
+        }
+        if end >= high {
+            return true;
+        }
+        let Some(next) = end.checked_add(1) else {
+            return true;
+        };
+        cursor = next;
+    }
+    false
+}
+
+/// Insert one inclusive interval while keeping the set normalized. Each old
+/// interval is removed at most once, so a large flat `case` stays near
+/// O(patterns log patterns) instead of repeatedly rescanning every arm.
+fn insert_case_interval(covered: &mut BTreeMap<usize, usize>, (mut low, mut high): (usize, usize)) {
+    if let Some((&start, &end)) = covered.range(..=low).next_back()
+        && end.saturating_add(1) >= low
+    {
+        low = start;
+        high = high.max(end);
+        covered.remove(&start);
+    }
+
+    loop {
+        let next = covered
+            .range(low..)
+            .next()
+            .map(|(&start, &end)| (start, end));
+        let Some((start, end)) = next else {
+            break;
+        };
+        if start > high.saturating_add(1) {
+            break;
+        }
+        high = high.max(end);
+        covered.remove(&start);
+    }
+    covered.insert(low, high);
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -2979,7 +3040,9 @@ impl<'a, 's> ProcedureAnalysis<'a, 's> {
         let mut nested_controls = controls.to_vec();
         nested_controls.extend_from_slice(&condition);
 
-        if let Some(target) = statement.case_target.eval_value(&mut self.ctx) {
+        if let Some(target) = statement.case_target.eval_value(&mut self.ctx)
+            && target.to_usize().is_some()
+        {
             let mut possible = Vec::new();
             let mut has_definite_match = false;
             for (index, arm) in statement.arms.iter().enumerate() {
@@ -3033,23 +3096,124 @@ impl<'a, 's> ProcedureAnalysis<'a, 's> {
             return self.merge_branches(states, predicate, &parent_condition);
         }
 
+        let (reachable_arms, default_reachable) = self
+            .ordered_case_reachability(statement)
+            .unwrap_or_else(|| ((0..statement.arms.len()).collect(), true));
         let branch = self.next_branch_id(statement.arms.len() + 1);
         let parent_condition = self.path_condition.clone();
-        let mut states = Vec::with_capacity(statement.arms.len() + 1);
-        for (index, arm) in statement.arms.iter().enumerate() {
+        let mut states = Vec::with_capacity(reachable_arms.len() + usize::from(default_reachable));
+        for index in reachable_arms {
             self.path_condition = parent_condition.with_choice(branch, index);
             let checkpoint = self.ssa.checkpoint();
-            let flow = self.eval_block(&arm.body, &nested_controls);
+            let flow = self.eval_block(&statement.arms[index].body, &nested_controls);
             let state = self.ssa.capture_and_rollback(checkpoint);
             states.push((flow, state, self.path_condition.clone()));
         }
-        self.path_condition = parent_condition.with_choice(branch, statement.arms.len());
-        let checkpoint = self.ssa.checkpoint();
-        let flow = self.eval_block(&statement.default, &nested_controls);
-        let state = self.ssa.capture_and_rollback(checkpoint);
-        states.push((flow, state, self.path_condition.clone()));
+        if default_reachable {
+            self.path_condition = parent_condition.with_choice(branch, statement.arms.len());
+            let checkpoint = self.ssa.checkpoint();
+            let flow = self.eval_block(&statement.default, &nested_controls);
+            let state = self.ssa.capture_and_rollback(checkpoint);
+            states.push((flow, state, self.path_condition.clone()));
+        }
         self.path_condition = parent_condition.clone();
         self.merge_branches(states, predicate, &parent_condition)
+    }
+
+    /// Return the arms that can win an ordered `case`, plus whether its
+    /// default remains reachable. Keep the general path conservative: this
+    /// finite interval model applies only to an unsigned, scalar, 2-state
+    /// selector and constant, non-X/Z equality/range bounds.
+    fn ordered_case_reachability(
+        &mut self,
+        statement: &CaseStatement,
+    ) -> Option<(Vec<usize>, bool)> {
+        let target_type = &statement.case_target.comptime().r#type;
+        if !matches!(target_type.kind, TypeKind::Bit)
+            || target_type.signed
+            || !target_type.array.is_empty()
+            || !target_type.is_2state()
+        {
+            return None;
+        }
+        let width = target_type.total_width()?;
+        if width == 0 || width > usize::BITS as usize {
+            return None;
+        }
+        let domain_high = if width == usize::BITS as usize {
+            usize::MAX
+        } else {
+            (1usize << width) - 1
+        };
+
+        let mut covered = BTreeMap::<usize, usize>::new();
+        let mut reachable = Vec::new();
+        for (index, arm) in statement.arms.iter().enumerate() {
+            let mut intervals = Vec::with_capacity(arm.patterns.len());
+            for pattern in &arm.patterns {
+                if let Some(interval) = self.case_pattern_interval(pattern, domain_high)? {
+                    intervals.push(interval);
+                }
+            }
+            if intervals
+                .iter()
+                .any(|&interval| !case_interval_is_covered(&covered, interval))
+            {
+                reachable.push(index);
+            }
+            for interval in intervals {
+                insert_case_interval(&mut covered, interval);
+            }
+        }
+
+        let default_reachable = !case_interval_is_covered(&covered, (0, domain_high));
+        Some((reachable, default_reachable))
+    }
+
+    fn case_pattern_interval(
+        &mut self,
+        pattern: &crate::ir::CasePattern,
+        domain_high: usize,
+    ) -> Option<Option<(usize, usize)>> {
+        let constant = |this: &mut Self, expression: &Expression| {
+            let value = expression.eval_value(&mut this.ctx)?;
+            // Width-zero values are the unbased all-bit literals (`'0`,
+            // `'1`, ...). Their concrete value comes from the selector width,
+            // so the context-free payload is not an interval endpoint.
+            if value.is_xz() || value.width() == 0 {
+                return None;
+            }
+            if value.signed()
+                && u64::try_from(value.width() - 1)
+                    .ok()
+                    .is_some_and(|sign| value.payload().bit(sign))
+            {
+                return None;
+            }
+            value.to_usize()
+        };
+
+        match pattern {
+            crate::ir::CasePattern::Eq(expression) => {
+                let value = constant(self, expression)?;
+                Some((value <= domain_high).then_some((value, value)))
+            }
+            crate::ir::CasePattern::Range { lo, hi, inclusive } => {
+                let lo = constant(self, lo)?;
+                let hi = constant(self, hi)?;
+                let Some(hi) = (if *inclusive {
+                    Some(hi)
+                } else {
+                    hi.checked_sub(1)
+                }) else {
+                    return Some(None);
+                };
+                if lo > hi || lo > domain_high {
+                    return Some(None);
+                }
+                Some(Some((lo, hi.min(domain_high))))
+            }
+        }
     }
 
     fn eval_for(&mut self, statement: &ForStatement, controls: &[VersionId]) -> FlowResult {

@@ -1316,6 +1316,167 @@ fn comb_loop_mutually_exclusive_case_arms_do_not_form_feedback() {
 }
 
 #[test]
+fn comb_loop_ordered_case_full_range_makes_later_arm_unreachable() {
+    assert_comb_loop(
+        "a preceding range covering every 2-state selector value shadows later arms",
+        r#"
+        module Top (
+            sel: input  bit<2>,
+            o  : output logic,
+        ) {
+            var feedback: logic;
+            var value   : logic;
+            assign feedback = value;
+            always_comb {
+                value = 0;
+                case sel {
+                    0..=3  : value = 0;
+                    1      : value = feedback;
+                    default: value = 0;
+                }
+                o = value;
+            }
+        }
+        "#,
+        false,
+    );
+}
+
+#[test]
+fn comb_loop_ordered_case_exhaustive_values_make_default_unreachable() {
+    assert_comb_loop(
+        "enumerating every bit value shadows the default arm",
+        r#"
+        module Top (
+            sel: input  bit,
+            o  : output logic,
+        ) {
+            var feedback: logic;
+            var value   : logic;
+            assign feedback = value;
+            always_comb {
+                value = 0;
+                case sel {
+                    0      : value = 0;
+                    1      : value = 0;
+                    default: value = feedback;
+                }
+                o = value;
+            }
+        }
+        "#,
+        false,
+    );
+}
+
+#[test]
+fn comb_loop_ordered_case_covered_overlapping_range_is_unreachable() {
+    assert_comb_loop(
+        "a later range fully covered by a preceding range is unreachable",
+        r#"
+        module Top (
+            sel: input  bit<3>,
+            o  : output logic,
+        ) {
+            var feedback: logic;
+            var value   : logic;
+            assign feedback = value;
+            always_comb {
+                value = 0;
+                case sel {
+                    0..=5  : value = 0;
+                    3..=5  : value = feedback;
+                    default: value = 0;
+                }
+                o = value;
+            }
+        }
+        "#,
+        false,
+    );
+}
+
+#[test]
+fn comb_loop_ordered_case_partially_overlapping_range_retains_uncovered_values() {
+    assert_comb_loop(
+        "the uncovered suffix of a partially overlapping range remains reachable",
+        r#"
+        module Top (
+            sel: input  bit<3>,
+            o  : output logic,
+        ) {
+            var feedback: logic;
+            var value   : logic;
+            assign feedback = value;
+            always_comb {
+                value = 0;
+                case sel {
+                    0..=2  : value = 0;
+                    2..=5  : value = feedback;
+                    default: value = 0;
+                }
+                o = value;
+            }
+        }
+        "#,
+        true,
+    );
+}
+
+#[test]
+fn comb_loop_ordered_case_four_state_target_keeps_default_reachable() {
+    assert_comb_loop(
+        "X and Z values keep the default reachable for a four-state selector",
+        r#"
+        module Top (
+            sel: input  logic<2>,
+            o  : output logic,
+        ) {
+            var feedback: logic;
+            var value   : logic;
+            assign feedback = value;
+            always_comb {
+                value = 0;
+                case sel {
+                    0..=3  : value = 0;
+                    default: value = feedback;
+                }
+                o = value;
+            }
+        }
+        "#,
+        true,
+    );
+}
+
+#[test]
+fn comb_loop_ordered_case_unbased_all_bit_pattern_keeps_contextual_value() {
+    assert_comb_loop(
+        "an unbased all-bit pattern is interpreted at the selector width",
+        r#"
+        module Top (
+            sel: input  bit<2>,
+            o  : output logic,
+        ) {
+            var feedback: logic;
+            var value   : logic;
+            assign feedback = value;
+            always_comb {
+                value = 0;
+                case sel {
+                    1      : value = 0;
+                    '1     : value = feedback;
+                    default: value = 0;
+                }
+                o = value;
+            }
+        }
+        "#,
+        true,
+    );
+}
+
+#[test]
 fn comb_loop_opposing_shifts_in_mutually_exclusive_arms_are_acyclic() {
     assert_comb_loop(
         "opposing positional dependencies cannot combine across exclusive arms",
