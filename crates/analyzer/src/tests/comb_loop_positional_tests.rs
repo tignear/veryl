@@ -105,6 +105,106 @@ fn structure_actual_code(constructor: &str) -> String {
     )
 }
 
+fn dynamic_union_overlay_code(observed_bit: usize) -> String {
+    format!(
+        r#"
+        module Top (
+            index: input  bit<2>,
+            o    : output bit,
+        ) {{
+            struct Pair {{
+                selected: bit<4>,
+                result  : bit<4>,
+            }}
+            union Overlay {{
+                pair: Pair,
+                raw : bit<8>,
+            }}
+            var value   : Overlay;
+            var observed: bit;
+            always_comb {{
+                value.raw = 0;
+                value.pair.selected[index] = observed;
+            }}
+            assign observed = value.raw[{observed_bit}];
+            assign o = observed;
+        }}
+        "#,
+    )
+}
+
+fn union_module_summary_code(feedback_element: usize) -> String {
+    format!(
+        r#"
+        package Types {{
+            struct Pair {{
+                high: logic<4>,
+                low : logic<4>,
+            }}
+            union Overlay {{
+                pair: Pair,
+                raw : logic<8>,
+            }}
+        }}
+        module Child (
+            i: input  Types::Overlay,
+            o: output Types::Overlay,
+        ) {{
+            always_comb {{
+                o.raw = 0;
+                o.pair.high[0] = i.raw[4];
+            }}
+        }}
+        module Top (o: output logic) {{
+            var feedback: Types::Overlay [2];
+            var passed  : Types::Overlay [2];
+            inst u: Child (i: feedback[0], o: passed[0]);
+            always_comb {{
+                feedback[0].raw = 0;
+                feedback[1].raw = 0;
+                feedback[{feedback_element}].raw[4] = passed[0].pair.high[0];
+                passed[1].raw = 0;
+            }}
+            assign o = passed[0].raw[4];
+        }}
+        "#,
+    )
+}
+
+fn union_function_output_code(driven_bit: usize, overwrite_after: bool) -> String {
+    let body = if overwrite_after {
+        "value.low = source; value.bits = 0;".to_string()
+    } else {
+        format!(
+            "value.bits[{driven_bit}] = source; value.bits[{}] = 0;",
+            1 - driven_bit,
+        )
+    };
+    format!(
+        r#"
+        module Top (o: output logic) {{
+            union Overlay {{
+                bits: logic<2>,
+                low : logic,
+            }}
+            function fill (
+                source: input  logic,
+                value : output Overlay,
+            ) {{
+                {body}
+            }}
+            var value   : Overlay;
+            var observed: logic;
+            always_comb {{
+                fill(observed, value);
+            }}
+            assign observed = value.low;
+            assign o = observed;
+        }}
+        "#,
+    )
+}
+
 fn array_literal_actual_code(actual: &str) -> String {
     format!(
         r#"
@@ -178,6 +278,55 @@ comb_loop_case!(
     "a structure actual retains corresponding-member feedback",
     structure_actual_code("Types::Pair'{a: feedback, b: 0}"),
     true
+);
+
+comb_loop_case!(
+    comb_loop_union_runtime_member_selector_excludes_disjoint_overlay_bit,
+    "a dynamic union member selector stays inside its member's overlaid domain",
+    dynamic_union_overlay_code(0),
+    false
+);
+
+comb_loop_case!(
+    comb_loop_union_runtime_member_selector_preserves_cross_member_overlap,
+    "a dynamic union member selector preserves a possible cross-member overlap",
+    dynamic_union_overlay_code(4),
+    true
+);
+
+comb_loop_case!(
+    comb_loop_union_module_summary_keeps_array_elements_independent,
+    "a union module summary keeps distinct unpacked array elements independent",
+    union_module_summary_code(1),
+    false
+);
+
+comb_loop_case!(
+    comb_loop_union_member_offset_and_array_element_survive_module_summary,
+    "a union member offset and array element survive a module summary",
+    union_module_summary_code(0),
+    true
+);
+
+comb_loop_case!(
+    comb_loop_union_function_output_keeps_disjoint_bit_loop_free,
+    "a union function output keeps a disjoint overlaid bit loop-free",
+    union_function_output_code(1, false),
+    false
+);
+
+comb_loop_case!(
+    comb_loop_union_function_output_retains_overlapping_bit_feedback,
+    "a union function output retains overlapping-member feedback",
+    union_function_output_code(0, false),
+    true
+);
+
+comb_loop_case!(
+    comb_loop_union_function_output_later_whole_member_overwrite_kills_feedback,
+    "a later whole union member write kills an earlier overlapping-member write",
+    union_function_output_code(0, true),
+    false
 );
 
 comb_loop_case!(
