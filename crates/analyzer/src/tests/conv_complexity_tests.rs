@@ -83,3 +83,82 @@ fn receiver_method_import_work_is_linear() {
         ));
     }
 }
+
+#[test]
+fn modport_instance_binding_work_is_linear() {
+    let child_ports = (0..ITEM_COUNT)
+        .map(|i| format!("lane_{i}: modport Lane::sink"))
+        .collect::<Vec<_>>()
+        .join(",\n");
+    let interfaces = (0..ITEM_COUNT)
+        .map(|i| format!("inst lane_{i}: Lane;"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let connects = (0..ITEM_COUNT)
+        .map(|i| format!("lane_{i}: lane_{i}"))
+        .collect::<Vec<_>>()
+        .join(",\n");
+    let code = format!(
+        r#"
+        interface Lane {{
+            var value: logic;
+            modport sink {{
+                value: input,
+            }}
+        }}
+        module Child (
+            {child_ports},
+        ) {{}}
+        module Top {{
+            {interfaces}
+            inst child: Child (
+                {connects},
+            );
+        }}
+        "#
+    );
+
+    Context::reset_interface_binding_prefix_comparisons();
+    let _errors = analyze(&code);
+    let comparisons = Context::interface_binding_prefix_comparisons();
+    assert!(
+        comparisons <= ITEM_COUNT * 12,
+        "modport binding work grew non-linearly: {comparisons} prefix comparisons for {ITEM_COUNT} ports"
+    );
+}
+
+#[test]
+fn collecting_non_modport_ports_does_not_compare_every_path_to_every_port() {
+    let ports = (0..ITEM_COUNT)
+        .map(|i| format!("port_{i}: input logic"))
+        .collect::<Vec<_>>()
+        .join(",\n");
+    let code = format!(
+        r#"
+        module Top (
+            {ports},
+        ) {{}}
+        "#
+    );
+
+    crate::conv::ir::reset_interface_member_port_candidates();
+    let ir = convert(&code);
+    let candidates = crate::conv::ir::interface_member_port_candidates();
+    assert_eq!(
+        candidates, ITEM_COUNT,
+        "interface-member collection examined {candidates} port candidates for {ITEM_COUNT} ordinary ports"
+    );
+
+    let top = ir
+        .components
+        .iter()
+        .find_map(|component| match component {
+            crate::ir::Component::Module(module) if module.name.to_string() == "Top" => {
+                Some(module)
+            }
+            _ => None,
+        })
+        .expect("Top module");
+    assert_eq!(top.port_types.len(), ITEM_COUNT);
+    assert!(top.interface_members.is_empty());
+}

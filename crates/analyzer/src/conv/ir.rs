@@ -8,8 +8,30 @@ use crate::ir::{self, IrResult, VarKind, VarPath, Variable};
 use crate::symbol::SymbolKind;
 use crate::symbol_table;
 use crate::{HashMap, ir_error};
+use veryl_parser::resource_table::StrId;
 use veryl_parser::token_range::TokenRange;
 use veryl_parser::veryl_grammar_trait::*;
+
+#[cfg(test)]
+thread_local! {
+    static INTERFACE_MEMBER_PORT_CANDIDATES: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn reset_interface_member_port_candidates() {
+    INTERFACE_MEMBER_PORT_CANDIDATES.with(|candidates| candidates.set(0));
+}
+
+#[cfg(test)]
+pub(crate) fn interface_member_port_candidates() -> usize {
+    INTERFACE_MEMBER_PORT_CANDIDATES.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+fn count_interface_member_port_candidate() {
+    INTERFACE_MEMBER_PORT_CANDIDATES.with(|candidates| candidates.set(candidates.get() + 1));
+}
 
 /// Memo key for a top-level component's direct conversion, or `None` when
 /// sharing must not apply: a non-`veryl test` run (instantiation clears bodies)
@@ -159,16 +181,54 @@ fn conv_global_function(context: &mut Context, value: &FunctionDeclaration) {
     upper_context.inherit(&mut context);
 }
 
+#[derive(Default)]
+struct ModportPrefixIndex {
+    terminal: bool,
+    children: HashMap<StrId, ModportPrefixIndex>,
+}
+
+impl ModportPrefixIndex {
+    fn insert(&mut self, path: &[StrId]) {
+        let mut node = self;
+        for segment in path {
+            node = node.children.entry(*segment).or_default();
+        }
+        node.terminal = true;
+    }
+
+    fn contains_proper_prefix(&self, path: &[StrId]) -> bool {
+        if self.terminal && !path.is_empty() {
+            return true;
+        }
+        let mut node = self;
+        for (index, segment) in path.iter().enumerate() {
+            let Some(child) = node.children.get(segment) else {
+                return false;
+            };
+            node = child;
+            if node.terminal && index + 1 < path.len() {
+                return true;
+            }
+        }
+        false
+    }
+}
+
 fn collect_interface_members(context: &Context) -> HashMap<ir::VarId, Variable> {
+    let mut modport_prefixes = ModportPrefixIndex::default();
+    for (port, (r#type, _)) in &context.port_types {
+        #[cfg(test)]
+        count_interface_member_port_candidate();
+        if matches!(r#type.kind, ir::TypeKind::Modport(_, _)) {
+            modport_prefixes.insert(&port.0);
+        }
+    }
+
     context
         .var_paths
         .iter()
         .filter_map(|(path, (id, comptime))| {
-            let belongs_to_modport = context.port_types.iter().any(|(port, (r#type, _))| {
-                matches!(r#type.kind, ir::TypeKind::Modport(_, _))
-                    && path.0.len() > port.0.len()
-                    && path.starts_with(&port.0)
-            });
+            let belongs_to_modport = modport_prefixes.contains_proper_prefix(&path.0);
             (!context.variables.contains_key(id) && belongs_to_modport).then(|| {
                 let variable = Variable::new(
                     *id,
