@@ -676,26 +676,25 @@ fn runtime_index_offset_is_not_proven_disjoint_from_a_static_element() {
 }
 
 #[test]
-fn static_suffix_below_a_dynamic_dimension_is_not_kept_disjoint() {
-    // The body writes only inner element zero while feedback reads inner
-    // element one. The dynamic outer index shortens their shared LSP.
+fn broad_runtime_array_selections_do_not_correlate_interleaved_static_axes() {
     assert_intentional_false_positive(
-        "different inner dimensions below a dynamic outer index share one LSP",
+        "two broad runtime selections keep conservative whole-array domains",
         r#"
         module Top (
-            n: input  logic<2>,
-            o: output logic,
+            write_first: input  u32,
+            write_last : input  u32,
+            read_first : input  u32,
+            read_last  : input  u32,
+            o          : output logic,
         ) {
-            var value   : logic [4, 2];
             var feedback: logic;
-            assign feedback = value[0][1];
+            var bus: logic [2, 2, 2];
             always_comb {
-                value = '{default: 0};
-                for index in 0..n {
-                    value[index][0] = feedback;
-                }
+                bus = '{default: 0};
+                bus[write_first][0][write_last] = feedback;
                 o = feedback;
             }
+            assign feedback = bus[read_first][1][read_last];
         }
         "#,
     );

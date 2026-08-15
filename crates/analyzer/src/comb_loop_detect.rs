@@ -83,6 +83,7 @@ use crate::ir::{
 };
 use crate::symbol::{Affiliation, Direction};
 use daggy::petgraph::graph::NodeIndex;
+use std::rc::Rc;
 use veryl_parser::token_range::TokenRange;
 
 pub fn check(ir: &Ir) -> Vec<AnalyzerError> {
@@ -211,9 +212,14 @@ fn build_bit_partition(
                     .push(packed);
             } else {
                 for dst in &out.dst {
-                    for (array, packed) in dst_writes(dst, ctx) {
-                        accesses.entry((dst.id, array)).or_default().push(packed);
-                    }
+                    collect_destination_spans(dst, &mut accesses, ctx);
+                    collect_called_function_destination_spans(
+                        dst,
+                        module,
+                        &mut accesses,
+                        &mut visited_functions,
+                        ctx,
+                    );
                 }
             }
         }
@@ -288,6 +294,119 @@ fn add_whole_type_access(
         ))
         .or_default()
         .push(packed);
+}
+
+#[derive(Clone, Copy)]
+struct PeriodicArrayFilter {
+    period: usize,
+    phase: usize,
+    extent: usize,
+}
+
+/// Statically known coordinates of an otherwise dynamic unpacked access.
+///
+/// Each coordinate is represented as one periodic band in flattened storage,
+/// so checking a sparse partition key is independent of the declared array
+/// width. Size-one axes are omitted; consequently the number of meaningful
+/// filters is bounded by the number of bits in a representable array size.
+#[derive(Clone, Default)]
+struct StaticArrayFilters {
+    filters: Rc<Vec<PeriodicArrayFilter>>,
+}
+
+impl StaticArrayFilters {
+    fn new(parent: VarId, index: &crate::ir::VarIndex, ctx: &mut Context) -> Self {
+        let Some(shape) = ctx
+            .variables
+            .get(&parent)
+            .map(|variable| variable.r#type.array.clone())
+        else {
+            return Self::default();
+        };
+        let filters = index
+            .0
+            .iter()
+            .enumerate()
+            .filter_map(|(position, expression)| {
+                if !expression.comptime().is_const {
+                    return None;
+                }
+                let dimension = shape.get(position).copied().flatten()?;
+                if dimension == 1 {
+                    return None;
+                }
+                let value = expression.eval_value(ctx)?.to_usize()?;
+                if value >= dimension {
+                    return None;
+                }
+                let stride = shape[position + 1..]
+                    .iter()
+                    .try_fold(1usize, |stride, dimension| {
+                        stride.checked_mul((*dimension)?)
+                    })?;
+                Some(PeriodicArrayFilter {
+                    period: dimension.checked_mul(stride)?,
+                    phase: value.checked_mul(stride)?,
+                    extent: stride,
+                })
+            })
+            .collect();
+        Self {
+            filters: Rc::new(filters),
+        }
+    }
+
+    fn may_select(&self, span: ArraySpan) -> bool {
+        self.filters
+            .iter()
+            .all(|filter| periodic_array_filter_may_overlap(span, *filter))
+    }
+}
+
+fn periodic_array_filter_may_overlap(span: ArraySpan, filter: PeriodicArrayFilter) -> bool {
+    let Some(span_end) = span.end() else {
+        return true;
+    };
+    let Some(phase_end) = filter.phase.checked_add(filter.extent) else {
+        return true;
+    };
+    if filter.period == 0
+        || filter.extent == 0
+        || filter.phase >= filter.period
+        || phase_end > filter.period
+    {
+        return true;
+    }
+
+    let residue = span.start % filter.period;
+    let band_start = if residue < filter.phase {
+        span.start.checked_add(filter.phase - residue)
+    } else if residue < phase_end {
+        span.start.checked_sub(residue - filter.phase)
+    } else {
+        span.start
+            .checked_add(filter.period - residue)
+            .and_then(|start| start.checked_add(filter.phase))
+    };
+    band_start.is_some_and(|band_start| band_start < span_end)
+}
+
+fn filtered_actual_keys(
+    bit_part: &BitPartition,
+    parent: VarId,
+    array: ArraySpan,
+    packed: PackedSpan,
+    filters: &StaticArrayFilters,
+) -> Vec<NodeKey> {
+    bit_part
+        .overlapping_access(parent, array, packed)
+        .into_iter()
+        .filter(|key| {
+            key.1
+                .intersection(array)
+                .is_some_and(|span| filters.may_select(span))
+        })
+        .collect()
 }
 
 fn collect_instance_summary_spans(
@@ -511,6 +630,25 @@ fn collect_factor_spans(
             for (idx, packed) in var_reads(*id, index, select, comptime.member_select_domain, ctx) {
                 out.entry((*id, idx)).or_default().push(packed);
             }
+            for coordinate in index
+                .0
+                .iter()
+                .chain(select.0.iter())
+                .chain(select.1.iter().map(|(_, expression)| expression))
+            {
+                collect_expr_spans(coordinate, out, ctx);
+            }
+        }
+        Factor::HierVariable(variable) => {
+            for coordinate in variable
+                .index
+                .0
+                .iter()
+                .chain(variable.select.0.iter())
+                .chain(variable.select.1.iter().map(|(_, expression)| expression))
+            {
+                collect_expr_spans(coordinate, out, ctx);
+            }
         }
         Factor::FunctionCall(call) => {
             for coordinate in &call.receiver_index.0 {
@@ -519,15 +657,18 @@ fn collect_factor_spans(
             for input in call.inputs.values() {
                 collect_expr_spans(input, out, ctx);
             }
+            for outputs in call.outputs.values() {
+                for destination in outputs {
+                    collect_destination_spans(destination, out, ctx);
+                }
+            }
         }
         Factor::SystemFunctionCall(call) => {
             for_each_system_function_input(call, |expression| {
                 collect_expr_spans(expression, out, ctx);
             });
             for destination in system_function_outputs(call) {
-                for (index, packed) in dst_writes(destination, ctx) {
-                    out.entry((destination.id, index)).or_default().push(packed);
-                }
+                collect_destination_spans(destination, out, ctx);
             }
         }
         _ => {}
@@ -565,6 +706,31 @@ fn system_function_outputs(call: &SystemFunctionCall) -> &[AssignDestination] {
     }
 }
 
+fn collect_destination_spans(
+    destination: &AssignDestination,
+    out: &mut HashMap<IdxKey, Vec<PackedSpan>>,
+    ctx: &mut Context,
+) {
+    for coordinate in destination
+        .index
+        .0
+        .iter()
+        .chain(destination.select.0.iter())
+        .chain(
+            destination
+                .select
+                .1
+                .iter()
+                .map(|(_, expression)| expression),
+        )
+    {
+        collect_expr_spans(coordinate, out, ctx);
+    }
+    for (index, packed) in dst_writes(destination, ctx) {
+        out.entry((destination.id, index)).or_default().push(packed);
+    }
+}
+
 fn collect_statement_spans(
     statements: &[Statement],
     out: &mut HashMap<IdxKey, Vec<PackedSpan>>,
@@ -575,9 +741,7 @@ fn collect_statement_spans(
             Statement::Assign(assign) => {
                 collect_expr_spans(&assign.expr, out, ctx);
                 for destination in &assign.dst {
-                    for (index, packed) in dst_writes(destination, ctx) {
-                        out.entry((destination.id, index)).or_default().push(packed);
-                    }
+                    collect_destination_spans(destination, out, ctx);
                 }
             }
             Statement::If(statement) => {
@@ -604,17 +768,28 @@ fn collect_statement_spans(
                 collect_statement_spans(&statement.default, out, ctx);
             }
             Statement::For(statement) => {
+                let (start, end) = match &statement.range {
+                    crate::ir::ForRange::Forward { start, end, .. }
+                    | crate::ir::ForRange::Reverse { start, end, .. }
+                    | crate::ir::ForRange::Stepped { start, end, .. } => (start, end),
+                };
+                for bound in [start, end] {
+                    if let crate::ir::ForBound::Expression(expression) = bound {
+                        collect_expr_spans(expression, out, ctx);
+                    }
+                }
                 collect_statement_spans(&statement.body, out, ctx);
             }
             Statement::FunctionCall(call) => {
+                for coordinate in &call.receiver_index.0 {
+                    collect_expr_spans(coordinate, out, ctx);
+                }
                 for input in call.inputs.values() {
                     collect_expr_spans(input, out, ctx);
                 }
                 for outputs in call.outputs.values() {
                     for destination in outputs {
-                        for (index, packed) in dst_writes(destination, ctx) {
-                            out.entry((destination.id, index)).or_default().push(packed);
-                        }
+                        collect_destination_spans(destination, out, ctx);
                     }
                 }
             }
@@ -623,9 +798,7 @@ fn collect_statement_spans(
                     collect_expr_spans(expression, out, ctx);
                 });
                 for destination in system_function_outputs(call) {
-                    for (index, packed) in dst_writes(destination, ctx) {
-                        out.entry((destination.id, index)).or_default().push(packed);
-                    }
+                    collect_destination_spans(destination, out, ctx);
                 }
             }
             Statement::IfReset(statement) => {
@@ -676,6 +849,17 @@ fn collect_called_function_expr_spans(
                 }
                 for input in call.inputs.values() {
                     collect_called_function_expr_spans(input, module, out, visited, ctx);
+                }
+                for outputs in call.outputs.values() {
+                    for destination in outputs {
+                        collect_called_function_destination_spans(
+                            destination,
+                            module,
+                            out,
+                            visited,
+                            ctx,
+                        );
+                    }
                 }
                 collect_called_function_body_spans(call, module, out, visited, ctx);
             }
@@ -920,6 +1104,9 @@ fn collect_called_function_statement_spans(
                 collect_called_function_statement_spans(&statement.body, module, out, visited, ctx);
             }
             Statement::FunctionCall(call) => {
+                for coordinate in &call.receiver_index.0 {
+                    collect_called_function_expr_spans(coordinate, module, out, visited, ctx);
+                }
                 for input in call.inputs.values() {
                     collect_called_function_expr_spans(input, module, out, visited, ctx);
                 }
@@ -1819,6 +2006,7 @@ fn instance_region_mapping(
         && let Some((parent, index, select, member_select_domain)) =
             instance_port_region_actual(inst, region.id, direction)
     {
+        let array_filters = StaticArrayFilters::new(parent, index, ctx);
         return map_summary_region(
             region,
             variable,
@@ -1826,6 +2014,7 @@ fn instance_region_mapping(
             index,
             select,
             member_select_domain,
+            &array_filters,
             bit_part,
             ctx,
         );
@@ -1882,21 +2071,23 @@ fn instance_port_region_actual(
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct ActualFragment {
     parent: VarId,
     child_array: ArraySpan,
     child_packed: PackedSpan,
     parent_array: ArraySpan,
     parent_packed: PackedSpan,
+    array_filters: StaticArrayFilters,
     offset: BitDependency,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct TranslatedFragmentAccess {
     parent: VarId,
     array: ArraySpan,
     packed: PackedSpan,
+    array_filters: StaticArrayFilters,
     offset: BitDependency,
     child_domain: SummaryRegion,
 }
@@ -1909,6 +2100,7 @@ fn append_coerced_actual_fragments(
     actual_packed: PackedSpan,
     parent_array: ArraySpan,
     parent_packed: PackedSpan,
+    array_filters: &StaticArrayFilters,
     child_packed_width: usize,
     child_signed: bool,
 ) -> Option<()> {
@@ -1939,6 +2131,7 @@ fn append_coerced_actual_fragments(
             child_packed: copied,
             parent_array,
             parent_packed,
+            array_filters: array_filters.clone(),
             offset: BitDependency {
                 array: array_offset,
                 packed: packed_offset,
@@ -1961,6 +2154,7 @@ fn append_coerced_actual_fragments(
                 child_packed: PackedSpan::new(child_packed_width - 1, 1)?,
                 parent_array,
                 parent_packed,
+                array_filters: array_filters.clone(),
                 offset: BitDependency {
                     array: array_offset,
                     packed: None,
@@ -2019,24 +2213,28 @@ fn actual_fragments(
             let [(parent_array, parent_packed)] = spans.as_slice() else {
                 return None;
             };
+            let array_filters = StaticArrayFilters::new(destination.id, &destination.index, ctx);
             Some((
                 destination.id,
                 *parent_array,
                 *parent_packed,
                 array_length,
                 packed_width,
+                array_filters,
             ))
         })
         .collect::<Option<Vec<_>>>()?;
     let array_length = accesses
         .iter()
-        .try_fold(0usize, |total, (_, _, _, length, _)| {
+        .try_fold(0usize, |total, (_, _, _, length, _, _)| {
             total.checked_add(*length)
         })?;
     if array_length == child_array_length {
         let mut child_start = 0usize;
         let mut fragments = Vec::new();
-        for (parent, parent_array, parent_packed, array_length, packed_width) in accesses {
+        for (parent, parent_array, parent_packed, array_length, packed_width, array_filters) in
+            accesses
+        {
             let child_array = ArraySpan {
                 start: child_start,
                 length: array_length,
@@ -2049,6 +2247,7 @@ fn actual_fragments(
                 PackedSpan::whole(packed_width)?,
                 parent_array,
                 parent_packed,
+                &array_filters,
                 child_packed_width,
                 child.r#type.signed,
             )?;
@@ -2058,20 +2257,20 @@ fn actual_fragments(
 
     let packed_width = accesses
         .iter()
-        .try_fold(0usize, |total, (_, _, _, _, width)| {
+        .try_fold(0usize, |total, (_, _, _, _, width, _)| {
             total.checked_add(*width)
         })?;
     if child_array_length != 1
         || accesses
             .iter()
-            .any(|(_, _, _, array_length, _)| *array_length != 1)
+            .any(|(_, _, _, array_length, _, _)| *array_length != 1)
     {
         return None;
     }
 
     let mut actual_start = packed_width;
     let mut fragments = Vec::new();
-    for (parent, parent_array, parent_packed, _, fragment_width) in accesses {
+    for (parent, parent_array, parent_packed, _, fragment_width, array_filters) in accesses {
         actual_start = actual_start.checked_sub(fragment_width)?;
         append_coerced_actual_fragments(
             &mut fragments,
@@ -2083,6 +2282,7 @@ fn actual_fragments(
             PackedSpan::new(actual_start, fragment_width)?,
             parent_array,
             parent_packed,
+            &array_filters,
             child_packed_width,
             child.r#type.signed,
         )?;
@@ -2113,6 +2313,7 @@ fn contiguous_actual_fragment(
             length: actual.parent_array_length,
         },
         parent_packed: PackedSpan::new(actual.parent_packed_start, actual.parent_packed_length)?,
+        array_filters: StaticArrayFilters::default(),
         offset: BitDependency {
             array: Some(signed_difference(actual.parent_array_start, 0)?),
             packed: Some(signed_difference(actual.parent_packed_start, 0)?),
@@ -2146,6 +2347,7 @@ fn coerced_contiguous_actual_fragments(
         PackedSpan::whole(actual.parent_packed_length)?,
         parent_array,
         parent_packed,
+        &StaticArrayFilters::default(),
         child_packed_width,
         child.r#type.signed,
     )?;
@@ -2179,6 +2381,7 @@ fn translate_actual_fragments(
                 parent: fragment.parent,
                 array,
                 packed,
+                array_filters: fragment.array_filters,
                 offset: fragment.offset,
                 child_domain: SummaryRegion {
                     id: region.id,
@@ -2234,15 +2437,20 @@ fn map_translated_fragment_accesses(
     let mut nodes = Vec::new();
     for access in accesses {
         nodes.extend(
-            bit_part
-                .overlapping_access(access.parent, access.array, access.packed)
-                .into_iter()
-                .map(|key| MappedNode {
-                    key,
-                    offset: access.offset,
-                    child_domain: Some(access.child_domain),
-                    condition: PathCondition::default(),
-                }),
+            filtered_actual_keys(
+                bit_part,
+                access.parent,
+                access.array,
+                access.packed,
+                &access.array_filters,
+            )
+            .into_iter()
+            .map(|key| MappedNode {
+                key,
+                offset: access.offset,
+                child_domain: Some(access.child_domain),
+                condition: PathCondition::default(),
+            }),
         );
     }
     InstanceRegionMapping { nodes }
@@ -2297,6 +2505,7 @@ fn map_summary_region(
     index: &crate::ir::VarIndex,
     select: &VarSelect,
     member_select_domain: Option<MemberSelectDomain>,
+    array_filters: &StaticArrayFilters,
     bit_part: &BitPartition,
     ctx: &mut Context,
 ) -> InstanceRegionMapping {
@@ -2314,7 +2523,13 @@ fn map_summary_region(
         Some(offset)
     } else {
         for (array, packed) in var_reads(parent, index, select, member_select_domain, ctx) {
-            keys.extend(bit_part.overlapping_access(parent, array, packed));
+            keys.extend(filtered_actual_keys(
+                bit_part,
+                parent,
+                array,
+                packed,
+                array_filters,
+            ));
         }
         None
     };
@@ -2850,8 +3065,15 @@ fn collect_factor_node_keys(
 ) {
     match factor {
         Factor::Variable(id, index, select, comptime) => {
+            let array_filters = StaticArrayFilters::new(*id, index, ctx);
             for (idx, span) in var_reads(*id, index, select, comptime.member_select_domain, ctx) {
-                out.extend(bit_part.overlapping_access(*id, idx, span));
+                out.extend(filtered_actual_keys(
+                    bit_part,
+                    *id,
+                    idx,
+                    span,
+                    &array_filters,
+                ));
             }
         }
         Factor::FunctionCall(_) | Factor::SystemFunctionCall(_) => {
@@ -2867,8 +3089,15 @@ fn collect_dst_node_keys(
     out: &mut Vec<NodeKey>,
     ctx: &mut Context,
 ) {
+    let array_filters = StaticArrayFilters::new(dst.id, &dst.index, ctx);
     for (array, packed) in dst_writes(dst, ctx) {
-        out.extend(bit_part.overlapping_access(dst.id, array, packed));
+        out.extend(filtered_actual_keys(
+            bit_part,
+            dst.id,
+            array,
+            packed,
+            &array_filters,
+        ));
     }
 }
 

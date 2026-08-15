@@ -1996,6 +1996,251 @@ fn runtime_logical_and_condition_merges_the_skipped_rhs_effect() {
     );
 }
 
+fn dynamic_write_interleaved_static_coordinate_code(feedback_middle: usize) -> String {
+    format!(
+        r#"
+        module Top (
+            first: input  u32,
+            last : input  u32,
+            o    : output logic,
+        ) {{
+            var feedback: logic;
+            var bus: logic [2, 2, 2];
+            always_comb {{
+                bus[0][0][0] = 0;
+                bus[0][0][1] = 0;
+                bus[0][1][0] = 0;
+                bus[0][1][1] = 0;
+                bus[1][0][0] = 0;
+                bus[1][0][1] = 0;
+                bus[1][1][0] = 0;
+                bus[1][1][1] = 0;
+                bus[first][0][last] = feedback;
+                o = feedback;
+            }}
+            assign feedback = bus[0][{feedback_middle}][0];
+        }}
+        "#,
+    )
+}
+
+#[test]
+fn comb_loop_dynamic_write_preserves_an_interleaved_static_coordinate() {
+    let code = dynamic_write_interleaved_static_coordinate_code(0);
+    assert!(comb_loop_analysis_is_complete(&code));
+    assert_comb_loop(
+        "a dynamic write reaches the selected interleaved static coordinate",
+        &code,
+        true,
+    );
+}
+
+#[test]
+fn comb_loop_dynamic_write_keeps_an_interleaved_static_coordinate_disjoint() {
+    let code = dynamic_write_interleaved_static_coordinate_code(1);
+    assert!(comb_loop_analysis_is_complete(&code));
+    assert_comb_loop(
+        "a dynamic write cannot cross an interleaved static coordinate",
+        &code,
+        false,
+    );
+}
+
+fn dynamic_write_interleaved_static_coordinate_with_dynamic_packed_select_code(
+    feedback_middle: usize,
+) -> String {
+    format!(
+        r#"
+        module Top (
+            first    : input  u32,
+            last     : input  u32,
+            bit_index: input  u32,
+            o        : output logic,
+        ) {{
+            var feedback: logic;
+            var bus: logic<2> [2, 2, 2];
+            always_comb {{
+                bus[0][0][0] = 0;
+                bus[0][0][1] = 0;
+                bus[0][1][0] = 0;
+                bus[0][1][1] = 0;
+                bus[1][0][0] = 0;
+                bus[1][0][1] = 0;
+                bus[1][1][0] = 0;
+                bus[1][1][1] = 0;
+                bus[first][0][last][bit_index] = feedback;
+                o = feedback;
+            }}
+            assign feedback = bus[0][{feedback_middle}][0][0];
+        }}
+        "#,
+    )
+}
+
+#[test]
+fn comb_loop_dynamic_write_with_a_dynamic_packed_select_preserves_an_interleaved_static_coordinate()
+{
+    let code = dynamic_write_interleaved_static_coordinate_with_dynamic_packed_select_code(0);
+    assert!(comb_loop_analysis_is_complete(&code));
+    assert_comb_loop(
+        "a dynamic packed write reaches its selected interleaved array coordinate",
+        &code,
+        true,
+    );
+}
+
+#[test]
+fn comb_loop_dynamic_write_with_a_dynamic_packed_select_keeps_an_interleaved_static_coordinate_disjoint()
+ {
+    let code = dynamic_write_interleaved_static_coordinate_with_dynamic_packed_select_code(1);
+    assert!(comb_loop_analysis_is_complete(&code));
+    assert_comb_loop(
+        "a dynamic packed write cannot cross an interleaved static array coordinate",
+        &code,
+        false,
+    );
+}
+
+fn dynamic_read_interleaved_static_coordinate_code(feedback_middle: usize) -> String {
+    format!(
+        r#"
+        module Top (
+            first: input  u32,
+            last : input  u32,
+            o    : output logic,
+        ) {{
+            var feedback: logic;
+            var bus: logic [2, 2, 2];
+            assign feedback = bus[first][{feedback_middle}][last];
+            always_comb {{
+                bus[0][0][0] = feedback;
+                bus[0][0][1] = 0;
+                bus[0][1][0] = 0;
+                bus[0][1][1] = 0;
+                bus[1][0][0] = 0;
+                bus[1][0][1] = 0;
+                bus[1][1][0] = 0;
+                bus[1][1][1] = 0;
+                o = feedback;
+            }}
+        }}
+        "#,
+    )
+}
+
+#[test]
+fn comb_loop_dynamic_read_preserves_an_interleaved_static_coordinate() {
+    let code = dynamic_read_interleaved_static_coordinate_code(0);
+    assert!(comb_loop_analysis_is_complete(&code));
+    assert_comb_loop(
+        "a dynamic read reaches the selected interleaved static coordinate",
+        &code,
+        true,
+    );
+}
+
+#[test]
+fn comb_loop_dynamic_read_keeps_an_interleaved_static_coordinate_disjoint() {
+    let code = dynamic_read_interleaved_static_coordinate_code(1);
+    assert!(comb_loop_analysis_is_complete(&code));
+    assert_comb_loop(
+        "a dynamic read cannot cross an interleaved static coordinate",
+        &code,
+        false,
+    );
+}
+
+#[test]
+fn comb_loop_dynamic_write_does_not_control_an_unreachable_periodic_gap() {
+    assert_comb_loop(
+        "a dynamic write to the odd suffix cannot write the even selector bit",
+        r#"
+        module Top (o: output logic) {
+            var index: logic;
+            var bus  : logic [2, 2];
+            assign index = bus[0][0];
+            always_comb {
+                bus[0][0] = 0;
+                bus[0][1] = 0;
+                bus[1][0] = 0;
+                bus[1][1] = 0;
+                bus[index][1] = 0;
+                o = bus[0][0] | bus[0][1] | bus[1][0] | bus[1][1];
+            }
+        }
+        "#,
+        false,
+    );
+}
+
+#[test]
+fn comb_loop_dynamic_write_controls_a_reachable_periodic_candidate() {
+    assert_comb_loop(
+        "a dynamic write retains control feedback through a reachable suffix bit",
+        r#"
+        module Top (o: output logic) {
+            var index: logic;
+            var bus  : logic [2, 2];
+            assign index = bus[0][1];
+            always_comb {
+                bus[0][0] = 0;
+                bus[0][1] = 0;
+                bus[1][0] = 0;
+                bus[1][1] = 0;
+                bus[index][1] = 0;
+                o = bus[0][0] | bus[0][1] | bus[1][0] | bus[1][1];
+            }
+        }
+        "#,
+        true,
+    );
+}
+
+fn dynamic_write_static_suffix_code(feedback_element: usize) -> String {
+    format!(
+        r#"
+        module Top (
+            index: input  u32,
+            o    : output logic,
+        ) {{
+            var feedback: logic;
+            var bus: logic [2, 2];
+            always_comb {{
+                bus[0][0] = 0;
+                bus[0][1] = 0;
+                bus[1][0] = 0;
+                bus[1][1] = 0;
+                bus[index][1] = feedback;
+                o = feedback;
+            }}
+            assign feedback = bus[0][{feedback_element}];
+        }}
+        "#,
+    )
+}
+
+#[test]
+fn comb_loop_dynamic_write_preserves_static_suffix_feedback() {
+    let code = dynamic_write_static_suffix_code(1);
+    assert!(comb_loop_analysis_is_complete(&code));
+    assert_comb_loop(
+        "a dynamic write retains feedback through its static suffix",
+        &code,
+        true,
+    );
+}
+
+#[test]
+fn comb_loop_dynamic_write_keeps_other_static_suffix_disjoint() {
+    let code = dynamic_write_static_suffix_code(0);
+    assert!(comb_loop_analysis_is_complete(&code));
+    assert_comb_loop(
+        "a dynamic write does not taint another static suffix",
+        &code,
+        false,
+    );
+}
+
 #[test]
 fn runtime_logical_or_condition_merges_the_skipped_rhs_effect() {
     assert_comb_loop(

@@ -2907,6 +2907,434 @@ fn function_summary_snapshots_actuals_in_source_order_false_positive() {
 }
 
 #[test]
+fn comb_loop_function_output_destination_selector_controls_copyback() {
+    assert_comb_loop(
+        "a function output copyback is controlled by its dynamic destination selector",
+        r#"
+        module Top (o: output logic) {
+            var selector: logic;
+            var value   : logic<2>;
+            function set (v: output logic) {
+                v = 1;
+            }
+            assign selector = value[0];
+            always_comb {
+                value = 0;
+                set(value[selector]);
+                o = |value;
+            }
+        }
+        "#,
+        true,
+    );
+}
+
+#[test]
+fn comb_loop_function_output_destination_selector_accepts_independent_input() {
+    assert_comb_loop(
+        "an independent function output selector does not create feedback",
+        r#"
+        module Top (selector: input logic, o: output logic) {
+            var value: logic<2>;
+            function set (v: output logic) {
+                v = 1;
+            }
+            always_comb {
+                value = 0;
+                set(value[selector]);
+                o = |value;
+            }
+        }
+        "#,
+        false,
+    );
+}
+
+fn dynamic_function_output_interleaved_static_coordinate_code(feedback_middle: usize) -> String {
+    format!(
+        r#"
+        module Top (
+            first: input  u32,
+            last : input  u32,
+            o    : output logic,
+        ) {{
+            var feedback: logic;
+            var bus: logic [2, 2, 2];
+            function copy (
+                i: input  logic,
+                y: output logic,
+            ) {{
+                y = i;
+            }}
+            always_comb {{
+                bus[0][0][0] = 0;
+                bus[0][0][1] = 0;
+                bus[0][1][0] = 0;
+                bus[0][1][1] = 0;
+                bus[1][0][0] = 0;
+                bus[1][0][1] = 0;
+                bus[1][1][0] = 0;
+                bus[1][1][1] = 0;
+                copy(feedback, bus[first][0][last]);
+                o = feedback;
+            }}
+            assign feedback = bus[0][{feedback_middle}][0];
+        }}
+        "#,
+    )
+}
+
+#[test]
+fn comb_loop_dynamic_function_output_preserves_an_interleaved_static_coordinate() {
+    let code = dynamic_function_output_interleaved_static_coordinate_code(0);
+    assert!(comb_loop_analysis_is_complete(&code));
+    assert_comb_loop(
+        "function copyback reaches the selected interleaved static coordinate",
+        &code,
+        true,
+    );
+}
+
+#[test]
+fn comb_loop_dynamic_function_output_keeps_an_interleaved_static_coordinate_disjoint() {
+    let code = dynamic_function_output_interleaved_static_coordinate_code(1);
+    assert!(comb_loop_analysis_is_complete(&code));
+    assert_comb_loop(
+        "function copyback cannot cross an interleaved static coordinate",
+        &code,
+        false,
+    );
+}
+
+fn dynamic_function_output_interleaved_static_coordinate_with_dynamic_packed_select_code(
+    feedback_middle: usize,
+) -> String {
+    format!(
+        r#"
+        module Top (
+            first    : input  u32,
+            last     : input  u32,
+            bit_index: input  u32,
+            o        : output logic,
+        ) {{
+            var feedback: logic;
+            var bus: logic<2> [2, 2, 2];
+            function copy (
+                i: input  logic,
+                y: output logic,
+            ) {{
+                y = i;
+            }}
+            always_comb {{
+                bus[0][0][0] = 0;
+                bus[0][0][1] = 0;
+                bus[0][1][0] = 0;
+                bus[0][1][1] = 0;
+                bus[1][0][0] = 0;
+                bus[1][0][1] = 0;
+                bus[1][1][0] = 0;
+                bus[1][1][1] = 0;
+                copy(feedback, bus[first][0][last][bit_index]);
+                o = feedback;
+            }}
+            assign feedback = bus[0][{feedback_middle}][0][0];
+        }}
+        "#,
+    )
+}
+
+#[test]
+fn comb_loop_dynamic_function_output_with_a_dynamic_packed_select_preserves_an_interleaved_static_coordinate()
+ {
+    let code =
+        dynamic_function_output_interleaved_static_coordinate_with_dynamic_packed_select_code(0);
+    assert!(comb_loop_analysis_is_complete(&code));
+    assert_comb_loop(
+        "dynamic packed function copyback reaches its selected interleaved array coordinate",
+        &code,
+        true,
+    );
+}
+
+#[test]
+fn comb_loop_dynamic_function_output_with_a_dynamic_packed_select_keeps_an_interleaved_static_coordinate_disjoint()
+ {
+    let code =
+        dynamic_function_output_interleaved_static_coordinate_with_dynamic_packed_select_code(1);
+    assert!(comb_loop_analysis_is_complete(&code));
+    assert_comb_loop(
+        "dynamic packed function copyback cannot cross an interleaved static array coordinate",
+        &code,
+        false,
+    );
+}
+
+#[test]
+fn comb_loop_dynamic_function_output_does_not_control_an_unreachable_periodic_gap() {
+    assert_comb_loop(
+        "function copyback to the odd suffix cannot write the even selector bit",
+        r#"
+        module Top (o: output logic) {
+            var index: logic;
+            var bus  : logic [2, 2];
+            function set (y: output logic) {
+                y = 0;
+            }
+            assign index = bus[0][0];
+            always_comb {
+                bus[0][0] = 0;
+                bus[0][1] = 0;
+                bus[1][0] = 0;
+                bus[1][1] = 0;
+                set(bus[index][1]);
+                o = bus[0][0] | bus[0][1] | bus[1][0] | bus[1][1];
+            }
+        }
+        "#,
+        false,
+    );
+}
+
+#[test]
+fn comb_loop_dynamic_function_output_controls_a_reachable_periodic_candidate() {
+    assert_comb_loop(
+        "function copyback retains selector feedback for a reachable suffix bit",
+        r#"
+        module Top (o: output logic) {
+            var index: logic;
+            var bus  : logic [2, 2];
+            function set (y: output logic) {
+                y = 0;
+            }
+            assign index = bus[0][1];
+            always_comb {
+                bus[0][0] = 0;
+                bus[0][1] = 0;
+                bus[1][0] = 0;
+                bus[1][1] = 0;
+                set(bus[index][1]);
+                o = bus[0][0] | bus[0][1] | bus[1][0] | bus[1][1];
+            }
+        }
+        "#,
+        true,
+    );
+}
+
+fn dynamic_function_output_code(
+    nested: bool,
+    packed: bool,
+    destination: &str,
+    feedback_source: &str,
+) -> String {
+    let bus_type = if packed {
+        "logic<2> [2, 2]"
+    } else {
+        "logic [2, 2]"
+    };
+    let nested_function = nested.then_some(
+        r#"
+        function nested_copy (
+            i: input logic,
+            y: output logic,
+        ) {
+            copy(i, y);
+        }
+        "#,
+    );
+    let callee = if nested { "nested_copy" } else { "copy" };
+    format!(
+        r#"
+        module Top (
+            index: input u32,
+            o    : output logic,
+        ) {{
+            var feedback: logic;
+            var bus: {bus_type};
+            function copy (
+                i: input logic,
+                y: output logic,
+            ) {{
+                y = i;
+            }}
+            {nested_function}
+            always_comb {{
+                bus[0][0] = 0;
+                bus[0][1] = 0;
+                bus[1][0] = 0;
+                bus[1][1] = 0;
+                {callee}(feedback, {destination});
+                o = feedback;
+            }}
+            assign feedback = {feedback_source};
+        }}
+        "#,
+        nested_function = nested_function.unwrap_or_default(),
+    )
+}
+
+#[test]
+fn comb_loop_dynamic_function_output_reaches_every_candidate_in_static_prefix() {
+    let code = dynamic_function_output_code(false, false, "bus[0][index]", "bus[0][1]");
+    assert!(comb_loop_analysis_is_complete(&code));
+    assert_comb_loop(
+        "a dynamic function output reaches every candidate below its static prefix",
+        &code,
+        true,
+    );
+}
+
+#[test]
+fn comb_loop_dynamic_function_output_keeps_outer_prefixes_disjoint() {
+    assert_comb_loop(
+        "a dynamic function output cannot escape its static outer prefix",
+        &dynamic_function_output_code(false, false, "bus[0][index]", "bus[1][0]"),
+        false,
+    );
+}
+
+#[test]
+fn comb_loop_dynamic_function_output_preserves_packed_position() {
+    assert_comb_loop(
+        "a dynamic unpacked output retains its selected packed bit",
+        &dynamic_function_output_code(false, true, "bus[1][index][0]", "bus[1][1][0]"),
+        true,
+    );
+}
+
+#[test]
+fn comb_loop_dynamic_function_output_keeps_packed_bits_disjoint() {
+    assert_comb_loop(
+        "a dynamic unpacked output does not taint a disjoint packed bit",
+        &dynamic_function_output_code(false, true, "bus[1][index][0]", "bus[1][1][1]"),
+        false,
+    );
+}
+
+#[test]
+fn comb_loop_dynamic_function_output_survives_a_nested_summary() {
+    let code = dynamic_function_output_code(true, false, "bus[0][index]", "bus[0][1]");
+    assert!(comb_loop_analysis_is_complete(&code));
+    assert_comb_loop(
+        "a dynamic function output candidate survives a nested function summary",
+        &code,
+        true,
+    );
+}
+
+#[test]
+fn comb_loop_dynamic_function_output_summary_keeps_outer_prefixes_disjoint() {
+    assert_comb_loop(
+        "a summarized dynamic function output retains its static outer prefix",
+        &dynamic_function_output_code(true, false, "bus[0][index]", "bus[1][0]"),
+        false,
+    );
+}
+
+fn dynamic_function_output_static_suffix_code(feedback_element: usize) -> String {
+    format!(
+        r#"
+        module Top (
+            index: input  u32,
+            o    : output logic,
+        ) {{
+            var feedback: logic;
+            var bus: logic [2, 2];
+            function copy (
+                i: input  logic,
+                y: output logic,
+            ) {{
+                y = i;
+            }}
+            always_comb {{
+                bus[0][0] = 0;
+                bus[0][1] = 0;
+                bus[1][0] = 0;
+                bus[1][1] = 0;
+                copy(feedback, bus[index][0]);
+                o = feedback;
+            }}
+            assign feedback = bus[0][{feedback_element}];
+        }}
+        "#,
+    )
+}
+
+#[test]
+fn comb_loop_dynamic_function_output_preserves_static_suffix_feedback() {
+    let code = dynamic_function_output_static_suffix_code(0);
+    assert!(comb_loop_analysis_is_complete(&code));
+    assert_comb_loop(
+        "a dynamic function output retains feedback through its static suffix",
+        &code,
+        true,
+    );
+}
+
+#[test]
+fn comb_loop_dynamic_function_output_keeps_other_static_suffix_disjoint() {
+    let code = dynamic_function_output_static_suffix_code(1);
+    assert!(comb_loop_analysis_is_complete(&code));
+    assert_comb_loop(
+        "a dynamic function output does not taint another static suffix",
+        &code,
+        false,
+    );
+}
+
+fn dynamic_function_array_output_code(feedback_element: usize) -> String {
+    format!(
+        r#"
+        module Top (
+            index: input u32,
+            o    : output logic,
+        ) {{
+            var feedback: logic;
+            var bus: logic [2, 2];
+            function place (
+                i: input logic,
+                y: output logic [2],
+            ) {{
+                y[0] = i;
+                y[1] = 0;
+            }}
+            always_comb {{
+                bus[0][0] = 0;
+                bus[0][1] = 0;
+                bus[1][0] = 0;
+                bus[1][1] = 0;
+                place(feedback, bus[index]);
+                o = feedback;
+            }}
+            assign feedback = bus[1][{feedback_element}];
+        }}
+        "#,
+    )
+}
+
+#[test]
+fn comb_loop_dynamic_function_array_output_preserves_trailing_element_position() {
+    let code = dynamic_function_array_output_code(0);
+    assert!(comb_loop_analysis_is_complete(&code));
+    assert_comb_loop(
+        "a dynamic function array output preserves its trailing element position",
+        &code,
+        true,
+    );
+}
+
+#[test]
+fn comb_loop_dynamic_function_array_output_keeps_trailing_elements_disjoint() {
+    let code = dynamic_function_array_output_code(1);
+    assert!(comb_loop_analysis_is_complete(&code));
+    assert_comb_loop(
+        "a dynamic function array output does not taint another trailing element",
+        &code,
+        false,
+    );
+}
+
+#[test]
 fn expression_snapshot_preserves_nested_function_return_dependencies() {
     assert_comb_loop(
         "an effects pass cannot discard a nested call used by the cached return value",

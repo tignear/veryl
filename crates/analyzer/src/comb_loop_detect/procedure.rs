@@ -142,6 +142,194 @@ struct AffineIndex {
     constant: isize,
 }
 
+#[derive(Clone, Copy)]
+struct DestinationArrayProjection {
+    destination: ArraySpan,
+    source: ArraySpan,
+    /// Translation from expression-local/formal array coordinates to this
+    /// destination key. A key spanning more than one periodic candidate has
+    /// no single exact translation.
+    array_offset: Option<isize>,
+}
+
+#[derive(Clone, Copy)]
+struct PeriodicArrayFilter {
+    period: usize,
+    phase: usize,
+    extent: usize,
+}
+
+#[derive(Clone)]
+struct DestinationArraySelection {
+    dynamic: bool,
+    /// Geometry of the statically selected suffix after the last dynamic
+    /// index. Reachable storage intervals start at `phase` modulo `period`
+    /// and have `extent` elements.
+    period: Option<usize>,
+    phase: usize,
+    extent: Option<usize>,
+    /// Constraints from every statically known coordinate, including a
+    /// constant between two dynamic coordinates such as `a[i][0][j]`.
+    static_filters: Vec<PeriodicArrayFilter>,
+}
+
+impl DestinationArrayProjection {
+    fn position_offset(
+        self,
+        destination_packed: usize,
+        source_packed: usize,
+    ) -> Option<PositionRelation> {
+        Some(PositionRelation {
+            array: self.array_offset,
+            packed: Some(signed_difference(destination_packed, source_packed)?),
+        })
+    }
+}
+
+enum PeriodicArrayProjection {
+    Exact(Option<DestinationArrayProjection>),
+    Unknown,
+}
+
+fn periodic_destination_array_projection(
+    destination: ArraySpan,
+    period: usize,
+    phase: usize,
+    extent: usize,
+) -> PeriodicArrayProjection {
+    let Some(phase_end) = phase.checked_add(extent) else {
+        return PeriodicArrayProjection::Unknown;
+    };
+    if period == 0 || extent == 0 || phase >= period || phase_end > period {
+        return PeriodicArrayProjection::Unknown;
+    }
+    let Some(destination_end) = destination.end() else {
+        return PeriodicArrayProjection::Unknown;
+    };
+
+    let residue = destination.start % period;
+    let band_start = if residue < phase {
+        destination.start.checked_add(phase - residue)
+    } else if residue < phase_end {
+        destination.start.checked_sub(residue - phase)
+    } else {
+        destination
+            .start
+            .checked_add(period - residue)
+            .and_then(|start| start.checked_add(phase))
+    };
+    let Some(band_start) = band_start else {
+        // The next periodic interval lies beyond the address space, and the
+        // input span itself was already known not to overflow.
+        return PeriodicArrayProjection::Exact(None);
+    };
+    if band_start >= destination_end {
+        return PeriodicArrayProjection::Exact(None);
+    }
+    let Some(band_end) = band_start.checked_add(extent) else {
+        return PeriodicArrayProjection::Unknown;
+    };
+    let fragment_start = destination.start.max(band_start);
+    let fragment_end = destination_end.min(band_end);
+    if fragment_start >= fragment_end {
+        return PeriodicArrayProjection::Exact(None);
+    }
+
+    let spans_multiple_bands = band_start
+        .checked_add(period)
+        .is_some_and(|next| next < destination_end);
+    if spans_multiple_bands {
+        return PeriodicArrayProjection::Exact(Some(DestinationArrayProjection {
+            destination,
+            source: ArraySpan {
+                start: 0,
+                length: extent,
+            },
+            array_offset: None,
+        }));
+    }
+
+    PeriodicArrayProjection::Exact(Some(DestinationArrayProjection {
+        destination: ArraySpan {
+            start: fragment_start,
+            length: fragment_end - fragment_start,
+        },
+        source: ArraySpan {
+            start: fragment_start - band_start,
+            length: fragment_end - fragment_start,
+        },
+        array_offset: isize::try_from(band_start).ok(),
+    }))
+}
+
+fn destination_array_projection(
+    key: ArraySpan,
+    candidates: ArraySpan,
+    selection: &DestinationArraySelection,
+) -> Option<DestinationArrayProjection> {
+    let destination = key.intersection(candidates)?;
+    if !selection.dynamic {
+        return Some(DestinationArrayProjection {
+            destination,
+            source: destination.translated(candidates.start, 0)?,
+            array_offset: isize::try_from(candidates.start).ok(),
+        });
+    }
+
+    for filter in &selection.static_filters {
+        if matches!(
+            periodic_destination_array_projection(
+                destination,
+                filter.period,
+                filter.phase,
+                filter.extent,
+            ),
+            PeriodicArrayProjection::Exact(None)
+        ) {
+            return None;
+        }
+    }
+
+    if let (Some(period), Some(extent)) = (selection.period, selection.extent) {
+        match periodic_destination_array_projection(destination, period, selection.phase, extent) {
+            PeriodicArrayProjection::Exact(projection) => return projection,
+            PeriodicArrayProjection::Unknown => {}
+        }
+    }
+
+    let source = {
+        // A dynamic unpacked index broadcasts the selected value to every
+        // candidate below the statically resolved prefix. Preserve trailing
+        // unpacked dimensions by projecting storage coordinates modulo the
+        // extent selected by one dynamic-prefix value.
+        if let Some(extent) = selection.extent.filter(|extent| *extent != 0) {
+            let relative = destination.start.checked_sub(candidates.start)?;
+            let start = relative % extent;
+            if destination.length >= extent || start.checked_add(destination.length)? > extent {
+                ArraySpan {
+                    start: 0,
+                    length: extent,
+                }
+            } else {
+                ArraySpan {
+                    start,
+                    length: destination.length,
+                }
+            }
+        } else {
+            ArraySpan {
+                start: 0,
+                length: destination.length,
+            }
+        }
+    };
+    Some(DestinationArrayProjection {
+        destination,
+        source,
+        array_offset: None,
+    })
+}
+
 impl AffineIndex {
     fn variable(id: VarId) -> Self {
         Self {
@@ -1355,6 +1543,7 @@ struct FormalOutputCoercion {
 struct ProjectionContext {
     destination_index: Option<AffineIndex>,
     destination_array: Option<ArraySpan>,
+    destination_array_offset: Option<isize>,
 }
 
 impl ExpressionSources {
@@ -2339,12 +2528,18 @@ impl<'a, 's> ProcedureAnalysis<'a, 's> {
         }
         let mut keys = Vec::new();
         let index = self.receiver_index(id, index);
+        let selection = self.destination_array_selection(id, &index);
         let accesses = var_reads(id, &index, select, member_select_domain, &mut self.ctx);
         if accesses.is_empty() {
             self.status = self.status.max(AnalysisStatus::Partial);
         }
         for (idx, span) in accesses {
-            keys.extend(self.bit_part.overlapping_access(id, idx, span));
+            keys.extend(
+                self.bit_part
+                    .overlapping_access(id, idx, span)
+                    .into_iter()
+                    .filter(|key| destination_array_projection(key.1, idx, &selection).is_some()),
+            );
         }
         keys.sort_unstable();
         keys.dedup();
@@ -2398,6 +2593,113 @@ impl<'a, 's> ProcedureAnalysis<'a, 's> {
         }
         let flattened = variable.r#type.array.calc_index_expr(&index.0)?;
         affine_index(&flattened, &mut self.ctx)
+    }
+
+    fn destination_array_selection(
+        &mut self,
+        id: VarId,
+        index: &VarIndex,
+    ) -> DestinationArraySelection {
+        let index = self.receiver_index(id, index);
+        let last_dynamic = index
+            .0
+            .iter()
+            .rposition(|expression| !expression.comptime().is_const);
+        let dynamic = last_dynamic.is_some();
+        let Some(shape) = self
+            .ctx
+            .variables
+            .get(&id)
+            .map(|variable| variable.r#type.array.clone())
+        else {
+            return DestinationArraySelection {
+                dynamic,
+                period: None,
+                phase: 0,
+                extent: None,
+                static_filters: Vec::new(),
+            };
+        };
+        let extent = (index.dimension() <= shape.dims())
+            .then(|| {
+                shape[index.dimension()..]
+                    .iter()
+                    .try_fold(1usize, |extent, dimension| {
+                        extent.checked_mul((*dimension)?)
+                    })
+            })
+            .flatten();
+        let periodic = last_dynamic.and_then(|last_dynamic| {
+            let extent = extent?;
+            let period = shape[last_dynamic + 1..]
+                .iter()
+                .try_fold(1usize, |period, dimension| {
+                    period.checked_mul((*dimension)?)
+                })?;
+            let mut phase = 0usize;
+            for (position, expression) in index.0.iter().enumerate().skip(last_dynamic + 1) {
+                let dimension = shape.get(position).copied().flatten()?;
+                let value = expression.eval_value(&mut self.ctx)?.to_usize()?;
+                if value >= dimension {
+                    return None;
+                }
+                phase = phase.checked_mul(dimension)?.checked_add(value)?;
+            }
+            phase = phase.checked_mul(extent)?;
+            Some((period, phase))
+        });
+        let static_filters = index
+            .0
+            .iter()
+            .enumerate()
+            .filter_map(|(position, expression)| {
+                if !expression.comptime().is_const {
+                    return None;
+                }
+                let dimension = shape.get(position).copied().flatten()?;
+                // A size-one axis constrains no storage coordinate. Skipping
+                // it also bounds meaningful periodic filters by the number of
+                // bits in the flattened array size, rather than by an
+                // arbitrarily long list of singleton dimensions.
+                if dimension == 1 {
+                    return None;
+                }
+                let value = expression.eval_value(&mut self.ctx)?.to_usize()?;
+                if value >= dimension {
+                    return None;
+                }
+                let stride = shape[position + 1..]
+                    .iter()
+                    .try_fold(1usize, |stride, dimension| {
+                        stride.checked_mul((*dimension)?)
+                    })?;
+                Some(PeriodicArrayFilter {
+                    period: dimension.checked_mul(stride)?,
+                    phase: value.checked_mul(stride)?,
+                    extent: stride,
+                })
+            })
+            .collect();
+        DestinationArraySelection {
+            dynamic,
+            period: periodic.map(|(period, _)| period),
+            phase: periodic.map_or(0, |(_, phase)| phase),
+            extent,
+            static_filters,
+        }
+    }
+
+    fn aggregate_destination_controls(
+        &mut self,
+        mut controls: Vec<VersionId>,
+    ) -> Option<VersionId> {
+        controls.sort_unstable();
+        controls.dedup();
+        match controls.len() {
+            0 => None,
+            1 => controls.first().copied(),
+            _ => Some(self.ssa.definition(controls)),
+        }
     }
 
     fn bind_destination(&mut self, key: NodeKey, version: VersionId, dynamic: bool) {
@@ -2492,15 +2794,9 @@ impl<'a, 's> ProcedureAnalysis<'a, 's> {
             .into_iter()
             .map(|(array, _)| array)
             .next();
-        let destination_offset = destination_array
-            .zip(selected)
-            .and_then(|(array, (_, low))| {
-                Some(PositionRelation {
-                    array: Some(isize::try_from(array.start).ok()?),
-                    packed: Some(signed_difference(low, expression_offset)?),
-                })
-            });
         let destination_index = self.flattened_affine_index(destination.id, &destination.index);
+        let destination_array_selection =
+            self.destination_array_selection(destination.id, &destination.index);
         let (keys, resolved) = self.write_keys(destination);
         let whole_sources = if resolved && (destination_array.is_none() || selected.is_none()) {
             Some(self.eval_speculatively(|this| this.eval_expr(expression)))
@@ -2509,39 +2805,40 @@ impl<'a, 's> ProcedureAnalysis<'a, 's> {
         };
         let mut snapshots = Vec::with_capacity(keys.len());
         for key in keys {
+            let mut destination_offset = None;
+            let array = if !resolved {
+                None
+            } else if let Some(destination_array) = destination_array {
+                let Some(array) = destination_array_projection(
+                    key.1,
+                    destination_array,
+                    &destination_array_selection,
+                ) else {
+                    // The partition key lies in a statically impossible gap
+                    // between periodic dynamic-index candidates.
+                    continue;
+                };
+                Some(array)
+            } else {
+                None
+            };
             let mut sources = if !resolved {
                 ExpressionSources::default()
-            } else if let (Some(destination_array), Some((_, low)), Some(key_span)) =
-                (destination_array, selected, self.key_span(key))
+            } else if let (Some(array), Some((_, low)), Some(key_span)) =
+                (array, selected, self.key_span(key))
             {
-                let destination_region = key.1.intersection(destination_array);
-                let expression_array = destination_region.and_then(|array| {
-                    if destination_index
-                        .as_ref()
-                        .is_some_and(|index| !index.terms.is_empty())
-                    {
-                        Some(ArraySpan {
-                            start: 0,
-                            length: array.length,
-                        })
-                    } else {
-                        array.translated(destination_array.start, 0)
-                    }
-                });
-                if let (Some(array), Some(destination_region), Some(packed)) = (
-                    expression_array,
-                    destination_region,
-                    key_span.translated(low, expression_offset),
-                ) {
+                if let Some(packed) = key_span.translated(low, expression_offset) {
+                    destination_offset = array.position_offset(low, expression_offset);
                     self.eval_speculatively(|this| {
                         this.eval_expr_requested_in(
                             expression,
-                            array,
+                            array.source,
                             packed,
                             expression_context_width,
                             &ProjectionContext {
                                 destination_index: destination_index.clone(),
-                                destination_array: Some(destination_region),
+                                destination_array: Some(array.destination),
+                                destination_array_offset: array.array_offset,
                             },
                         )
                     })
@@ -2572,34 +2869,33 @@ impl<'a, 's> ProcedureAnalysis<'a, 's> {
         controls: &[VersionId],
     ) {
         let destination_dynamic = self.destination_is_dynamic(destination);
+        let mut destination_controls = controls.to_vec();
+        // Destination coordinates are one syntactic evaluation, independent
+        // of how many sparse partition keys may be written. Freeze their
+        // effects/dependencies once instead of re-running a selector per key.
+        for selector in destination
+            .index
+            .0
+            .iter()
+            .chain(destination.select.0.iter())
+        {
+            destination_controls.extend(self.eval_expr(selector));
+        }
+        if let Some((_, selector)) = &destination.select.1 {
+            destination_controls.extend(self.eval_expr(selector));
+        }
+        let destination_control = self.aggregate_destination_controls(destination_controls);
         for DestinationSnapshot {
             key,
             mut sources,
             opaque,
         } in snapshots
         {
-            let mut whole = if opaque {
+            let whole = if opaque {
                 Vec::new()
             } else {
-                controls.to_vec()
+                destination_control.into_iter().collect()
             };
-            for selector in destination
-                .index
-                .0
-                .iter()
-                .chain(destination.select.0.iter())
-            {
-                let selector = self.eval_expr(selector);
-                if !opaque {
-                    whole.extend(selector);
-                }
-            }
-            if let Some((_, selector)) = &destination.select.1 {
-                let selector = self.eval_expr(selector);
-                if !opaque {
-                    whole.extend(selector);
-                }
-            }
             sources.extend_whole(whole);
             sources.normalize();
             let version = if opaque {
@@ -3791,7 +4087,7 @@ impl<'a, 's> ProcedureAnalysis<'a, 's> {
                             comptime.member_select_domain,
                             &mut self.ctx,
                         );
-                        let dynamic_array_offset = projection
+                        let absolute_dynamic_array_offset = projection
                             .destination_index
                             .clone()
                             .filter(|destination| !destination.terms.is_empty())
@@ -3799,30 +4095,39 @@ impl<'a, 's> ProcedureAnalysis<'a, 's> {
                                 let source = self.flattened_affine_index(*id, index)?;
                                 destination.destination_offset_from(&source)
                             });
+                        // Affine comparison produces an absolute
+                        // source-to-destination translation. Expression
+                        // projection first maps the source into expression-local
+                        // coordinates; the key-specific destination translation
+                        // is composed by the caller.
+                        let local_dynamic_array_offset = absolute_dynamic_array_offset
+                            .zip(projection.destination_array_offset)
+                            .and_then(|(absolute, destination)| absolute.checked_sub(destination));
                         let position_preserving =
                             index.0.iter().all(|index| index.comptime().is_const)
                                 && accesses.len() == 1;
                         if let Some(source_span) = requested.translated(0, low) {
                             for (idx, access) in &accesses {
-                                let source_array = if let Some(offset) = dynamic_array_offset {
-                                    offset
-                                        .checked_neg()
-                                        .and_then(|offset| {
-                                            translate_array_span(
-                                                projection
-                                                    .destination_array
-                                                    .unwrap_or(requested_array),
-                                                offset,
-                                            )
-                                        })
-                                        .and_then(|requested| requested.intersection(*idx))
-                                } else if position_preserving {
-                                    requested_array
-                                        .translated(0, idx.start)
-                                        .and_then(|requested| requested.intersection(*idx))
-                                } else {
-                                    Some(*idx)
-                                };
+                                let source_array =
+                                    if let Some(offset) = absolute_dynamic_array_offset {
+                                        offset
+                                            .checked_neg()
+                                            .and_then(|offset| {
+                                                translate_array_span(
+                                                    projection
+                                                        .destination_array
+                                                        .unwrap_or(requested_array),
+                                                    offset,
+                                                )
+                                            })
+                                            .and_then(|requested| requested.intersection(*idx))
+                                    } else if position_preserving {
+                                        requested_array
+                                            .translated(0, idx.start)
+                                            .and_then(|requested| requested.intersection(*idx))
+                                    } else {
+                                        Some(*idx)
+                                    };
                                 if let (Some(source_array), Some(source_span)) =
                                     (source_array, source_span.intersection(*access))
                                 {
@@ -3842,7 +4147,7 @@ impl<'a, 's> ProcedureAnalysis<'a, 's> {
                                 }
                             }
                         }
-                        let offset = dynamic_array_offset
+                        let offset = local_dynamic_array_offset
                             .and_then(|array| {
                                 Some(PositionRelation {
                                     array: Some(array),
@@ -5362,6 +5667,25 @@ impl<'a, 's> ProcedureAnalysis<'a, 's> {
             formal_width,
             formal_signed,
         } = coercion;
+        // An output actual is an assignment destination evaluated at copy-out.
+        // Its array/packed coordinates therefore control every candidate key,
+        // just as they do for an ordinary procedural assignment. Evaluate each
+        // syntactic coordinate once here; omitting these dependencies loses
+        // real loops such as `set(value[index])` where `index` depends on
+        // `value` itself.
+        let mut destination_controls = controls.to_vec();
+        for selector in destination
+            .index
+            .0
+            .iter()
+            .chain(destination.select.0.iter())
+        {
+            destination_controls.extend(self.eval_expr(selector));
+        }
+        if let Some((_, selector)) = &destination.select.1 {
+            destination_controls.extend(self.eval_expr(selector));
+        }
+        let destination_control = self.aggregate_destination_controls(destination_controls);
         let variable = self.ctx.variables.get(&destination.id).cloned();
         let selected = if destination.select.is_const_with_range() {
             variable.as_ref().and_then(|variable| {
@@ -5376,14 +5700,8 @@ impl<'a, 's> ProcedureAnalysis<'a, 's> {
             .into_iter()
             .map(|(array, _)| array)
             .next();
-        let position_offset = destination_array
-            .zip(selected)
-            .and_then(|(array, (_, low))| {
-                Some(PositionRelation {
-                    array: Some(isize::try_from(array.start).ok()?),
-                    packed: Some(signed_difference(low, formal_offset)?),
-                })
-            });
+        let destination_array_selection =
+            self.destination_array_selection(destination.id, &destination.index);
         let (keys, resolved) = self.write_keys(destination);
         let dynamic = !resolved || self.destination_is_dynamic(destination);
         for key in keys {
@@ -5392,69 +5710,89 @@ impl<'a, 's> ProcedureAnalysis<'a, 's> {
                 self.bind_destination(key, opaque, true);
                 continue;
             }
+            let array = if let Some(destination_array) = destination_array {
+                let Some(array) = destination_array_projection(
+                    key.1,
+                    destination_array,
+                    &destination_array_selection,
+                ) else {
+                    // Exact periodic gap: this key is not a possible output
+                    // destination and must retain its previous value.
+                    continue;
+                };
+                Some(array)
+            } else {
+                None
+            };
             let mut positional = Vec::new();
-            let mut whole = controls.to_vec();
-            if let (Some(destination_array), Some((_, low)), Some(span), Some(position_offset)) = (
-                destination_array,
-                selected,
-                self.key_span(key),
-                position_offset,
-            ) {
-                if let (Some(requested_array), Some(requested)) = (
-                    key.1
-                        .intersection(destination_array)
-                        .and_then(|array| array.translated(destination_array.start, 0)),
-                    span.translated(low, formal_offset)
-                        .and_then(|span| PackedSpan::whole(actual_width)?.intersection(span)),
-                ) {
-                    if let Some(copied) = PackedSpan::whole(formal_width)
-                        .and_then(|formal| formal.intersection(requested))
+            let mut whole = destination_control.into_iter().collect::<Vec<_>>();
+            if let (Some(array), Some((_, low)), Some(span)) = (array, selected, self.key_span(key))
+            {
+                if let Some(position_offset) = array.position_offset(low, formal_offset) {
+                    if let Some(requested) = span
+                        .translated(low, formal_offset)
+                        .and_then(|span| PackedSpan::whole(actual_width)?.intersection(span))
                     {
-                        for (formal_key, version) in formal_versions {
-                            if !formal_key.1.overlaps(requested_array) {
-                                continue;
-                            }
-                            let Some(formal_span) = self.key_span(*formal_key) else {
-                                continue;
-                            };
-                            if formal_span.overlaps(copied) {
-                                positional.extend(
-                                    self.project_version_sources(*version, requested_array, copied)
+                        let requested_array = array.source;
+                        if let Some(copied) = PackedSpan::whole(formal_width)
+                            .and_then(|formal| formal.intersection(requested))
+                        {
+                            for (formal_key, version) in formal_versions {
+                                if !formal_key.1.overlaps(requested_array) {
+                                    continue;
+                                }
+                                let Some(formal_span) = self.key_span(*formal_key) else {
+                                    continue;
+                                };
+                                if formal_span.overlaps(copied) {
+                                    positional.extend(
+                                        self.project_version_sources(
+                                            *version,
+                                            requested_array,
+                                            copied,
+                                        )
                                         .into_iter()
                                         .map(|version| (version, position_offset)),
-                                );
+                                    );
+                                }
                             }
                         }
-                    }
-                    if formal_signed
-                        && formal_width != 0
-                        && actual_width > formal_width
-                        && requested.end() > formal_width
-                    {
-                        let sign = PackedSpan {
-                            start: formal_width - 1,
-                            length: 1,
-                        };
-                        let sign_relation = PositionRelation {
-                            array: position_offset.array,
-                            packed: None,
-                        };
-                        for (formal_key, version) in formal_versions {
-                            if !formal_key.1.overlaps(requested_array) {
-                                continue;
-                            }
-                            let Some(formal_span) = self.key_span(*formal_key) else {
-                                continue;
+                        if formal_signed
+                            && formal_width != 0
+                            && actual_width > formal_width
+                            && requested.end() > formal_width
+                        {
+                            let sign = PackedSpan {
+                                start: formal_width - 1,
+                                length: 1,
                             };
-                            if formal_span.overlaps(sign) {
-                                positional.extend(
-                                    self.project_version_sources(*version, requested_array, sign)
+                            let sign_relation = PositionRelation {
+                                array: position_offset.array,
+                                packed: None,
+                            };
+                            for (formal_key, version) in formal_versions {
+                                if !formal_key.1.overlaps(requested_array) {
+                                    continue;
+                                }
+                                let Some(formal_span) = self.key_span(*formal_key) else {
+                                    continue;
+                                };
+                                if formal_span.overlaps(sign) {
+                                    positional.extend(
+                                        self.project_version_sources(
+                                            *version,
+                                            requested_array,
+                                            sign,
+                                        )
                                         .into_iter()
                                         .map(|version| (version, sign_relation)),
-                                );
+                                    );
+                                }
                             }
                         }
                     }
+                } else {
+                    whole.extend(formal_versions.iter().map(|(_, version)| *version));
                 }
             } else {
                 whole.extend(formal_versions.iter().map(|(_, version)| *version));

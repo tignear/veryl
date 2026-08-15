@@ -3031,6 +3031,183 @@ fn comb_loop_signed_output_extension_survives_two_module_summaries() {
 }
 
 #[test]
+fn comb_loop_module_summary_keeps_output_destination_selector_dependency() {
+    let code = r#"
+        module Child (
+            sel: input  logic,
+            o  : output logic<2>,
+        ) {
+            always_comb {
+                o = 0;
+                o[sel] = 1;
+            }
+        }
+        module Top (out: output logic) {
+            var data: logic<2>;
+            inst child: Child (
+                sel: data[0],
+                o  : data,
+            );
+            assign out = |data;
+        }
+    "#;
+    assert!(comb_loop_analysis_is_complete(code));
+    assert_comb_loop(
+        "a child output destination selector survives the module summary",
+        code,
+        true,
+    );
+}
+
+#[test]
+fn comb_loop_module_summary_accepts_independent_output_destination_selector() {
+    let code = r#"
+        module Child (
+            sel: input  logic,
+            o  : output logic<2>,
+        ) {
+            always_comb {
+                o = 0;
+                o[sel] = 1;
+            }
+        }
+        module Top (sel: input logic, out: output logic) {
+            var data: logic<2>;
+            inst child: Child (
+                sel: sel,
+                o  : data,
+            );
+            assign out = |data;
+        }
+    "#;
+    assert!(comb_loop_analysis_is_complete(code));
+    assert_comb_loop(
+        "an independent child output selector remains acyclic",
+        code,
+        false,
+    );
+}
+
+fn interleaved_static_coordinate_instance_input_code(feedback_middle: usize) -> String {
+    let bus_assignments = (0..2)
+        .flat_map(|first| {
+            (0..2).flat_map(move |middle| {
+                (0..2).map(move |last| {
+                    let source = if (first, middle, last) == (0, feedback_middle, 0) {
+                        "feedback"
+                    } else {
+                        "0"
+                    };
+                    format!("assign bus[{first}][{middle}][{last}] = {source};")
+                })
+            })
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!(
+        r#"
+        module Leaf (i: input logic, o: output logic) {{
+            assign o = !i;
+        }}
+        module Middle (i: input logic, o: output logic) {{
+            inst leaf: Leaf (
+                i: i,
+                o: o,
+            );
+        }}
+        module Top (
+            first: input  u32,
+            last : input  u32,
+            o    : output logic,
+        ) {{
+            var feedback: logic;
+            var bus: logic [2, 2, 2];
+            inst middle: Middle (
+                i: bus[first][0][last],
+                o: feedback,
+            );
+            {bus_assignments}
+            assign o = feedback;
+        }}
+        "#,
+    )
+}
+
+#[test]
+fn comb_loop_dynamic_instance_input_preserves_an_interleaved_static_coordinate() {
+    let code = interleaved_static_coordinate_instance_input_code(0);
+    assert!(comb_loop_analysis_is_complete(&code));
+    assert_comb_loop(
+        "an instance input reaches its selected interleaved static coordinate",
+        &code,
+        true,
+    );
+}
+
+#[test]
+fn comb_loop_dynamic_instance_input_keeps_an_interleaved_static_coordinate_disjoint() {
+    let code = interleaved_static_coordinate_instance_input_code(1);
+    assert!(comb_loop_analysis_is_complete(&code));
+    assert_comb_loop(
+        "an instance input cannot cross an interleaved static coordinate",
+        &code,
+        false,
+    );
+}
+
+fn interleaved_static_coordinate_instance_output_code(feedback_middle: usize) -> String {
+    format!(
+        r#"
+        module Leaf (i: input logic, o: output logic) {{
+            assign o = i;
+        }}
+        module Middle (i: input logic, o: output logic) {{
+            inst leaf: Leaf (
+                i: i,
+                o: o,
+            );
+        }}
+        module Top (
+            first: input  u32,
+            last : input  u32,
+            o    : output logic,
+        ) {{
+            var feedback: logic;
+            var bus: logic [2, 2, 2];
+            inst middle: Middle (
+                i: feedback,
+                o: bus[first][0][last],
+            );
+            assign feedback = bus[0][{feedback_middle}][0];
+            assign o = feedback;
+        }}
+        "#,
+    )
+}
+
+#[test]
+fn comb_loop_dynamic_instance_output_preserves_an_interleaved_static_coordinate() {
+    let code = interleaved_static_coordinate_instance_output_code(0);
+    assert!(comb_loop_analysis_is_complete(&code));
+    assert_comb_loop(
+        "an instance output reaches its selected interleaved static coordinate",
+        &code,
+        true,
+    );
+}
+
+#[test]
+fn comb_loop_dynamic_instance_output_keeps_an_interleaved_static_coordinate_disjoint() {
+    let code = interleaved_static_coordinate_instance_output_code(1);
+    assert!(comb_loop_analysis_is_complete(&code));
+    assert_comb_loop(
+        "an instance output cannot cross an interleaved static coordinate",
+        &code,
+        false,
+    );
+}
+
+#[test]
 fn comb_loop_signed_output_extension_two_level_excludes_non_sign_bit() {
     assert_comb_loop(
         "two summaries keep a non-sign bit out of signed output extension",
