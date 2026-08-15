@@ -27,6 +27,120 @@ use crate::symbol::Affiliation;
 use crate::value::Value;
 use std::collections::BTreeMap;
 
+#[cfg(test)]
+thread_local! {
+    static SCALING_COUNTERS: std::cell::Cell<(usize, usize, usize)> = const {
+        std::cell::Cell::new((0, 0, 0))
+    };
+    static RANGE_ENTRY_WORK: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static RUNTIME_FOOTPRINT_STATEMENT_VISITS: std::cell::Cell<usize> = const {
+        std::cell::Cell::new(0)
+    };
+    static DESTINATION_CANDIDATE_VISITS: std::cell::Cell<usize> = const {
+        std::cell::Cell::new(0)
+    };
+    static READ_GROUP_COMPARISONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(super) fn reset_scaling_counters() {
+    SCALING_COUNTERS.set((0, 0, 0));
+    RANGE_ENTRY_WORK.set(0);
+    RUNTIME_FOOTPRINT_STATEMENT_VISITS.set(0);
+    DESTINATION_CANDIDATE_VISITS.set(0);
+    READ_GROUP_COMPARISONS.set(0);
+}
+
+#[cfg(test)]
+pub(super) fn scaling_counters() -> (usize, usize, usize) {
+    SCALING_COUNTERS.get()
+}
+
+#[cfg(test)]
+pub(super) fn range_entry_work() -> usize {
+    RANGE_ENTRY_WORK.get()
+}
+
+#[cfg(test)]
+pub(super) fn runtime_footprint_statement_visits() -> usize {
+    RUNTIME_FOOTPRINT_STATEMENT_VISITS.get()
+}
+
+#[cfg(test)]
+pub(super) fn destination_candidate_visits() -> usize {
+    DESTINATION_CANDIDATE_VISITS.get()
+}
+
+#[cfg(test)]
+pub(super) fn read_group_comparisons() -> usize {
+    READ_GROUP_COMPARISONS.get()
+}
+
+#[cfg(test)]
+fn count_destination_candidate_visit() {
+    DESTINATION_CANDIDATE_VISITS.set(DESTINATION_CANDIDATE_VISITS.get() + 1);
+}
+
+#[cfg(not(test))]
+fn count_destination_candidate_visit() {}
+
+#[cfg(test)]
+fn count_read_group_comparison() {
+    READ_GROUP_COMPARISONS.set(READ_GROUP_COMPARISONS.get() + 1);
+}
+
+#[cfg(not(test))]
+fn count_read_group_comparison() {}
+
+#[cfg(test)]
+fn count_runtime_footprint_statement_visit() {
+    RUNTIME_FOOTPRINT_STATEMENT_VISITS.set(RUNTIME_FOOTPRINT_STATEMENT_VISITS.get() + 1);
+}
+
+#[cfg(not(test))]
+fn count_runtime_footprint_statement_visit() {}
+
+#[cfg(test)]
+fn count_range_entry_work(count: usize) {
+    RANGE_ENTRY_WORK.set(RANGE_ENTRY_WORK.get() + count);
+}
+
+#[cfg(not(test))]
+fn count_range_entry_work(_count: usize) {}
+
+#[cfg(test)]
+fn count_state_merge() {
+    SCALING_COUNTERS.with(|counters| {
+        let (state, ranges, arms) = counters.get();
+        counters.set((state + 1, ranges, arms));
+    });
+}
+
+#[cfg(not(test))]
+fn count_state_merge() {}
+
+#[cfg(test)]
+fn count_range_insert() {
+    SCALING_COUNTERS.with(|counters| {
+        let (state, ranges, arms) = counters.get();
+        counters.set((state, ranges + 1, arms));
+    });
+}
+
+#[cfg(not(test))]
+fn count_range_insert() {}
+
+#[cfg(test)]
+fn count_branch_arm() {
+    SCALING_COUNTERS.with(|counters| {
+        let (state, ranges, arms) = counters.get();
+        counters.set((state, ranges, arms + 1));
+    });
+}
+
+#[cfg(not(test))]
+fn count_branch_arm() {}
+
 /// Elements that must keep their register, as `(declaration index, VarId,
 /// array element)`.
 pub type UnsafeSelfReads = HashSet<(usize, VarId, usize)>;
@@ -48,6 +162,7 @@ impl DestinationGroup {
     fn for_each(&self, mut f: impl FnMut(WrittenKey, Mask)) {
         let mask = Mask::from(self.mask);
         for index in self.candidates.clone() {
+            count_destination_candidate_visit();
             f((self.id, index), mask.clone());
         }
     }
@@ -158,6 +273,14 @@ impl Mask {
             Self::Ranges(mut other) => match self {
                 Self::All => {}
                 Self::Ranges(ranges) => {
+                    if other
+                        .0
+                        .iter()
+                        .any(|(&low, &high)| ranges.merge_work_exceeds_limit(low, high))
+                    {
+                        *self = Self::All;
+                        return;
+                    }
                     if ranges.0.len() < other.0.len() {
                         std::mem::swap(ranges, &mut other);
                     }
@@ -179,7 +302,34 @@ struct RangeUndo {
 }
 
 impl BitRanges {
+    // Merging a broad branch delta through an arbitrarily fragmented prefix
+    // can otherwise repeat quadratic removal/rollback work. Above this bound
+    // the analysis deliberately widens to `Mask::All`: sound, but potentially
+    // conservative for a later read outside the known packed ranges.
+    const MERGE_WORK_LIMIT: usize = 8;
+
+    fn merge_work_exceeds_limit(&self, low: usize, high: usize) -> bool {
+        let mut touched = usize::from(
+            self.0
+                .range(..low)
+                .next_back()
+                .is_some_and(|(_, end)| end.saturating_add(1) >= low),
+        );
+        let limit = high.saturating_add(1);
+        for (&start, _) in self.0.range(low..) {
+            if start > limit {
+                break;
+            }
+            touched += 1;
+            if touched > Self::MERGE_WORK_LIMIT {
+                return true;
+            }
+        }
+        false
+    }
+
     fn insert(&mut self, low: usize, high: usize) -> Option<RangeUndo> {
+        count_range_insert();
         debug_assert!(low <= high);
         if self
             .0
@@ -210,6 +360,7 @@ impl BitRanges {
             merged_high = merged_high.max(end);
         }
         self.0.insert(merged_low, merged_high);
+        count_range_entry_work(removed.len());
         Some(RangeUndo {
             inserted: (merged_low, merged_high),
             removed,
@@ -218,6 +369,7 @@ impl BitRanges {
 
     fn rollback(&mut self, undo: RangeUndo) {
         self.0.remove(&undo.inserted.0);
+        count_range_entry_work(undo.removed.len());
         self.0.extend(undo.removed);
     }
 
@@ -376,6 +528,7 @@ impl Written {
     }
 
     fn merge_tracked(&mut self, key: WrittenKey, incoming: &Mask) {
+        count_state_merge();
         if incoming.is_empty() {
             return;
         }
@@ -395,8 +548,22 @@ impl Written {
                 }
             }
             Mask::Ranges(incoming) => {
-                let Mask::Ranges(current) = current else {
+                let should_widen = match current {
+                    Mask::All => return,
+                    Mask::Ranges(ranges) => incoming
+                        .0
+                        .iter()
+                        .any(|(&low, &high)| ranges.merge_work_exceeds_limit(low, high)),
+                };
+                if should_widen {
+                    let Mask::Ranges(previous) = std::mem::replace(current, Mask::All) else {
+                        unreachable!()
+                    };
+                    self.undo.push(WrittenUndo::RestoreKnown(key, previous));
                     return;
+                }
+                let Mask::Ranges(current) = current else {
+                    unreachable!()
                 };
                 for (&low, &high) in &incoming.0 {
                     if let Some(change) = current.insert(low, high) {
@@ -422,6 +589,7 @@ pub fn unsafe_self_reads(decls: &[Declaration], context: &mut Context) -> Unsafe
                 &mut written,
                 &mut delta,
                 &weights,
+                false,
                 &mut result,
             );
         }
@@ -437,10 +605,20 @@ fn walk_seq(
     written: &mut Written,
     delta: &mut WrittenDelta,
     weights: &StatementWeights,
+    runtime_footprint_preapplied: bool,
     out: &mut UnsafeSelfReads,
 ) {
     for s in stmts {
-        walk_one(s, decl, context, written, delta, weights, out);
+        walk_one(
+            s,
+            decl,
+            context,
+            written,
+            delta,
+            weights,
+            runtime_footprint_preapplied,
+            out,
+        );
     }
 }
 
@@ -452,6 +630,7 @@ fn walk_one(
     written: &mut Written,
     delta: &mut WrittenDelta,
     weights: &StatementWeights,
+    runtime_footprint_preapplied: bool,
     out: &mut UnsafeSelfReads,
 ) {
     match stmt {
@@ -487,6 +666,7 @@ fn walk_one(
                 written,
                 delta,
                 weights,
+                runtime_footprint_preapplied,
                 out,
             );
         }
@@ -498,6 +678,7 @@ fn walk_one(
             written,
             delta,
             weights,
+            runtime_footprint_preapplied,
             out,
         ),
         Statement::Case(x) => {
@@ -514,6 +695,7 @@ fn walk_one(
                 written,
                 delta,
                 weights,
+                runtime_footprint_preapplied,
                 out,
             );
         }
@@ -526,15 +708,26 @@ fn walk_one(
                         let val = Value::new(i as u64, total_width, x.var_type.signed);
                         var.set_value(&[], val, None);
                     }
-                    walk_seq(&x.body, decl, context, written, delta, weights, out);
+                    walk_seq(
+                        &x.body,
+                        decl,
+                        context,
+                        written,
+                        delta,
+                        weights,
+                        runtime_footprint_preapplied,
+                        out,
+                    );
                 }
             } else {
                 // Without concrete iterations there is no order to walk, and
                 // the body runs again.
-                let mut body = WrittenDelta::default();
-                collect_writes(&x.body, context, &mut body);
-                written.apply_delta(body, delta);
-                walk_seq(&x.body, decl, context, written, delta, weights, out);
+                if !runtime_footprint_preapplied {
+                    let mut body = WrittenDelta::default();
+                    collect_writes(&x.body, context, &mut body);
+                    written.apply_delta(body, delta);
+                }
+                walk_seq(&x.body, decl, context, written, delta, weights, true, out);
             }
         }
         Statement::FunctionCall(x) => {
@@ -563,6 +756,7 @@ fn walk_branches(
     written: &mut Written,
     delta: &mut WrittenDelta,
     weights: &StatementWeights,
+    runtime_footprint_preapplied: bool,
     out: &mut UnsafeSelfReads,
 ) {
     walk_alternatives(
@@ -572,6 +766,7 @@ fn walk_branches(
         written,
         delta,
         weights,
+        runtime_footprint_preapplied,
         out,
     );
 }
@@ -584,6 +779,7 @@ fn walk_alternatives<'s>(
     written: &mut Written,
     delta: &mut WrittenDelta,
     weights: &StatementWeights,
+    runtime_footprint_preapplied: bool,
     out: &mut UnsafeSelfReads,
 ) {
     let mut branches = branches.collect::<Vec<_>>();
@@ -600,6 +796,7 @@ fn walk_alternatives<'s>(
     };
     let mut joined = WrittenDelta::default();
     for branch in preceding {
+        count_branch_arm();
         let checkpoint = written.checkpoint();
         let mut branch_delta = WrittenDelta::default();
         walk_seq(
@@ -609,13 +806,24 @@ fn walk_alternatives<'s>(
             written,
             &mut branch_delta,
             weights,
+            runtime_footprint_preapplied,
             out,
         );
         written.rollback(checkpoint);
         joined.absorb(branch_delta);
     }
+    count_branch_arm();
     let mut last_delta = WrittenDelta::default();
-    walk_seq(last, decl, context, written, &mut last_delta, weights, out);
+    walk_seq(
+        last,
+        decl,
+        context,
+        written,
+        &mut last_delta,
+        weights,
+        runtime_footprint_preapplied,
+        out,
+    );
     delta.absorb(last_delta);
     written.apply_delta(joined, delta);
 }
@@ -623,6 +831,7 @@ fn walk_alternatives<'s>(
 /// Everything the statements may write, ignoring order.
 fn collect_writes(stmts: &[Statement], context: &mut Context, out: &mut WrittenDelta) {
     for s in stmts {
+        count_runtime_footprint_statement_visit();
         match s {
             Statement::Assign(x) => {
                 collect_expression_writes(&x.expr, context, out);
@@ -894,6 +1103,7 @@ impl<'a> ExpressionOrder<'a> {
                 continue;
             };
             if matching.iter().any(|read| {
+                count_read_group_comparison();
                 read.candidates == target.candidates && self.written.contains_group(read)
             }) {
                 self.written.report_group(target, self.decl, self.out);

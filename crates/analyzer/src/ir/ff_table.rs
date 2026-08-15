@@ -5,7 +5,33 @@ use crate::ir::variable::FlatIndexSet;
 use crate::ir::write_count::{UnsafeSelfReads, unsafe_self_reads};
 use crate::{HashMap, HashSet};
 
+#[cfg(test)]
+thread_local! {
+    static CANDIDATE_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(super) fn reset_candidate_visits() {
+    CANDIDATE_VISITS.set(0);
+}
+
+#[cfg(test)]
+pub(super) fn candidate_visits() -> usize {
+    CANDIDATE_VISITS.get()
+}
+
+#[cfg(test)]
+fn count_candidate_visit() {
+    CANDIDATE_VISITS.set(CANDIDATE_VISITS.get() + 1);
+}
+
+#[cfg(not(test))]
+fn count_candidate_visit() {}
+
 /// A compact packed-bit access. `Unknown` conservatively covers every bit.
+///
+/// Keeping this as an interval avoids allocating a dense `BigUint` whose
+/// size grows with the selected bit number while walking constant loops.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum PackedMask {
     Range { high: usize, low: usize },
@@ -24,6 +50,17 @@ impl PackedMask {
 /// LHS of an assignment: `(VarId, array element index, packed access)`.
 /// `None` array index = dynamic.
 pub type AssignTarget = (VarId, Option<usize>, PackedMask);
+
+type ReferenceKey = (VarId, usize, usize, Option<AssignTarget>, PackedMask, bool);
+type ReferenceGroupKey = (
+    VarId,
+    usize,
+    Option<AssignTarget>,
+    PackedMask,
+    bool,
+    FlatIndexSet,
+);
+type AssignmentGroupKey = (VarId, usize, bool, FlatIndexSet);
 
 #[derive(Clone, Debug)]
 pub struct FfTableEntry {
@@ -65,7 +102,7 @@ impl FfTableEntry {
                             if *target_id != self_key.0 {
                                 return true;
                             }
-                            // A dynamic index is conservative → FF.
+                            // A dynamic index is conservatively classified as FF.
                             match target_idx {
                                 Some(idx) if *idx == self_key.1 => !readable,
                                 Some(_) => true,
@@ -82,6 +119,9 @@ impl FfTableEntry {
 #[derive(Clone, Debug, Default)]
 pub struct FfTable {
     pub table: HashMap<(VarId, usize), FfTableEntry>,
+    reference_set: HashSet<ReferenceKey>,
+    reference_groups: HashSet<ReferenceGroupKey>,
+    assignment_groups: HashSet<AssignmentGroupKey>,
     unknown_ff_reads: HashSet<VarId>,
     unknown_ff_assignments: HashSet<VarId>,
 }
@@ -135,6 +175,12 @@ impl FfTable {
         src_read_mask: PackedMask,
         from_ff: bool,
     ) {
+        if !self
+            .reference_set
+            .insert((id, index, decl, assign_target, src_read_mask, from_ff))
+        {
+            return;
+        }
         self.table
             .entry((id, index))
             .and_modify(|x| {
@@ -158,7 +204,18 @@ impl FfTable {
         src_read_mask: PackedMask,
         from_ff: bool,
     ) {
+        if !self.reference_groups.insert((
+            id,
+            decl,
+            assign_target,
+            src_read_mask,
+            from_ff,
+            candidates.clone(),
+        )) {
+            return;
+        }
         for index in candidates {
+            count_candidate_visit();
             self.insert_refered(id, index, decl, assign_target, src_read_mask, from_ff);
         }
     }
@@ -202,7 +259,14 @@ impl FfTable {
         decl: usize,
         from_comb: bool,
     ) {
+        if !self
+            .assignment_groups
+            .insert((id, decl, from_comb, candidates.clone()))
+        {
+            return;
+        }
         for index in candidates {
+            count_candidate_visit();
             if from_comb {
                 self.insert_assigned_comb(id, index, decl);
             } else {

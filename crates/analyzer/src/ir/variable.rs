@@ -405,7 +405,8 @@ impl std::str::FromStr for VarPath {
 pub struct VarIndex(pub Vec<Expression>);
 
 /// Token-independent geometry of the flat elements selected by a partially
-/// dynamic array index.
+/// dynamic array index. This is hashable so consumers can discard an identical
+/// relation before visiting its candidates again.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct FlatIndexSet {
     base: usize,

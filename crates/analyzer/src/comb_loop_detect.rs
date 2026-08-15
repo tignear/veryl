@@ -1204,7 +1204,7 @@ fn build_module_graph(
                     continue;
                 };
                 builder.complete &= summary.complete;
-                builder.add_instance_feedthrough(module, inst, child, summary);
+                builder.add_instance_feedthrough(inst, child, summary);
             }
             // SV black box: under-detect.
             Component::SystemVerilog(_) => builder.complete = false,
@@ -1339,7 +1339,6 @@ impl<'a> ModuleGraphBuilder<'a> {
 
     fn add_instance_feedthrough(
         &mut self,
-        module: &'a Module,
         inst: &InstDeclaration,
         child: &Module,
         summary: &ModuleCombSummary,

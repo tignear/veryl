@@ -4068,3 +4068,400 @@ fn ff_opt_runtime_footprints_include_output_coordinate_side_effects() {
     assert_eq!(flags.get("call_index"), Some(&true));
     assert_eq!(flags.get("readmem_index"), Some(&true));
 }
+
+#[test]
+fn ff_opt_packed_mask_work_limit_is_sound_but_conservative() {
+    // Crossing more than MERGE_WORK_LIMIT sparse ranges intentionally widens
+    // to all packed bits. The overlap case stays sound, while the disjoint
+    // high-bit read documents the precision cost of that linear-work guard.
+    let code = r#"
+    module ModuleA (
+        i_clk: input clock,
+        d    : input logic,
+    ) {
+        var boundary_8       : logic<32>;
+        var conservative_fp  : logic<32>;
+        var true_overlap     : logic<32>;
+
+        always_ff (i_clk) {
+            boundary_8[0] = d; boundary_8[2] = d;
+            boundary_8[4] = d; boundary_8[6] = d;
+            boundary_8[8] = d; boundary_8[10] = d;
+            boundary_8[12] = d; boundary_8[14] = d;
+            boundary_8[0+:15] = 0;
+            boundary_8[31] = boundary_8[31] + 1;
+
+            conservative_fp[0] = d; conservative_fp[2] = d;
+            conservative_fp[4] = d; conservative_fp[6] = d;
+            conservative_fp[8] = d; conservative_fp[10] = d;
+            conservative_fp[12] = d; conservative_fp[14] = d;
+            conservative_fp[16] = d;
+            conservative_fp[0+:17] = 0;
+            conservative_fp[31] = conservative_fp[31] + 1;
+
+            true_overlap[0] = d; true_overlap[2] = d;
+            true_overlap[4] = d; true_overlap[6] = d;
+            true_overlap[8] = d; true_overlap[10] = d;
+            true_overlap[12] = d; true_overlap[14] = d;
+            true_overlap[16] = d;
+            true_overlap[0+:17] = 0;
+            true_overlap[16] = true_overlap[16] + 1;
+        }
+    }
+    "#;
+
+    assert_eq!(
+        ff_flags(code),
+        vec![
+            ("boundary_8".to_string(), false),
+            ("conservative_fp".to_string(), true),
+            ("true_overlap".to_string(), true),
+        ]
+    );
+}
+
+#[test]
+fn ff_opt_branch_analysis_scales_with_changed_keys() {
+    const COUNT: usize = 512;
+    let code = format!(
+        r#"
+        module ModuleA (
+            i_clk: input clock,
+            gate : input logic,
+            d    : input logic,
+        ) {{
+            var q: logic [{COUNT}];
+            always_ff (i_clk) {{
+                for i in 0..{COUNT} {{
+                    if gate {{
+                        q[i] = d;
+                    }} else {{
+                        q[i] = d;
+                    }}
+                }}
+            }}
+        }}
+        "#
+    );
+
+    super::write_count::reset_scaling_counters();
+    let flags = ff_flags(&code);
+    assert_eq!(flags.len(), COUNT);
+    assert!(flags.iter().all(|flag| flag == &("q".to_string(), false)));
+    let (state_merges, range_inserts, branch_arms) = super::write_count::scaling_counters();
+    assert!(state_merges <= COUNT * 8, "{state_merges}");
+    assert!(range_inserts <= COUNT * 12, "{range_inserts}");
+    assert_eq!(branch_arms, COUNT * 2);
+}
+
+#[test]
+fn ff_opt_packed_mask_analysis_scales_with_ranges() {
+    const COUNT: usize = 1024;
+    let code = format!(
+        r#"
+        module ModuleA (
+            i_clk: input clock,
+            d    : input logic,
+        ) {{
+            var q: logic<{COUNT}>;
+            always_ff (i_clk) {{
+                for i in 0..{COUNT} {{
+                    q[i] = d;
+                }}
+            }}
+        }}
+        "#
+    );
+
+    super::write_count::reset_scaling_counters();
+    assert_eq!(ff_flags(&code), vec![("q".to_string(), false)]);
+    let (state_merges, range_inserts, branch_arms) = super::write_count::scaling_counters();
+    assert!(state_merges <= COUNT * 2, "{state_merges}");
+    assert!(range_inserts <= COUNT * 8, "{range_inserts}");
+    assert_eq!(branch_arms, 0);
+}
+
+#[test]
+fn ff_opt_case_analysis_is_flat_and_linear() {
+    const COUNT: usize = 512;
+    let mut arms = String::new();
+    for i in 0..COUNT {
+        arms.push_str(&format!("{i}: q[{i}] = d;\n"));
+    }
+    let code = format!(
+        r#"
+        module ModuleA (
+            i_clk  : input clock,
+            select : input u32,
+            d      : input logic,
+        ) {{
+            var q: logic [{COUNT}];
+            always_ff (i_clk) {{
+                case select {{
+                    {arms}
+                }}
+            }}
+        }}
+        "#
+    );
+
+    super::write_count::reset_scaling_counters();
+    let flags = ff_flags(&code);
+    assert_eq!(flags.len(), COUNT);
+    assert!(flags.iter().all(|flag| flag == &("q".to_string(), false)));
+    let (state_merges, range_inserts, branch_arms) = super::write_count::scaling_counters();
+    assert!(state_merges <= COUNT * 2, "{state_merges}");
+    assert!(range_inserts <= COUNT * 8, "{range_inserts}");
+    assert_eq!(branch_arms, COUNT + 1);
+}
+
+#[test]
+fn ff_opt_nested_branch_analysis_uses_a_heavy_path() {
+    const COUNT: usize = 32;
+    let mut body = String::new();
+    for i in 0..COUNT {
+        body.push_str(&format!("if gate[{i}] {{\n"));
+    }
+    body.push_str("q[0] = d;\n");
+    for i in (0..COUNT).rev() {
+        body.push_str(&format!("}} else {{ q[{}] = d; }}\n", i + 1));
+    }
+    let code = format!(
+        r#"
+        module ModuleA (
+            i_clk : input clock,
+            gate  : input logic [{COUNT}],
+            d     : input logic,
+        ) {{
+            var q: logic [{}];
+            always_ff (i_clk) {{
+                {body}
+            }}
+        }}
+        "#,
+        COUNT + 1,
+    );
+
+    super::write_count::reset_scaling_counters();
+    let flags = ff_flags(&code);
+    assert_eq!(flags.len(), COUNT + 1);
+    assert!(flags.iter().all(|flag| flag == &("q".to_string(), false)));
+    let (state_merges, range_inserts, branch_arms) = super::write_count::scaling_counters();
+    assert!(state_merges <= COUNT * 8, "{state_merges}");
+    assert!(range_inserts <= COUNT * 8, "{range_inserts}");
+    assert_eq!(branch_arms, COUNT * 2);
+}
+
+#[test]
+fn ff_opt_broad_branch_writes_do_not_rebuild_sparse_prefixes() {
+    const COUNT: usize = 256;
+    let mut arms = String::new();
+    for i in 0..COUNT {
+        arms.push_str(&format!("{i}: q = 0;\n"));
+    }
+    let code = format!(
+        r#"
+        module ModuleA (
+            i_clk  : input clock,
+            select : input u32,
+            d      : input logic,
+        ) {{
+            var q: logic<{}>;
+            always_ff (i_clk) {{
+                for i in 0..{COUNT} {{
+                    q[i * 2] = d;
+                }}
+                case select {{
+                    {arms}
+                    default: q = 0;
+                }}
+            }}
+        }}
+        "#,
+        COUNT * 2,
+    );
+
+    super::write_count::reset_scaling_counters();
+    assert_eq!(ff_flags(&code), vec![("q".to_string(), false)]);
+    assert!(
+        super::write_count::range_entry_work() <= COUNT * 4,
+        "{}",
+        super::write_count::range_entry_work(),
+    );
+}
+
+#[test]
+fn ff_opt_repeated_dynamic_reads_store_one_relation_per_candidate() {
+    const COUNT: usize = 128;
+    let expression = std::iter::repeat_n("values[index]", COUNT)
+        .collect::<Vec<_>>()
+        .join(" | ");
+    let code = format!(
+        r#"
+        module ModuleA (
+            i_clk : input clock,
+            index : input u7,
+            d     : input logic,
+        ) {{
+            var values: logic [{COUNT}];
+            var sink  : logic;
+            always_ff (i_clk) {{
+                values[0] = d;
+                sink = {expression};
+            }}
+        }}
+        "#
+    );
+
+    super::ff_table::reset_candidate_visits();
+    let module = analyzed_module(&code);
+    let candidate_visits = super::ff_table::candidate_visits();
+    let values = module
+        .variables
+        .values()
+        .find(|variable| variable.path.to_string() == "values")
+        .expect("values");
+    let relations = module
+        .ff_table
+        .table
+        .iter()
+        .filter(|((id, _), _)| *id == values.id)
+        .map(|(_, entry)| entry.refered.len())
+        .sum::<usize>();
+    assert_eq!(relations, COUNT);
+    // The module FF table is gathered twice during conversion/rebuild, plus a
+    // constant-size handful of scalar accesses. Repeating the same syntax
+    // COUNT times must not multiply either gather by COUNT again.
+    assert!(candidate_visits <= COUNT * 3, "{candidate_visits}");
+}
+
+#[test]
+fn ff_opt_repeated_dynamic_destinations_expand_one_candidate_relation() {
+    const COUNT: usize = 128;
+    let writes = std::iter::repeat_n("values[index] = d;", COUNT)
+        .collect::<Vec<_>>()
+        .join("\n");
+    let code = format!(
+        r#"
+        module ModuleA (
+            i_clk : input clock,
+            index : input u7,
+            d     : input logic,
+        ) {{
+            var values: logic [{COUNT}];
+            always_ff (i_clk) {{
+                {writes}
+            }}
+        }}
+        "#
+    );
+
+    super::write_count::reset_scaling_counters();
+    let flags = ff_flags(&code);
+    assert_eq!(flags.len(), COUNT);
+    assert!(
+        flags
+            .iter()
+            .all(|flag| flag == &("values".to_string(), false))
+    );
+    let candidate_visits = super::write_count::destination_candidate_visits();
+    assert!(candidate_visits <= COUNT * 4, "{candidate_visits}");
+}
+
+#[test]
+fn ff_opt_repeated_dynamic_self_reads_expand_and_report_once() {
+    const COUNT: usize = 128;
+    let writes = std::iter::repeat_n("values[index] = values[index];", COUNT)
+        .collect::<Vec<_>>()
+        .join("\n");
+    let code = format!(
+        r#"
+        module ModuleA (
+            i_clk : input clock,
+            index : input u7,
+        ) {{
+            var values: logic [{COUNT}];
+            always_ff (i_clk) {{
+                {writes}
+            }}
+        }}
+        "#
+    );
+
+    super::write_count::reset_scaling_counters();
+    let flags = ff_flags(&code);
+    assert_eq!(flags.len(), COUNT);
+    assert!(
+        flags
+            .iter()
+            .all(|flag| flag == &("values".to_string(), true))
+    );
+    let candidate_visits = super::write_count::destination_candidate_visits();
+    assert!(candidate_visits <= COUNT * 4, "{candidate_visits}");
+}
+
+#[test]
+fn ff_opt_indexes_expression_reads_by_variable_once() {
+    const COUNT: usize = 64;
+    let declarations = (0..COUNT)
+        .map(|i| format!("var value_{i}: logic;"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let destinations = (0..COUNT)
+        .map(|i| format!("value_{i}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sources = (0..COUNT)
+        .rev()
+        .map(|i| format!("value_{i}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let code = format!(
+        r#"
+        module ModuleA (i_clk: input clock) {{
+            {declarations}
+            always_ff (i_clk) {{
+                {{{destinations}}} = {{{sources}}};
+            }}
+        }}
+        "#
+    );
+
+    super::write_count::reset_scaling_counters();
+    let flags = ff_flags(&code);
+    assert_eq!(flags.len(), COUNT);
+    // This test targets the target/read-id comparison work; the reversed
+    // parallel assignment intentionally mixes FF and comb-eligible values.
+    let comparisons = super::write_count::read_group_comparisons();
+    assert!(comparisons <= COUNT * 2, "{comparisons}");
+}
+
+#[test]
+fn ff_opt_nested_runtime_loop_footprints_are_gathered_once() {
+    const DEPTH: usize = 96;
+    let mut body = "q = q + 1;".to_string();
+    for depth in (0..DEPTH).rev() {
+        body = format!("for loop_index_{depth} in 0..bound {{ {body} }}");
+    }
+    let code = format!(
+        r#"
+        module ModuleA (
+            i_clk : input clock,
+            bound : input u32,
+        ) {{
+            var q: logic;
+            always_ff (i_clk) {{
+                {body}
+            }}
+        }}
+        "#
+    );
+
+    super::write_count::reset_scaling_counters();
+    assert_eq!(ff_flags(&code), vec![("q".to_string(), true)]);
+    assert!(
+        super::write_count::runtime_footprint_statement_visits() <= DEPTH + 1,
+        "{}",
+        super::write_count::runtime_footprint_statement_visits(),
+    );
+}
