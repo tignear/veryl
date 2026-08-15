@@ -13,6 +13,10 @@ thread_local! {
     static REVISION_EVENT_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static REVISION_CANDIDATE_INPUTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static SOURCE_SUMMARY_STATE_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static INLINE_DEPENDENCY_EDGE_PROBES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static INLINE_DEPENDENCY_NODE_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static IMPORTED_BINDING_PROBES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static STRUCTURAL_DEPENDENCY_VERSION_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 #[cfg(test)]
@@ -963,6 +967,25 @@ pub(super) struct DependencyDag<K> {
     pub(super) edges: Vec<DependencyDagEdge>,
     pub(super) roots: Vec<Option<usize>>,
     pub(super) domains: Vec<Vec<PositionDomain>>,
+    pub(super) incoming: OnceCell<Rc<Vec<Vec<usize>>>>,
+}
+
+impl<K> DependencyDag<K> {
+    fn incoming(&self) -> Rc<Vec<Vec<usize>>> {
+        self.incoming
+            .get_or_init(|| {
+                let mut incoming = vec![Vec::new(); self.nodes.len()];
+                for (index, edge) in self.edges.iter().enumerate() {
+                    #[cfg(test)]
+                    INLINE_DEPENDENCY_EDGE_PROBES.set(INLINE_DEPENDENCY_EDGE_PROBES.get() + 1);
+                    if let Some(edges) = incoming.get_mut(edge.destination) {
+                        edges.push(index);
+                    }
+                }
+                Rc::new(incoming)
+            })
+            .clone()
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -1154,6 +1177,10 @@ impl<K> SsaStore<K>
 where
     K: Copy + Eq + Hash,
 {
+    pub(super) fn entry_keys(&self) -> impl Iterator<Item = K> + '_ {
+        self.entries.keys().copied()
+    }
+
     fn entry(&mut self, key: K) -> VersionId {
         if let Some(version) = self.entries.get(&key) {
             return *version;
@@ -1220,11 +1247,21 @@ where
         bindings: HashMap<K, Vec<(VersionId, PositionRelation)>>,
         branches: Rc<BranchRemapper>,
     ) -> VersionId {
+        self.imported_shared(graph, root, Rc::new(bindings), branches)
+    }
+
+    pub(super) fn imported_shared(
+        &mut self,
+        graph: Rc<DependencyDag<K>>,
+        root: Option<usize>,
+        bindings: Rc<HashMap<K, Vec<(VersionId, PositionRelation)>>>,
+        branches: Rc<BranchRemapper>,
+    ) -> VersionId {
         let version = self.versions.len();
         self.versions.push(Version::Imported {
             graph,
             root,
-            bindings: Rc::new(bindings),
+            bindings,
             branches,
         });
         version
@@ -1281,6 +1318,69 @@ where
             }
         }
         false
+    }
+
+    pub(super) fn has_structural_dependency_cached(
+        &self,
+        version: VersionId,
+        cache: &mut HashMap<VersionId, bool>,
+    ) -> bool {
+        if let Some(&result) = cache.get(&version) {
+            return result;
+        }
+        let mut stack = vec![(version, false)];
+        while let Some((current, expanded)) = stack.pop() {
+            if cache.contains_key(&current) {
+                continue;
+            }
+            match &self.versions[current] {
+                Version::Imported { .. } | Version::Projected { .. } | Version::Repeated { .. } => {
+                    #[cfg(test)]
+                    STRUCTURAL_DEPENDENCY_VERSION_VISITS
+                        .set(STRUCTURAL_DEPENDENCY_VERSION_VISITS.get() + 1);
+                    cache.insert(current, true);
+                }
+                Version::Definition { sources, .. } => {
+                    if expanded {
+                        #[cfg(test)]
+                        STRUCTURAL_DEPENDENCY_VERSION_VISITS
+                            .set(STRUCTURAL_DEPENDENCY_VERSION_VISITS.get() + 1);
+                        cache.insert(current, sources.iter().any(|(source, _)| cache[source]));
+                    } else {
+                        stack.push((current, true));
+                        stack.extend(
+                            sources
+                                .iter()
+                                .filter(|(source, _)| !cache.contains_key(source))
+                                .map(|(source, _)| (*source, false)),
+                        );
+                    }
+                }
+                Version::Phi(inputs) => {
+                    if expanded {
+                        #[cfg(test)]
+                        STRUCTURAL_DEPENDENCY_VERSION_VISITS
+                            .set(STRUCTURAL_DEPENDENCY_VERSION_VISITS.get() + 1);
+                        cache.insert(current, inputs.iter().any(|input| cache[input]));
+                    } else {
+                        stack.push((current, true));
+                        stack.extend(
+                            inputs
+                                .iter()
+                                .filter(|input| !cache.contains_key(input))
+                                .map(|input| (*input, false)),
+                        );
+                    }
+                }
+                Version::Entry(_) => {
+                    #[cfg(test)]
+                    STRUCTURAL_DEPENDENCY_VERSION_VISITS
+                        .set(STRUCTURAL_DEPENDENCY_VERSION_VISITS.get() + 1);
+                    cache.insert(current, false);
+                }
+            }
+        }
+        cache[&version]
     }
 
     pub(super) fn bind(&mut self, key: K, version: VersionId) {
@@ -1880,6 +1980,11 @@ where
     where
         K: Ord,
     {
+        type ImportBindingIdentityKey = (usize, usize);
+        let mut import_reachable_nodes: HashMap<ImportBindingIdentityKey, HashSet<usize>> =
+            HashMap::default();
+        let mut import_reachable_keys: HashMap<ImportBindingIdentityKey, HashSet<K>> =
+            HashMap::default();
         let mut states = HashSet::default();
         let mut queue = VecDeque::new();
         for &root in roots {
@@ -1905,10 +2010,38 @@ where
                         enqueue((*input, include_entry));
                     }
                 }
-                Version::Imported { bindings, .. } => {
-                    for sources in bindings.values() {
-                        for (source, _) in sources {
-                            enqueue((*source, true));
+                Version::Imported {
+                    graph,
+                    root,
+                    bindings,
+                    ..
+                } => {
+                    let Some(root) = *root else {
+                        continue;
+                    };
+                    let identity = (Rc::as_ptr(graph) as usize, Rc::as_ptr(bindings) as usize);
+                    let visited = import_reachable_nodes.entry(identity).or_default();
+                    if !visited.insert(root) {
+                        continue;
+                    }
+                    let reachable_keys = import_reachable_keys.entry(identity).or_default();
+                    let incoming = graph.incoming();
+                    let mut import_queue = VecDeque::from([root]);
+                    while let Some(node) = import_queue.pop_front() {
+                        if let DependencyDagNode::External(key) = graph.nodes[node]
+                            && reachable_keys.insert(key)
+                        {
+                            #[cfg(test)]
+                            IMPORTED_BINDING_PROBES.set(IMPORTED_BINDING_PROBES.get() + 1);
+                            for (source, _) in bindings.get(&key).into_iter().flatten() {
+                                enqueue((*source, true));
+                            }
+                        }
+                        for &edge in incoming.get(node).into_iter().flatten() {
+                            let source = graph.edges[edge].source;
+                            if visited.insert(source) {
+                                import_queue.push_back(source);
+                            }
                         }
                     }
                 }
@@ -1921,13 +2054,24 @@ where
         let mut edges = Vec::new();
         let mut domains = Vec::new();
         let mut mapped: HashMap<(VersionId, bool), Option<usize>> = HashMap::default();
-        type ImportKey<K> = (
+        type ImportInlineIdentityKey = (usize, usize, usize);
+        type ImportInlineValueKey<K> = (
             usize,
-            Option<usize>,
-            Vec<(K, Vec<(usize, PositionRelation)>)>,
+            MappedDependencyBindingKey<K>,
             Vec<(BranchId, BranchId)>,
         );
-        let mut imports: HashMap<ImportKey<K>, Option<usize>> = HashMap::default();
+        let mut mapped_bindings_by_identity: HashMap<
+            ImportBindingIdentityKey,
+            MappedDependencyBindingGroup<K>,
+        > = HashMap::default();
+        let mut imports_by_identity: HashMap<
+            ImportInlineIdentityKey,
+            Rc<RefCell<InlineDependencyDagCache>>,
+        > = HashMap::default();
+        let mut imports_by_value: HashMap<
+            ImportInlineValueKey<K>,
+            Rc<RefCell<InlineDependencyDagCache>>,
+        > = HashMap::default();
 
         let mut ordered = states.into_iter().collect::<Vec<_>>();
         ordered.sort_unstable();
@@ -1977,47 +2121,83 @@ where
                     bindings,
                     branches,
                 } => {
-                    let mut mapped_bindings = bindings
-                        .iter()
-                        .map(|(&key, sources)| {
-                            let mut sources = sources
-                                .iter()
-                                .filter_map(|(source, relation)| {
-                                    mapped[&(*source, true)].map(|source| (source, *relation))
+                    let binding_identity =
+                        (Rc::as_ptr(graph) as usize, Rc::as_ptr(bindings) as usize);
+                    let mapped_binding_group = mapped_bindings_by_identity
+                        .entry(binding_identity)
+                        .or_insert_with(|| {
+                            let mapped_bindings = import_reachable_keys
+                                .get(&binding_identity)
+                                .into_iter()
+                                .flatten()
+                                .filter_map(|&key| {
+                                    #[cfg(test)]
+                                    IMPORTED_BINDING_PROBES.set(IMPORTED_BINDING_PROBES.get() + 1);
+                                    let sources = bindings.get(&key)?;
+                                    let mut sources = sources
+                                        .iter()
+                                        .filter_map(|(source, relation)| {
+                                            mapped
+                                                .get(&(*source, true))
+                                                .copied()
+                                                .flatten()
+                                                .map(|source| (source, *relation))
+                                        })
+                                        .collect::<Vec<_>>();
+                                    sources.sort_unstable();
+                                    Some((key, sources))
                                 })
-                                .collect::<Vec<_>>();
-                            sources.sort_unstable();
-                            (key, sources)
-                        })
-                        .collect::<Vec<_>>();
-                    mapped_bindings.sort_unstable_by_key(|(key, _)| *key);
-                    let mut mapped_branches = branches
-                        .mapping
-                        .iter()
-                        .map(|(&source, &destination)| (source, destination))
-                        .collect::<Vec<_>>();
-                    mapped_branches.sort_unstable();
-                    let key = (
+                                .collect::<MappedDependencyBindings<_>>();
+                            let mut value_key = mapped_bindings
+                                .iter()
+                                .map(|(&key, sources)| (key, sources.clone()))
+                                .collect::<MappedDependencyBindingKey<_>>();
+                            value_key.sort_unstable_by_key(|(key, _)| *key);
+                            MappedDependencyBindingGroup {
+                                bindings: Rc::new(mapped_bindings),
+                                value_key: Rc::new(value_key),
+                            }
+                        });
+                    let mapped_bindings = Rc::clone(&mapped_binding_group.bindings);
+                    let binding_value_key = Rc::clone(&mapped_binding_group.value_key);
+                    let identity_key = (
                         Rc::as_ptr(graph) as usize,
-                        *root,
-                        mapped_bindings.clone(),
-                        mapped_branches,
+                        Rc::as_ptr(bindings) as usize,
+                        Rc::as_ptr(branches) as usize,
                     );
-                    if let Some(node) = imports.get(&key) {
-                        *node
+                    let inline_cache = if let Some(cache) = imports_by_identity.get(&identity_key) {
+                        Rc::clone(cache)
                     } else {
-                        let node = inline_dependency_dag(
-                            graph,
-                            *root,
-                            &mapped_bindings.into_iter().collect(),
-                            branches,
-                            &mut nodes,
-                            &mut edges,
-                            &mut domains,
+                        let mut branch_key = branches
+                            .mapping
+                            .iter()
+                            .map(|(&source, &destination)| (source, destination))
+                            .collect::<Vec<_>>();
+                        branch_key.sort_unstable();
+                        let value_key = (
+                            Rc::as_ptr(graph) as usize,
+                            binding_value_key.as_ref().clone(),
+                            branch_key,
                         );
-                        imports.insert(key, node);
-                        node
-                    }
+                        let cache = imports_by_value
+                            .entry(value_key)
+                            .or_insert_with(|| {
+                                Rc::new(RefCell::new(InlineDependencyDagCache::default()))
+                            })
+                            .clone();
+                        imports_by_identity.insert(identity_key, Rc::clone(&cache));
+                        cache
+                    };
+                    inline_dependency_dag_cached(
+                        graph,
+                        *root,
+                        &mapped_bindings,
+                        branches,
+                        &mut inline_cache.borrow_mut(),
+                        &mut nodes,
+                        &mut edges,
+                        &mut domains,
+                    )
                 }
                 Version::Projected { source, domain } => {
                     let node = nodes.len();
@@ -2067,6 +2247,7 @@ where
             edges,
             roots: roots.iter().map(|root| mapped[&(*root, false)]).collect(),
             domains,
+            incoming: OnceCell::new(),
         }
     }
 
@@ -2218,10 +2399,7 @@ where
     let Some(root) = root else {
         return Vec::new();
     };
-    let mut incoming: HashMap<usize, Vec<&DependencyDagEdge>> = HashMap::default();
-    for edge in &graph.edges {
-        incoming.entry(edge.destination).or_default().push(edge);
-    }
+    let incoming = graph.incoming();
     let mut reached = HashMap::default();
     let start = (root, PositionRelation::default());
     reached.insert(start, PathCondition::default());
@@ -2240,9 +2418,10 @@ where
         let regular_transfer = matches!(graph.nodes[node], DependencyDagNode::RegularTransfer);
         let relation = if regular_transfer {
             incoming
-                .get(&node)
+                .get(node)
                 .into_iter()
                 .flatten()
+                .filter_map(|&edge| graph.edges.get(edge))
                 .filter(|edge| edge.source == node)
                 .fold(relation, |relation, edge| {
                     widen_repeated_axis(relation, edge.relation)
@@ -2254,7 +2433,12 @@ where
             merge_source(&mut sources, (key, relation), condition);
             continue;
         }
-        for edge in incoming.get(&node).into_iter().flatten() {
+        for edge in incoming
+            .get(node)
+            .into_iter()
+            .flatten()
+            .filter_map(|&edge| graph.edges.get(edge))
+        {
             if regular_transfer && edge.source == node {
                 continue;
             }
@@ -2292,13 +2476,7 @@ where
     let Some(root) = root else {
         return HashSet::default();
     };
-    let mut incoming: HashMap<usize, Vec<usize>> = HashMap::default();
-    for edge in &graph.edges {
-        incoming
-            .entry(edge.destination)
-            .or_default()
-            .push(edge.source);
-    }
+    let incoming = graph.incoming();
     let mut visited = HashSet::from_iter([root]);
     let mut queue = VecDeque::from([root]);
     let mut keys = HashSet::default();
@@ -2306,7 +2484,8 @@ where
         if let DependencyDagNode::External(key) = graph.nodes[node] {
             keys.insert(key);
         }
-        for &source in incoming.get(&node).into_iter().flatten() {
+        for &edge in incoming.get(node).into_iter().flatten() {
+            let source = graph.edges[edge].source;
             if visited.insert(source) {
                 queue.push_back(source);
             }
@@ -2315,6 +2494,20 @@ where
     keys
 }
 
+type MappedDependencyBindings<K> = HashMap<K, Vec<(usize, PositionRelation)>>;
+type MappedDependencyBindingKey<K> = Vec<(K, Vec<(usize, PositionRelation)>)>;
+
+struct MappedDependencyBindingGroup<K> {
+    bindings: Rc<MappedDependencyBindings<K>>,
+    value_key: Rc<MappedDependencyBindingKey<K>>,
+}
+
+#[derive(Default)]
+struct InlineDependencyDagCache {
+    mapped: HashMap<usize, usize>,
+}
+
+#[cfg(test)]
 fn inline_dependency_dag<K>(
     graph: &DependencyDag<K>,
     root: Option<usize>,
@@ -2327,23 +2520,56 @@ fn inline_dependency_dag<K>(
 where
     K: Copy + Eq + Hash,
 {
+    inline_dependency_dag_cached(
+        graph,
+        root,
+        bindings,
+        branches,
+        &mut InlineDependencyDagCache::default(),
+        nodes,
+        edges,
+        domains,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn inline_dependency_dag_cached<K>(
+    graph: &DependencyDag<K>,
+    root: Option<usize>,
+    bindings: &HashMap<K, Vec<(usize, PositionRelation)>>,
+    branches: &BranchRemapper,
+    cache: &mut InlineDependencyDagCache,
+    nodes: &mut Vec<DependencyDagNode<K>>,
+    edges: &mut Vec<DependencyDagEdge>,
+    domains: &mut Vec<Vec<PositionDomain>>,
+) -> Option<usize>
+where
+    K: Copy + Eq + Hash,
+{
     let root = root?;
+    if let Some(&root) = cache.mapped.get(&root) {
+        return Some(root);
+    }
+    let incoming = graph.incoming();
     let mut retained = HashSet::default();
     let mut queue = VecDeque::from([root]);
+    let mut retained_nodes = vec![root];
     retained.insert(root);
     while let Some(node) = queue.pop_front() {
-        for edge in graph.edges.iter().filter(|edge| edge.destination == node) {
-            if retained.insert(edge.source) {
-                queue.push_back(edge.source);
+        #[cfg(test)]
+        INLINE_DEPENDENCY_NODE_VISITS.set(INLINE_DEPENDENCY_NODE_VISITS.get() + 1);
+        for &edge in incoming.get(node).into_iter().flatten() {
+            let source = graph.edges[edge].source;
+            if !cache.mapped.contains_key(&source) && retained.insert(source) {
+                queue.push_back(source);
+                retained_nodes.push(source);
             }
         }
     }
+    retained_nodes.sort_unstable();
 
-    let mut mapped: HashMap<usize, usize> = HashMap::default();
-    for (child, child_node) in graph.nodes.iter().enumerate() {
-        if !retained.contains(&child) {
-            continue;
-        }
+    for &child in &retained_nodes {
+        let child_node = &graph.nodes[child];
         let node = nodes.len();
         nodes.push(match child_node {
             DependencyDagNode::RegularTransfer => DependencyDagNode::RegularTransfer,
@@ -2352,7 +2578,7 @@ where
             }
         });
         domains.push(graph.domains[child].clone());
-        mapped.insert(child, node);
+        cache.mapped.insert(child, node);
         if let DependencyDagNode::External(key) = child_node {
             for &(source, relation) in bindings.get(key).into_iter().flatten() {
                 edges.push(DependencyDagEdge {
@@ -2364,20 +2590,24 @@ where
             }
         }
     }
-    for edge in &graph.edges {
-        let (Some(&source), Some(&destination)) =
-            (mapped.get(&edge.source), mapped.get(&edge.destination))
-        else {
-            continue;
-        };
-        edges.push(DependencyDagEdge {
-            source,
-            destination,
-            relation: edge.relation,
-            condition: branches.remap(&edge.condition),
-        });
+    for &child in &retained_nodes {
+        for &edge in incoming.get(child).into_iter().flatten() {
+            let edge = &graph.edges[edge];
+            let (Some(&source), Some(&destination)) = (
+                cache.mapped.get(&edge.source),
+                cache.mapped.get(&edge.destination),
+            ) else {
+                continue;
+            };
+            edges.push(DependencyDagEdge {
+                source,
+                destination,
+                relation: edge.relation,
+                condition: branches.remap(&edge.condition),
+            });
+        }
     }
-    mapped.get(&root).copied()
+    cache.mapped.get(&root).copied()
 }
 
 fn merge_source<K>(
@@ -2421,6 +2651,171 @@ fn merge_source_summaries<K>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn imported_roots_visit_only_their_reachable_bindings() {
+        const COUNT: usize = 256;
+        let graph = Rc::new(DependencyDag::<u32> {
+            nodes: (0..COUNT as u32).map(DependencyDagNode::External).collect(),
+            edges: Vec::new(),
+            roots: (0..COUNT).map(Some).collect(),
+            domains: vec![Vec::new(); COUNT],
+            incoming: OnceCell::new(),
+        });
+        let mut ssa = SsaStore::default();
+        let bindings = Rc::new(
+            (0..COUNT as u32)
+                .map(|key| (key, vec![(ssa.read(key), PositionRelation::default())]))
+                .collect::<HashMap<_, _>>(),
+        );
+        let branches = SsaStore::<u32>::branch_remapper(HashMap::default());
+        let roots = (0..COUNT)
+            .map(|root| {
+                ssa.imported_shared(
+                    Rc::clone(&graph),
+                    Some(root),
+                    Rc::clone(&bindings),
+                    Rc::clone(&branches),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(Rc::strong_count(&bindings), COUNT + 1);
+        let allowed = (0..COUNT as u32).collect::<HashSet<_>>();
+
+        IMPORTED_BINDING_PROBES.set(0);
+        let dependency = ssa.dependency_dag(&roots, &allowed);
+        assert_eq!(dependency.roots.len(), COUNT);
+        assert!(
+            IMPORTED_BINDING_PROBES.get() <= COUNT * 4,
+            "each independent imported root should inspect only its own binding"
+        );
+    }
+
+    #[test]
+    fn inline_dependency_dag_indexes_incoming_edges_once() {
+        const COUNT: usize = 4_096;
+        let graph = DependencyDag::<u32> {
+            nodes: vec![DependencyDagNode::Internal; COUNT],
+            edges: (0..COUNT - 1)
+                .map(|source| DependencyDagEdge {
+                    source,
+                    destination: source + 1,
+                    relation: PositionRelation::default(),
+                    condition: PathCondition::default(),
+                })
+                .collect(),
+            roots: vec![Some(COUNT - 1)],
+            domains: vec![Vec::new(); COUNT],
+            incoming: OnceCell::new(),
+        };
+        let bindings: HashMap<u32, Vec<(usize, PositionRelation)>> = HashMap::default();
+        let branches = BranchRemapper::new(HashMap::default());
+        let mut nodes = Vec::new();
+        let mut edges = Vec::new();
+        let mut domains = Vec::new();
+
+        INLINE_DEPENDENCY_EDGE_PROBES.set(0);
+        let root = inline_dependency_dag(
+            &graph,
+            graph.roots[0],
+            &bindings,
+            &branches,
+            &mut nodes,
+            &mut edges,
+            &mut domains,
+        );
+
+        assert_eq!(root, Some(COUNT - 1));
+        assert_eq!(nodes.len(), COUNT);
+        assert_eq!(edges.len(), COUNT - 1);
+        // The former full-edge scan examined every edge once per retained node.
+        // Building the incoming index must examine each edge exactly once.
+        assert_eq!(INLINE_DEPENDENCY_EDGE_PROBES.get(), COUNT - 1);
+    }
+
+    #[test]
+    fn imported_shared_chain_roots_inline_each_prefix_once() {
+        const COUNT: usize = 256;
+        let graph = Rc::new(DependencyDag::<u32> {
+            nodes: std::iter::once(DependencyDagNode::External(0))
+                .chain(std::iter::repeat_n(DependencyDagNode::Internal, COUNT - 1))
+                .collect(),
+            edges: (0..COUNT - 1)
+                .map(|source| DependencyDagEdge {
+                    source,
+                    destination: source + 1,
+                    relation: PositionRelation::default(),
+                    condition: PathCondition::default(),
+                })
+                .collect(),
+            roots: (0..COUNT).map(Some).collect(),
+            domains: vec![Vec::new(); COUNT],
+            incoming: OnceCell::new(),
+        });
+        let mut ssa = SsaStore::default();
+        let source = ssa.read(0);
+        let bindings = Rc::new(
+            [(0, vec![(source, PositionRelation::default())])]
+                .into_iter()
+                .collect(),
+        );
+        let branches = SsaStore::<u32>::branch_remapper(HashMap::default());
+        let roots = (0..COUNT)
+            .map(|root| {
+                ssa.imported_shared(
+                    Rc::clone(&graph),
+                    Some(root),
+                    Rc::clone(&bindings),
+                    Rc::clone(&branches),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        INLINE_DEPENDENCY_NODE_VISITS.set(0);
+        let allowed = [0].into_iter().collect();
+        let dependency = ssa.dependency_dag(&roots, &allowed);
+
+        assert_eq!(dependency.roots.len(), COUNT);
+        assert_eq!(dependency.nodes.len(), COUNT + 1);
+        assert_eq!(dependency.edges.len(), COUNT);
+        assert!(
+            INLINE_DEPENDENCY_NODE_VISITS.get() <= COUNT * 2,
+            "shared prefixes should be visited at most once plus one root lookup each"
+        );
+    }
+
+    #[test]
+    fn structural_dependency_cache_visits_a_shared_chain_once() {
+        const COUNT: usize = 4_096;
+        let mut ssa = SsaStore::default();
+        let mut current = ssa.read(0_u32);
+        let mut versions = vec![current];
+        for _ in 1..COUNT {
+            current = ssa.definition(vec![current]);
+            versions.push(current);
+        }
+        assert!(!ssa.has_structural_dependency(current));
+
+        STRUCTURAL_DEPENDENCY_VERSION_VISITS.set(0);
+        let mut cache = HashMap::default();
+        for &version in versions.iter().rev() {
+            assert!(!ssa.has_structural_dependency_cached(version, &mut cache));
+        }
+        assert_eq!(cache.len(), COUNT);
+        assert_eq!(STRUCTURAL_DEPENDENCY_VERSION_VISITS.get(), COUNT);
+
+        let projected = ssa.projected(
+            current,
+            PositionDomain {
+                array_start: 0,
+                array_length: 1,
+                packed_start: 0,
+                packed_length: 1,
+            },
+        );
+        assert!(ssa.has_structural_dependency_cached(projected, &mut cache));
+        assert_eq!(STRUCTURAL_DEPENDENCY_VERSION_VISITS.get(), COUNT + 1);
+    }
 
     #[test]
     fn persistent_paths_and_remap_caches_are_linear_and_isolated() {
@@ -2511,6 +2906,7 @@ mod tests {
             edges: Vec::new(),
             roots: vec![None, None],
             domains: Vec::new(),
+            incoming: OnceCell::new(),
         });
         let mut ssa = SsaStore::default();
         let first = ssa.imported(graph.clone(), None, HashMap::default(), remapper.clone());
@@ -2686,6 +3082,7 @@ mod tests {
             ],
             roots: vec![Some(1)],
             domains: vec![Vec::new(), Vec::new()],
+            incoming: OnceCell::new(),
         };
 
         let sources = dependency_dag_external_sources(&graph, Some(1));

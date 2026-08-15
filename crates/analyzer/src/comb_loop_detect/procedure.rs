@@ -19,6 +19,7 @@ use crate::ir::{
 };
 use crate::value::Value;
 use crate::{HashMap, HashSet};
+use std::cell::OnceCell;
 use std::collections::BTreeMap;
 use std::rc::Rc;
 
@@ -2258,6 +2259,7 @@ impl<'a, 's> ProcedureAnalysis<'a, 's> {
             edges: graph.edges,
             roots: graph.roots,
             domains: graph.domains,
+            incoming: OnceCell::new(),
         }
     }
 
