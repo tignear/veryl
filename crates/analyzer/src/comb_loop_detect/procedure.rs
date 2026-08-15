@@ -3043,6 +3043,20 @@ impl<'a, 's> ProcedureAnalysis<'a, 's> {
         }
     }
 
+    fn bind_destination(&mut self, key: NodeKey, version: VersionId, dynamic: bool) {
+        if dynamic {
+            let key = self.ssa_key(key);
+            self.ssa.weak_bind(key, version);
+        } else {
+            self.bind_key(key, version);
+        }
+        self.written.insert(key);
+    }
+
+    /// Collapse a potentially wide set of selector/control sources once per
+    /// syntactic destination. Attaching every source independently to every
+    /// dynamic candidate creates a C x K SSA fanout even though all candidates
+    /// share exactly the same control expression.
     fn aggregate_destination_controls(
         &mut self,
         mut controls: Vec<VersionId>,
@@ -3054,16 +3068,6 @@ impl<'a, 's> ProcedureAnalysis<'a, 's> {
             1 => controls.first().copied(),
             _ => Some(self.ssa.definition(controls)),
         }
-    }
-
-    fn bind_destination(&mut self, key: NodeKey, version: VersionId, dynamic: bool) {
-        if dynamic {
-            let key = self.ssa_key(key);
-            self.ssa.weak_bind(key, version);
-        } else {
-            self.bind_key(key, version);
-        }
-        self.written.insert(key);
     }
 
     fn receiver_index(&self, _id: VarId, index: &VarIndex) -> VarIndex {
@@ -4428,19 +4432,18 @@ impl<'a, 's> ProcedureAnalysis<'a, 's> {
                         self.status = self.status.max(AnalysisStatus::Partial);
                         return ExpressionSources::default();
                     }
-                    let mut selector_sources = frozen
-                        .as_ref()
-                        .map(|frozen| frozen.selectors.clone())
-                        .unwrap_or_else(|| {
-                            let mut selectors = Vec::new();
-                            for expression in index.0.iter().chain(select.0.iter()) {
-                                selectors.extend(self.eval_expr(expression));
-                            }
-                            if let Some((_, expression)) = &select.1 {
-                                selectors.extend(self.eval_expr(expression));
-                            }
-                            selectors
-                        });
+                    let mut selector_sources = if frozen.is_some() {
+                        Vec::new()
+                    } else {
+                        let mut selectors = Vec::new();
+                        for expression in index.0.iter().chain(select.0.iter()) {
+                            selectors.extend(self.eval_expr(expression));
+                        }
+                        if let Some((_, expression)) = &select.1 {
+                            selectors.extend(self.eval_expr(expression));
+                        }
+                        selectors
+                    };
                     let variable = self.ctx.variables.get(id).cloned();
                     let selected = if select.is_const_with_range() {
                         variable.as_ref().and_then(|variable| {
@@ -4468,9 +4471,9 @@ impl<'a, 's> ProcedureAnalysis<'a, 's> {
                             });
                         // Affine comparison produces an absolute
                         // source-to-destination translation. Expression
-                        // projection first maps the source into expression-local
-                        // coordinates; the key-specific destination translation
-                        // is composed by the caller.
+                        // projection, however, must first map the source into
+                        // expression-local coordinates; the key-specific
+                        // destination translation is composed by the caller.
                         let local_dynamic_array_offset = absolute_dynamic_array_offset
                             .zip(projection.destination_array_offset)
                             .and_then(|(absolute, destination)| absolute.checked_sub(destination));
@@ -4546,14 +4549,22 @@ impl<'a, 's> ProcedureAnalysis<'a, 's> {
                                     .map(|version| (version, offset))
                                     .collect(),
                             };
-                            sources.extend_whole(selector_sources);
+                            if let Some(frozen) = &frozen {
+                                sources.extend_whole(frozen.selectors.iter().copied());
+                            } else {
+                                sources.extend_whole(selector_sources);
+                            }
                             sources
                         } else {
+                            if let Some(frozen) = &frozen {
+                                selector_sources.extend(frozen.selectors.iter().copied());
+                            }
                             selector_sources.extend(reads);
                             ExpressionSources::whole(selector_sources)
                         }
                     } else {
                         if let Some(frozen) = &frozen {
+                            selector_sources.extend(frozen.selectors.iter().copied());
                             selector_sources
                                 .extend(frozen.versions.iter().map(|(_, version)| *version));
                         } else {
