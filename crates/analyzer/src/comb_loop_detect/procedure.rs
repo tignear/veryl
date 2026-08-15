@@ -7,7 +7,8 @@ use super::region::{
 };
 use super::ssa::{
     BranchId, BranchState, Checkpoint, DependencyDag, DependencyDagNode, PathCondition,
-    PositionDomain, PositionRelation, SourceCache, SsaStore, StateRevision, VersionId,
+    PositionDomain, PositionRelation, RepeatedTransfer, SourceCache, SsaStore, StateRevision,
+    VersionId,
 };
 use crate::conv::Context;
 use crate::ir::VarId;
@@ -1010,11 +1011,27 @@ struct FunctionFlow {
 struct LoopFlow {
     checkpoint: Checkpoint,
     breaks: Vec<FlowState>,
+    returns: Option<RuntimeReturnCapture>,
+}
+
+struct RuntimeReturnCapture {
+    /// Runtime-loop returns are exits after zero or more continuing
+    /// iterations. Delay recording them in the enclosing function until the
+    /// loop transfer has been applied.
+    revision: StateRevision,
+    conditions: Vec<PathCondition>,
 }
 
 struct FlowState {
     state: BranchState<SsaKey>,
     condition: PathCondition,
+}
+
+struct RuntimeLoopBody {
+    flow: FlowResult,
+    continuing: BranchState<SsaKey>,
+    breaks: Vec<FlowState>,
+    returned: Option<FlowState>,
 }
 
 #[derive(Clone, PartialEq, Eq, Hash)]
@@ -2612,10 +2629,34 @@ impl<'a, 's> ProcedureAnalysis<'a, 's> {
     }
 
     fn record_return(&mut self) {
+        self.record_return_marker(self.path_condition.clone());
+    }
+
+    fn record_return_marker(&mut self, condition: PathCondition) {
+        if let Some(index) = self
+            .loop_flows
+            .iter()
+            .rposition(|r#loop| r#loop.returns.is_some())
+        {
+            let returns = self.loop_flows[index]
+                .returns
+                .as_mut()
+                .expect("selected a runtime-loop return capture");
+            self.ssa.record_state_revision_exit(returns.revision);
+            returns.conditions.push(condition);
+            return;
+        }
         let Some(revision) = self.function_flows.last().map(|function| function.revision) else {
             return;
         };
         self.ssa.record_state_revision_exit(revision);
+    }
+
+    fn record_deferred_return(&mut self, state: BranchState<SsaKey>, condition: PathCondition) {
+        let checkpoint = self.ssa.checkpoint();
+        self.ssa.merge([&state]);
+        self.record_return_marker(condition);
+        let _ = self.ssa.capture_and_rollback(checkpoint);
     }
 
     fn record_break(&mut self) {
@@ -3130,6 +3171,7 @@ impl<'a, 's> ProcedureAnalysis<'a, 's> {
         self.loop_flows.push(LoopFlow {
             checkpoint,
             breaks: Vec::new(),
+            returns: None,
         });
         let mut iteration_trees = Vec::with_capacity(iterations.len());
         let mut iteration_controls = range_controls.to_vec();
@@ -3183,30 +3225,32 @@ impl<'a, 's> ProcedureAnalysis<'a, 's> {
         self.forget_runtime_iterator_value(statement.var_id);
         let parent_condition = self.path_condition.clone();
         let may_execute_zero_times = for_range_has_dynamic_bounds(&statement.range);
-        let checkpoint = self.ssa.checkpoint();
-        self.loop_flows.push(LoopFlow {
-            checkpoint,
-            breaks: Vec::new(),
-        });
-        let flow = self.eval_block(&statement.body, range_controls);
-        let mut loop_flow = self.loop_flows.pop().expect("loop flow was pushed above");
-        let body_state = self.ssa.capture_and_rollback(checkpoint);
-        if self.flow_store.contains(flow.tree, ProcedureFlow::Continue) {
-            loop_flow.breaks.push(FlowState {
-                state: body_state,
-                condition: self.path_condition.clone(),
-            });
+        let execution_branch = may_execute_zero_times.then(|| self.next_branch_id(2));
+        if let Some(branch) = execution_branch {
+            self.path_condition = parent_condition.with_choice(branch, 1);
         }
+        let checkpoint = self.ssa.checkpoint();
+        let mut body = self.capture_runtime_loop_body(statement, range_controls, checkpoint);
         self.path_condition = parent_condition.clone();
-        // Break and fallthrough paths jointly describe one abstract
-        // iteration. Close that finite transfer instead of re-evaluating the
-        // body or enumerating runtime iterator values.
-        let transfer = self.merge_flow_state_bindings(&loop_flow.breaks);
-        self.ssa
-            .close_repeated_transfer(&transfer, checkpoint, may_execute_zero_times);
-        let mut tree = self.flow_store.leave_loop(flow.tree);
+        let transfer = self
+            .ssa
+            .prepare_repeated_transfer(&body.continuing, checkpoint);
+        self.lift_runtime_loop_exits(&transfer, &mut body);
+        let normal = self.capture_runtime_normal_exit(
+            &transfer,
+            self.flow_store
+                .contains(body.flow.tree, ProcedureFlow::Continue),
+            may_execute_zero_times,
+        );
+        self.ssa.merge(
+            body.breaks
+                .iter()
+                .map(|state| &state.state)
+                .chain(normal.iter()),
+        );
+        let mut tree = self.flow_store.leave_loop(body.flow.tree);
         if may_execute_zero_times {
-            let branch = self.next_branch_id(2);
+            let branch = execution_branch.expect("created for a possibly empty runtime loop");
             let zero = self.flow_store.outcome(ProcedureFlow::Continue);
             tree = self.flow_store.decision(
                 FlowPredicate::opaque(std::ptr::from_ref(statement).addr(), bound_controls),
@@ -3225,10 +3269,78 @@ impl<'a, 's> ProcedureAnalysis<'a, 's> {
         self.flow_result_from_tree(tree)
     }
 
-    fn merge_flow_state_bindings(&mut self, states: &[FlowState]) -> BranchState<SsaKey> {
-        let checkpoint = self.ssa.checkpoint();
-        self.ssa.merge(states.iter().map(|state| &state.state));
-        self.ssa.capture_and_rollback(checkpoint)
+    fn capture_runtime_loop_body(
+        &mut self,
+        statement: &ForStatement,
+        range_controls: &[VersionId],
+        checkpoint: Checkpoint,
+    ) -> RuntimeLoopBody {
+        let return_revision =
+            (!self.function_flows.is_empty()).then(|| self.ssa.begin_state_revision(checkpoint));
+        self.loop_flows.push(LoopFlow {
+            checkpoint,
+            breaks: Vec::new(),
+            returns: return_revision.map(|revision| RuntimeReturnCapture {
+                revision,
+                conditions: Vec::new(),
+            }),
+        });
+        let flow = self.eval_block(&statement.body, range_controls);
+        let loop_flow = self.loop_flows.pop().expect("loop flow was pushed above");
+        let return_state = return_revision
+            .map(|revision| self.ssa.finish_optional_state_revision(revision))
+            .unwrap_or_else(BranchState::empty);
+        let body_state = self.ssa.capture_and_rollback(checkpoint);
+        let continuing = if self.flow_store.contains(flow.tree, ProcedureFlow::Continue) {
+            body_state
+        } else {
+            BranchState::empty()
+        };
+        let returned = loop_flow.returns.and_then(|returns| {
+            (!returns.conditions.is_empty()).then(|| FlowState {
+                state: return_state,
+                condition: PathCondition::disjoin_all(&returns.conditions),
+            })
+        });
+        RuntimeLoopBody {
+            flow,
+            continuing,
+            breaks: loop_flow.breaks,
+            returned,
+        }
+    }
+
+    fn lift_runtime_loop_exits(
+        &mut self,
+        transfer: &RepeatedTransfer<SsaKey>,
+        body: &mut RuntimeLoopBody,
+    ) {
+        self.ssa.lift_repeated_exit_states(
+            transfer,
+            body.breaks
+                .iter_mut()
+                .chain(body.returned.iter_mut())
+                .map(|state| (&mut state.state, &state.condition)),
+        );
+        if let Some(returned) = body.returned.take() {
+            self.record_deferred_return(returned.state, returned.condition);
+        }
+    }
+
+    fn capture_runtime_normal_exit(
+        &mut self,
+        transfer: &RepeatedTransfer<SsaKey>,
+        continues: bool,
+        may_execute_zero_times: bool,
+    ) -> Option<BranchState<SsaKey>> {
+        if continues {
+            let checkpoint = self.ssa.checkpoint();
+            self.ssa
+                .apply_repeated_transfer(transfer, may_execute_zero_times);
+            Some(self.ssa.capture_and_rollback(checkpoint))
+        } else {
+            may_execute_zero_times.then(BranchState::empty)
+        }
     }
 
     fn eval_expr_requested(

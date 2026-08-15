@@ -1076,6 +1076,160 @@ fn comb_loop_break_condition_does_not_control_write_after_loop_exit() {
 }
 
 #[test]
+fn runtime_bound_unconditional_break_is_not_repeated() {
+    assert_comb_loop(
+        "an unconditional break permits at most one shift",
+        r#"
+        module Top (
+            n: input  logic<2>,
+            o: output logic,
+        ) {
+            var value   : logic [3];
+            var feedback: logic;
+            assign feedback = value[2];
+            always_comb {
+                value = '{default: 0};
+                value[0] = feedback;
+                for index in 0..n {
+                    value[index + 1] = value[index];
+                    break;
+                }
+                o = feedback;
+            }
+        }
+        "#,
+        false,
+    );
+}
+
+#[test]
+fn runtime_bound_conditional_break_is_not_repeated() {
+    assert_comb_loop(
+        "a transfer exclusive to a break arm occurs at most once",
+        r#"
+        module Top (
+            n   : input  logic<2>,
+            gate: input  logic,
+            o   : output logic,
+        ) {
+            var value   : logic [3];
+            var feedback: logic;
+            assign feedback = value[2];
+            always_comb {
+                value = '{default: 0};
+                value[0] = feedback;
+                for index in 0..n {
+                    if gate {
+                        value[index + 1] = value[index];
+                        break;
+                    }
+                }
+                o = feedback;
+            }
+        }
+        "#,
+        false,
+    );
+}
+
+#[test]
+fn runtime_bound_mutually_exclusive_break_arms_are_not_composed() {
+    assert_comb_loop(
+        "opposing transfers in mutually exclusive break arms do not compose",
+        r#"
+        module Top (
+            n     : input  u32,
+            select: input  logic,
+            o     : output logic,
+        ) {
+            var feedback: logic;
+            var a       : logic;
+            var b       : logic;
+            var c       : logic;
+            assign feedback = c;
+            always_comb {
+                a = feedback;
+                b = 0;
+                c = 0;
+                for _index in 0..n {
+                    if select {
+                        b = a;
+                        break;
+                    } else {
+                        c = b;
+                        break;
+                    }
+                }
+                o = feedback;
+            }
+        }
+        "#,
+        false,
+    );
+}
+
+#[test]
+fn runtime_bound_break_retains_its_single_iteration_transfer() {
+    assert_comb_loop(
+        "the one transfer before an unconditional break can itself close feedback",
+        r#"
+        module Top (
+            n: input  logic<2>,
+            o: output logic,
+        ) {
+            var value   : logic [2];
+            var feedback: logic;
+            assign feedback = value[1];
+            always_comb {
+                value = '{default: 0};
+                value[0] = feedback;
+                for index in 0..n {
+                    value[index + 1] = value[index];
+                    break;
+                }
+                o = feedback;
+            }
+        }
+        "#,
+        true,
+    );
+}
+
+#[test]
+fn runtime_bound_break_is_lifted_over_prior_continuing_iterations() {
+    assert_comb_loop(
+        "a break exit sees state transferred by an earlier continuing iteration",
+        r#"
+        module Top (
+            n: input  u32,
+            o: output logic,
+        ) {
+            var feedback: logic;
+            var a       : logic;
+            var b       : logic;
+            var c       : logic;
+            assign feedback = c;
+            always_comb {
+                a = feedback;
+                b = 0;
+                c = 0;
+                for index in 0..n {
+                    if index == 1 {
+                        c = b;
+                        break;
+                    }
+                    b = a;
+                    a = 0;
+                }
+                o = feedback;
+            }
+        }
+        "#,
+        true,
+    );
+}
+
+#[test]
 fn comb_loop_branches_in_separate_processes_are_not_mutually_exclusive() {
     assert_comb_loop(
         "branch identities are local to their procedural process",

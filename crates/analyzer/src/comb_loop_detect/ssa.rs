@@ -1073,12 +1073,22 @@ pub(super) struct BranchState<K> {
     bindings: HashMap<K, VersionId>,
 }
 
+pub(super) struct RepeatedTransfer<K> {
+    entry_version_by_key: HashMap<K, VersionId>,
+    reachable_by_entry: HashMap<VersionId, HashSet<VersionId>>,
+    version_start: usize,
+}
+
 impl<K> BranchState<K> {
-    #[cfg(test)]
-    pub(super) fn unchanged() -> Self {
+    pub(super) fn empty() -> Self {
         Self {
             bindings: HashMap::default(),
         }
+    }
+
+    #[cfg(test)]
+    pub(super) fn unchanged() -> Self {
+        Self::empty()
     }
 }
 
@@ -1333,6 +1343,23 @@ where
     /// one linear replay recovers the same per-key phi inputs as merging those
     /// snapshots would.
     pub(super) fn finish_state_revision(&mut self, revision: StateRevision) -> BranchState<K> {
+        self.finish_state_revision_inner(revision, true)
+    }
+
+    /// Finish a speculative exit recorder. Runtime-loop bodies may contain no
+    /// return at all, in which case the recorded state is intentionally empty.
+    pub(super) fn finish_optional_state_revision(
+        &mut self,
+        revision: StateRevision,
+    ) -> BranchState<K> {
+        self.finish_state_revision_inner(revision, false)
+    }
+
+    fn finish_state_revision_inner(
+        &mut self,
+        revision: StateRevision,
+        require_exit: bool,
+    ) -> BranchState<K> {
         assert_eq!(self.active_revisions.last(), Some(&revision.id));
         assert!(revision.checkpoint_depth < self.checkpoints.len());
 
@@ -1369,10 +1396,9 @@ where
             }
         }
         assert!(
-            exit_count != 0,
+            !require_exit || exit_count != 0,
             "a completed function has at least one exit"
         );
-
         let mut bindings = HashMap::default();
         for (key, mut value) in values {
             if value.current_since_exit < exit_count {
@@ -1507,37 +1533,28 @@ where
         }
     }
 
-    /// Apply the transitive closure of a runtime loop's may-dependency
+    /// Prepare the transitive closure of a runtime loop's may-dependency
     /// transfer without enumerating runtime iterator values or iterations.
     ///
     /// `single_iteration` maps each written key to its output after one
     /// abstract iteration. Versions that predate `iteration_checkpoint` are
     /// that iteration's inputs, so they form the nodes of a finite transfer
-    /// graph. Its transitive closure models any positive number of iterations.
-    /// When `may_skip` is true, a root phi keeps the loop-entry version as a
-    /// separate zero-iteration alternative. This distinction matters for a
-    /// raw live-on-entry value: dependency DAG roots intentionally suppress
-    /// that implicit latch input, while a concrete definition made before the
-    /// loop remains visible through the phi.
-    pub(super) fn close_repeated_transfer(
+    /// graph. The prepared reachability relation is shared by normal and early
+    /// exits from the same runtime loop.
+    pub(super) fn prepare_repeated_transfer(
         &mut self,
         single_iteration: &BranchState<K>,
         iteration_checkpoint: Checkpoint,
-        may_skip: bool,
-    ) {
+    ) -> RepeatedTransfer<K> {
         let mut entry_version_by_key = HashMap::default();
-        for &key in single_iteration.bindings.keys() {
-            entry_version_by_key.insert(key, self.read(key));
-        }
-
         let mut direct_inputs_by_key = HashMap::default();
         for (&key, &output) in &single_iteration.bindings {
+            entry_version_by_key.insert(key, self.read(key));
             direct_inputs_by_key.insert(
                 key,
                 self.iteration_input_versions(output, iteration_checkpoint.version_start),
             );
         }
-
         let mut next_inputs_by_input: HashMap<VersionId, HashSet<VersionId>> = HashMap::default();
         for (&key, direct_inputs) in &direct_inputs_by_key {
             next_inputs_by_input
@@ -1545,22 +1562,201 @@ where
                 .or_default()
                 .extend(direct_inputs);
         }
+        let reachable_by_entry = entry_version_by_key
+            .values()
+            .copied()
+            .map(|entry| {
+                let direct = next_inputs_by_input
+                    .get(&entry)
+                    .cloned()
+                    .unwrap_or_default();
+                (entry, reachable_versions(&direct, &next_inputs_by_input))
+            })
+            .collect();
+        RepeatedTransfer {
+            entry_version_by_key,
+            reachable_by_entry,
+            version_start: iteration_checkpoint.version_start,
+        }
+    }
 
-        for (&key, direct_inputs) in &direct_inputs_by_key {
-            let reached = reachable_versions(direct_inputs, &next_inputs_by_input);
+    /// Apply a prepared transfer for any positive number of iterations.
+    ///
+    /// When `may_skip` is true, a root phi keeps the loop-entry version as a
+    /// separate zero-iteration alternative. This distinction matters for a
+    /// raw live-on-entry value: dependency DAG roots intentionally suppress
+    /// that implicit latch input, while a concrete definition made before the
+    /// loop remains visible through the phi.
+    pub(super) fn apply_repeated_transfer(
+        &mut self,
+        transfer: &RepeatedTransfer<K>,
+        may_skip: bool,
+    ) {
+        for (&key, &entry) in &transfer.entry_version_by_key {
+            let reached = &transfer.reachable_by_entry[&entry];
             let positive_closure = self.related_definition(
                 reached
-                    .into_iter()
+                    .iter()
+                    .copied()
                     .map(|version| (version, PositionRelation::whole()))
                     .collect(),
             );
             let output = if may_skip {
-                self.phi(vec![entry_version_by_key[&key], positive_closure])
+                self.phi(vec![entry, positive_closure])
             } else {
                 positive_closure
             };
             self.bind(key, output);
         }
+    }
+
+    pub(super) fn lift_repeated_exit_states<'b>(
+        &mut self,
+        transfer: &RepeatedTransfer<K>,
+        exits: impl IntoIterator<Item = (&'b mut BranchState<K>, &'b PathCondition)>,
+    ) where
+        K: 'b,
+    {
+        let mut exits = exits.into_iter().peekable();
+        if exits.peek().is_none() {
+            return;
+        }
+        let substitutions = transfer
+            .entry_version_by_key
+            .values()
+            .copied()
+            .map(|entry| {
+                let reached = &transfer.reachable_by_entry[&entry];
+                let positive = self.related_definition(
+                    reached
+                        .iter()
+                        .copied()
+                        .map(|version| (version, PositionRelation::whole()))
+                        .collect(),
+                );
+                // Keep the zero-prior-iteration entry as a phi alternative.
+                // At a retained-state root it remains an implicit latch input;
+                // when a break assignment explicitly reads it, the enclosing
+                // definition still turns that read into an ordinary source.
+                (entry, self.phi(vec![entry, positive]))
+            })
+            .collect::<HashMap<_, _>>();
+        let mut mapped = HashMap::default();
+        for (state, condition) in exits {
+            for (key, exit) in state.bindings.clone() {
+                let output = self.substitute_iteration_inputs(
+                    exit,
+                    &substitutions,
+                    transfer.version_start,
+                    &mut mapped,
+                );
+                state.bindings.insert(key, output);
+            }
+            for (&key, &entry) in &transfer.entry_version_by_key {
+                if state.bindings.contains_key(&key) {
+                    continue;
+                }
+                let reached = &transfer.reachable_by_entry[&entry];
+                let positive = self.related_definition(
+                    reached
+                        .iter()
+                        .copied()
+                        .map(|version| (version, PositionRelation::whole()))
+                        .collect(),
+                );
+                let positive = self.related_definition_guarded(
+                    vec![(positive, PositionRelation::default())],
+                    condition,
+                );
+                state.bindings.insert(key, self.phi(vec![entry, positive]));
+            }
+        }
+    }
+
+    fn substitute_iteration_inputs(
+        &mut self,
+        root: VersionId,
+        substitutions: &HashMap<VersionId, VersionId>,
+        version_start: usize,
+        mapped: &mut HashMap<VersionId, VersionId>,
+    ) -> VersionId {
+        let mut work = vec![(root, false)];
+        while let Some((version, expanded)) = work.pop() {
+            if mapped.contains_key(&version) {
+                continue;
+            }
+            if version < version_start || matches!(self.versions[version], Version::Entry(_)) {
+                mapped.insert(
+                    version,
+                    substitutions.get(&version).copied().unwrap_or(version),
+                );
+                continue;
+            }
+            let data = self.versions[version].clone();
+            if !expanded {
+                work.push((version, true));
+                match data {
+                    Version::Definition { sources, .. } => {
+                        work.extend(sources.into_iter().map(|(source, _)| (source, false)));
+                    }
+                    Version::Phi(inputs) => {
+                        work.extend(inputs.into_iter().map(|input| (input, false)));
+                    }
+                    Version::Imported { bindings, .. } => {
+                        for sources in bindings.values() {
+                            work.extend(sources.iter().map(|(source, _)| (*source, false)));
+                        }
+                    }
+                    Version::Projected { source, .. } | Version::Repeated { source, .. } => {
+                        work.push((source, false));
+                    }
+                    Version::Entry(_) => unreachable!("entries are handled above"),
+                }
+                continue;
+            }
+            let replacement = match data {
+                Version::Definition { sources, condition } => self.related_definition_guarded(
+                    sources
+                        .into_iter()
+                        .map(|(source, relation)| (mapped[&source], relation))
+                        .collect(),
+                    &condition,
+                ),
+                Version::Phi(inputs) => {
+                    self.phi(inputs.into_iter().map(|input| mapped[&input]).collect())
+                }
+                Version::Imported {
+                    graph,
+                    root,
+                    bindings,
+                    branches,
+                } => {
+                    let bindings = bindings
+                        .iter()
+                        .map(|(&key, sources)| {
+                            (
+                                key,
+                                sources
+                                    .iter()
+                                    .map(|(source, relation)| (mapped[source], *relation))
+                                    .collect(),
+                            )
+                        })
+                        .collect();
+                    self.imported(graph, root, bindings, branches)
+                }
+                Version::Projected { source, domain } => self.projected(mapped[&source], domain),
+                Version::Repeated {
+                    source,
+                    initial,
+                    step,
+                    domain,
+                } => self.repeated(mapped[&source], initial, step, domain),
+                Version::Entry(_) => unreachable!("entries are handled above"),
+            };
+            mapped.insert(version, replacement);
+        }
+        mapped[&root]
     }
 
     fn iteration_input_versions(
@@ -2730,11 +2926,60 @@ mod tests {
         ssa.weak_bind("middle", middle);
 
         let iteration = ssa.capture_and_rollback(checkpoint);
-        ssa.close_repeated_transfer(&iteration, checkpoint, false);
+        let transfer = ssa.prepare_repeated_transfer(&iteration, checkpoint);
+        ssa.apply_repeated_transfer(&transfer, false);
 
         let last = ssa.read("last");
         let sources = ssa.root_sources(last);
         assert!(sources.contains("first"));
+    }
+
+    #[test]
+    fn repeated_break_preserves_a_direct_break_transfer() {
+        let mut ssa = SsaStore::default();
+        let checkpoint = ssa.checkpoint();
+        let source = ssa.read("source");
+        let output = ssa.definition(vec![source]);
+        ssa.bind("output", output);
+        let mut breaks = [(
+            ssa.capture_and_rollback(checkpoint),
+            PathCondition::default(),
+        )];
+
+        let transfer = ssa.prepare_repeated_transfer(&BranchState::empty(), checkpoint);
+        ssa.lift_repeated_exit_states(
+            &transfer,
+            breaks
+                .iter_mut()
+                .map(|(state, condition)| (state, &*condition)),
+        );
+        ssa.merge([&breaks[0].0]);
+
+        let output = ssa.read("output");
+        assert_eq!(ssa.root_sources(output), ["source"].into_iter().collect());
+    }
+
+    #[test]
+    fn repeated_break_retains_continuing_state_for_an_unwritten_key() {
+        let mut ssa = SsaStore::default();
+        let checkpoint = ssa.checkpoint();
+        let source = ssa.read("source");
+        let first = ssa.definition(vec![source]);
+        ssa.bind("value", first);
+        let continuing = ssa.capture_and_rollback(checkpoint);
+
+        let mut breaks = [(BranchState::empty(), PathCondition::default())];
+        let transfer = ssa.prepare_repeated_transfer(&continuing, checkpoint);
+        ssa.lift_repeated_exit_states(
+            &transfer,
+            breaks
+                .iter_mut()
+                .map(|(state, condition)| (state, &*condition)),
+        );
+        ssa.merge([&breaks[0].0]);
+
+        let value = ssa.read("value");
+        assert!(ssa.root_sources(value).contains("source"));
     }
 
     #[test]

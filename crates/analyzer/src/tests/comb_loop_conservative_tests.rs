@@ -16,8 +16,8 @@
 //!   range-disjoint indices, and static suffix dimensions below a dynamic one;
 //! - runtime ranges whose emptiness or exact iteration count requires bound
 //!   correlation, inequality reasoning, or the bound type's finite width;
-//! - forward/reverse iterator order, overwrite order, `break`, and iterator
-//!   predicates excluded by runtime bounds or stride.
+//! - forward/reverse iterator order, overwrite order, and iterator predicates
+//!   excluded by runtime bounds or stride.
 //!
 //! Each class has a loop-free program below which is intentionally diagnosed.
 
@@ -745,34 +745,6 @@ fn runtime_bound_width_is_not_used_as_an_iteration_limit() {
                 value[0] = feedback;
                 for index in 0..n {
                     value[index + 1] = value[index];
-                }
-                o = feedback;
-            }
-        }
-        "#,
-    );
-}
-
-#[test]
-fn runtime_break_is_not_used_as_an_iteration_limit() {
-    // The unconditional break prevents the second iteration required to reach
-    // value[2].
-    assert_intentional_false_positive(
-        "an unconditional break permits one iteration but closure is unbounded",
-        r#"
-        module Top (
-            n: input  logic<2>,
-            o: output logic,
-        ) {
-            var value   : logic [3];
-            var feedback: logic;
-            assign feedback = value[2];
-            always_comb {
-                value = '{default: 0};
-                value[0] = feedback;
-                for index in 0..n {
-                    value[index + 1] = value[index];
-                    break;
                 }
                 o = feedback;
             }

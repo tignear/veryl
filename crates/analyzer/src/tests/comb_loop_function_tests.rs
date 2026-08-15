@@ -313,6 +313,197 @@ fn comb_loop_runtime_for_return_controls_a_later_captured_write() {
 }
 
 #[test]
+fn runtime_bound_return_sees_prior_continuing_iterations() {
+    assert_comb_loop(
+        "a runtime-loop return is reached after the preceding iteration transfer",
+        r#"
+        module Top (n: input u32, o: output logic) {
+            var feedback: logic;
+            function delayed (seed: input logic) -> logic {
+                var state: logic<2>;
+                state = 0;
+                state[0] = seed;
+                for index in 0..n {
+                    if index == 1 {
+                        return state[1];
+                    }
+                    state = state << 1;
+                }
+                return 0;
+            }
+            assign o = delayed(feedback);
+            assign feedback = o;
+        }
+        "#,
+        true,
+    );
+}
+
+#[test]
+fn static_return_sees_prior_continuing_iterations() {
+    assert_comb_loop(
+        "the statically expanded form detects the same delayed feedback",
+        r#"
+        module Top (o: output logic) {
+            var feedback: logic;
+            function delayed (seed: input logic) -> logic {
+                var state: logic<2>;
+                state = 0;
+                state[0] = seed;
+                for index in 0..2 {
+                    if index == 1 {
+                        return state[1];
+                    }
+                    state = state << 1;
+                }
+                return 0;
+            }
+            assign o = delayed(feedback);
+            assign feedback = o;
+        }
+        "#,
+        true,
+    );
+}
+
+#[test]
+fn runtime_bound_immediate_return_does_not_invent_a_disjoint_bit_dependency() {
+    assert_comb_loop(
+        "a runtime-loop return keeps a disjoint state bit loop-free",
+        r#"
+        module Top (n: input u32, o: output logic) {
+            var feedback: logic;
+            function delayed (seed: input logic) -> logic {
+                var state: logic<2>;
+                state = 0;
+                state[0] = seed;
+                for _index in 0..n {
+                    state = state << 1;
+                    return state[0];
+                }
+                return 0;
+            }
+            assign o = delayed(feedback);
+            assign feedback = o;
+        }
+        "#,
+        false,
+    );
+}
+
+#[test]
+fn runtime_bound_return_lifts_a_captured_write_over_prior_iterations() {
+    assert_comb_loop(
+        "a captured write on return sees state from an earlier iteration",
+        r#"
+        module Top (n: input u32, o: output logic) {
+            var feedback: logic;
+            var captured: logic;
+            var dummy   : logic;
+            function delayed (seed: input logic) -> logic {
+                var state: logic<2>;
+                state = 0;
+                state[0] = seed;
+                for index in 0..n {
+                    if index == 1 {
+                        captured = state[1];
+                        return 0;
+                    }
+                    state = state << 1;
+                }
+                return 0;
+            }
+            always_comb {
+                captured = 0;
+                dummy = delayed(feedback);
+            }
+            always_comb {
+                feedback = captured;
+            }
+            assign o = feedback | dummy;
+        }
+        "#,
+        true,
+    );
+}
+
+#[test]
+fn runtime_bound_mutually_exclusive_return_writes_are_not_composed() {
+    assert_comb_loop(
+        "writes from mutually exclusive return arms remain incompatible",
+        r#"
+        module Top (
+            n     : input  u32,
+            select: input  logic,
+            o     : output logic,
+        ) {
+            var feedback: logic;
+            var a       : logic;
+            var b       : logic;
+            var c       : logic;
+            var dummy   : logic;
+            function choose () -> logic {
+                for _index in 0..n {
+                    if select {
+                        b = a;
+                        return 0;
+                    } else {
+                        c = b;
+                        return 0;
+                    }
+                }
+                return 0;
+            }
+            always_comb {
+                a = feedback;
+                b = 0;
+                c = 0;
+                dummy = choose();
+            }
+            always_comb {
+                feedback = c;
+            }
+            assign o = feedback | dummy;
+        }
+        "#,
+        false,
+    );
+}
+
+#[test]
+fn nested_runtime_bound_return_sees_prior_inner_iterations() {
+    assert_comb_loop(
+        "a nested runtime-loop return retains the inner continuing transfer",
+        r#"
+        module Top (
+            outer_bound: input u32,
+            inner_bound: input u32,
+            o          : output logic,
+        ) {
+            var feedback: logic;
+            function delayed (seed: input logic) -> logic {
+                var state: logic<2>;
+                state = 0;
+                state[0] = seed;
+                for _outer in 0..outer_bound {
+                    for inner in 0..inner_bound {
+                        if inner == 1 {
+                            return state[1];
+                        }
+                        state = state << 1;
+                    }
+                }
+                return 0;
+            }
+            assign o = delayed(feedback);
+            assign feedback = o;
+        }
+        "#,
+        true,
+    );
+}
+
+#[test]
 fn comb_loop_break_and_fallthrough_do_not_control_after_loop_write() {
     assert_comb_loop(
         "break and body fallthrough reach the same statement after the loop",
