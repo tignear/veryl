@@ -22,6 +22,7 @@ mod summary;
 #[cfg(test)]
 thread_local! {
     static INSTANCE_REQUEST_EDGE_PROBES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static INSTANCE_FRAGMENT_PROBES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static GUARDED_EXPRESSION_PROBES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
@@ -33,6 +34,16 @@ pub(crate) fn reset_instance_request_edge_probes() {
 #[cfg(test)]
 pub(crate) fn instance_request_edge_probes() -> usize {
     INSTANCE_REQUEST_EDGE_PROBES.get()
+}
+
+#[cfg(test)]
+pub(crate) fn reset_instance_fragment_probes() {
+    INSTANCE_FRAGMENT_PROBES.set(0);
+}
+
+#[cfg(test)]
+pub(crate) fn instance_fragment_probes() -> usize {
+    INSTANCE_FRAGMENT_PROBES.get()
 }
 
 #[cfg(test)]
@@ -417,10 +428,27 @@ struct InstanceEndpointIndex {
     interface_bindings: HashMap<VarId, usize>,
     input_array_filters: HashMap<VarId, StaticArrayFilters>,
     output_array_filters: HashMap<VarId, StaticArrayFilters>,
+    output_layouts: HashMap<VarId, Option<ActualFragmentLayout>>,
 }
 
 impl InstanceEndpointIndex {
-    fn new(inst: &InstDeclaration, _child: &Module, ctx: &mut Context) -> Self {
+    fn new(inst: &InstDeclaration, child: &Module, ctx: &mut Context) -> Self {
+        let output_layouts = inst
+            .outputs
+            .iter()
+            .filter_map(|output| {
+                let variable = child
+                    .variables
+                    .get(&output.id)
+                    .or_else(|| child.interface_members.get(&output.id))?;
+                let fragments = if let Some(actual) = &output.range_dst {
+                    coerced_contiguous_actual_fragments(variable, actual)
+                } else {
+                    actual_fragments(variable, &output.dst, ctx)
+                };
+                Some((output.id, fragments.map(ActualFragmentLayout::new)))
+            })
+            .collect();
         let input_array_filters = inst
             .inputs
             .iter()
@@ -468,6 +496,7 @@ impl InstanceEndpointIndex {
                 .collect(),
             input_array_filters,
             output_array_filters,
+            output_layouts,
         }
     }
 }
@@ -533,11 +562,11 @@ fn summary_parent_accesses(
             .get(&region.id)
             .map(|&index| &inst.outputs[index])
     {
-        let accesses = if let Some(actual) = &output.range_dst {
-            translated_coerced_contiguous_actual_accesses(region, variable, actual)
-        } else {
-            translated_fragment_accesses(region, variable, &output.dst, ctx)
-        };
+        let accesses = endpoints
+            .output_layouts
+            .get(&output.id)
+            .and_then(|layout| layout.as_ref())
+            .and_then(|layout| layout.translate(region));
         if let Some(accesses) = accesses {
             return accesses
                 .into_iter()
@@ -2093,7 +2122,7 @@ fn instance_region_mapping(
     }
 
     if direction == Direction::Output
-        && let (Some(variable), Some(output)) = (
+        && let (Some(_variable), Some(output)) = (
             variable,
             endpoints
                 .outputs
@@ -2101,11 +2130,12 @@ fn instance_region_mapping(
                 .map(|&index| &inst.outputs[index]),
         )
     {
-        let mapping = if let Some(actual) = &output.range_dst {
-            map_summary_region_to_coerced_contiguous_actual(region, variable, actual, bit_part)
-        } else {
-            map_summary_region_to_fragments(region, variable, &output.dst, bit_part, ctx)
-        };
+        let mapping = endpoints
+            .output_layouts
+            .get(&output.id)
+            .and_then(|layout| layout.as_ref())
+            .and_then(|layout| layout.translate(region))
+            .map(|accesses| map_translated_fragment_accesses(accesses, bit_part));
         if let Some(mapping) = mapping {
             return mapping;
         }
@@ -2217,6 +2247,115 @@ struct ActualFragment {
     parent_packed: PackedSpan,
     array_filters: StaticArrayFilters,
     offset: BitDependency,
+}
+
+/// Cached output-actual geometry. Summary regions repeatedly query the same
+/// endpoint, so rebuilding and linearly scanning a W-part concatenation for
+/// each of W child regions would otherwise take quadratic work.
+struct ActualFragmentLayout {
+    fragments: Vec<ActualFragment>,
+    array: FragmentIntervalOrder,
+    packed: FragmentIntervalOrder,
+}
+
+struct FragmentIntervalOrder {
+    indices: Vec<usize>,
+    prefix_max_end: Vec<usize>,
+}
+
+impl FragmentIntervalOrder {
+    fn new(fragments: &[ActualFragment], span: impl Fn(&ActualFragment) -> (usize, usize)) -> Self {
+        let mut indices = (0..fragments.len()).collect::<Vec<_>>();
+        indices.sort_unstable_by_key(|&index| span(&fragments[index]).0);
+        let mut maximum = 0usize;
+        let prefix_max_end = indices
+            .iter()
+            .map(|&index| {
+                maximum = maximum.max(span(&fragments[index]).1);
+                maximum
+            })
+            .collect();
+        Self {
+            indices,
+            prefix_max_end,
+        }
+    }
+
+    fn candidate_range(
+        &self,
+        fragments: &[ActualFragment],
+        start: usize,
+        end: usize,
+        span: impl Fn(&ActualFragment) -> (usize, usize),
+    ) -> std::ops::Range<usize> {
+        let first = self
+            .prefix_max_end
+            .partition_point(|&maximum| maximum <= start);
+        let last = self
+            .indices
+            .partition_point(|&index| span(&fragments[index]).0 < end);
+        first.min(last)..last
+    }
+}
+
+impl ActualFragmentLayout {
+    fn new(fragments: Vec<ActualFragment>) -> Self {
+        let array = FragmentIntervalOrder::new(&fragments, |fragment| {
+            (
+                fragment.child_array.start,
+                fragment.child_array.end().unwrap_or(usize::MAX),
+            )
+        });
+        let packed = FragmentIntervalOrder::new(&fragments, |fragment| {
+            (fragment.child_packed.start, fragment.child_packed.end())
+        });
+        Self {
+            fragments,
+            array,
+            packed,
+        }
+    }
+
+    fn translate(&self, region: SummaryRegion) -> Option<Vec<TranslatedFragmentAccess>> {
+        let array_end = region.array.end().unwrap_or(usize::MAX);
+        let packed_end = region.packed.end();
+        let array = self.array.candidate_range(
+            &self.fragments,
+            region.array.start,
+            array_end,
+            |fragment| {
+                (
+                    fragment.child_array.start,
+                    fragment.child_array.end().unwrap_or(usize::MAX),
+                )
+            },
+        );
+        let packed = self.packed.candidate_range(
+            &self.fragments,
+            region.packed.start,
+            packed_end,
+            |fragment| (fragment.child_packed.start, fragment.child_packed.end()),
+        );
+        let order = if array.len() <= packed.len() {
+            (&self.array, array)
+        } else {
+            (&self.packed, packed)
+        };
+        order.0.indices[order.1]
+            .iter()
+            .filter_map(|&index| {
+                #[cfg(test)]
+                INSTANCE_FRAGMENT_PROBES.set(INSTANCE_FRAGMENT_PROBES.get() + 1);
+                let fragment = self.fragments[index].clone();
+                let array = region.array.intersection(fragment.child_array)?;
+                let packed = region.packed.intersection(fragment.child_packed)?;
+                Some((fragment, array, packed))
+            })
+            .map(|(fragment, array, packed)| {
+                translate_actual_fragment(region.id, fragment, array, packed)
+            })
+            .collect()
+    }
 }
 
 #[derive(Clone)]
@@ -2568,42 +2707,40 @@ fn translate_actual_fragments(
             let packed = region.packed.intersection(fragment.child_packed)?;
             Some((fragment, array, packed))
         })
-        .map(|(fragment, child_array, child_packed)| {
-            let array = if fragment.offset.array.is_some() {
-                child_array.translated(fragment.child_array.start, fragment.parent_array.start)?
-            } else {
-                fragment.parent_array
-            };
-            let packed = if fragment.offset.packed.is_some() {
-                child_packed
-                    .translated(fragment.child_packed.start, fragment.parent_packed.start)?
-            } else {
-                fragment.parent_packed
-            };
-            Some(TranslatedFragmentAccess {
-                parent: fragment.parent,
-                array,
-                packed,
-                array_filters: fragment.array_filters,
-                offset: fragment.offset,
-                child_domain: SummaryRegion {
-                    id: region.id,
-                    array: child_array,
-                    packed: child_packed,
-                },
-            })
+        .map(|(fragment, array, packed)| {
+            translate_actual_fragment(region.id, fragment, array, packed)
         })
         .collect()
 }
 
-fn translated_fragment_accesses(
-    region: SummaryRegion,
-    child: &Variable,
-    actual: &[AssignDestination],
-    ctx: &mut Context,
-) -> Option<Vec<TranslatedFragmentAccess>> {
-    let fragments = actual_fragments(child, actual, ctx)?;
-    translate_actual_fragments(region, fragments)
+fn translate_actual_fragment(
+    child: VarId,
+    fragment: ActualFragment,
+    child_array: ArraySpan,
+    child_packed: PackedSpan,
+) -> Option<TranslatedFragmentAccess> {
+    let array = if fragment.offset.array.is_some() {
+        child_array.translated(fragment.child_array.start, fragment.parent_array.start)?
+    } else {
+        fragment.parent_array
+    };
+    let packed = if fragment.offset.packed.is_some() {
+        child_packed.translated(fragment.child_packed.start, fragment.parent_packed.start)?
+    } else {
+        fragment.parent_packed
+    };
+    Some(TranslatedFragmentAccess {
+        parent: fragment.parent,
+        array,
+        packed,
+        array_filters: fragment.array_filters,
+        offset: fragment.offset,
+        child_domain: SummaryRegion {
+            id: child,
+            array: child_array,
+            packed: child_packed,
+        },
+    })
 }
 
 fn translated_interface_binding_accesses(
@@ -2615,14 +2752,6 @@ fn translated_interface_binding_accesses(
         region,
         [contiguous_actual_fragment(child, &binding.actual)?],
     )
-}
-
-fn translated_coerced_contiguous_actual_accesses(
-    region: SummaryRegion,
-    child: &Variable,
-    actual: &InstActualFragment,
-) -> Option<Vec<TranslatedFragmentAccess>> {
-    translate_actual_fragments(region, coerced_contiguous_actual_fragments(child, actual)?)
 }
 
 fn translated_coerced_input_contiguous_actual_accesses(
@@ -2663,17 +2792,6 @@ fn map_translated_fragment_accesses(
     InstanceRegionMapping { nodes }
 }
 
-fn map_summary_region_to_fragments(
-    region: SummaryRegion,
-    child: &Variable,
-    actual: &[AssignDestination],
-    bit_part: &BitPartition,
-    ctx: &mut Context,
-) -> Option<InstanceRegionMapping> {
-    let accesses = translated_fragment_accesses(region, child, actual, ctx)?;
-    Some(map_translated_fragment_accesses(accesses, bit_part))
-}
-
 fn map_summary_region_to_interface_binding(
     region: SummaryRegion,
     child: &Variable,
@@ -2681,16 +2799,6 @@ fn map_summary_region_to_interface_binding(
     bit_part: &BitPartition,
 ) -> Option<InstanceRegionMapping> {
     let accesses = translated_interface_binding_accesses(region, child, binding)?;
-    Some(map_translated_fragment_accesses(accesses, bit_part))
-}
-
-fn map_summary_region_to_coerced_contiguous_actual(
-    region: SummaryRegion,
-    child: &Variable,
-    actual: &InstActualFragment,
-    bit_part: &BitPartition,
-) -> Option<InstanceRegionMapping> {
-    let accesses = translated_coerced_contiguous_actual_accesses(region, child, actual)?;
     Some(map_translated_fragment_accesses(accesses, bit_part))
 }
 
