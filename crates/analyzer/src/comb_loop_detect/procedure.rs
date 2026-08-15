@@ -13,8 +13,8 @@ use crate::conv::Context;
 use crate::ir::VarId;
 use crate::ir::{
     ArrayLiteralItem, AssignDestination, CaseStatement, Expression, Factor, ForBound, ForRange,
-    ForStatement, FunctionCall, IfStatement, Module, Op, Statement, SystemFunctionKind, VarIndex,
-    VarPath, VarSelect,
+    ForStatement, FunctionCall, IfStatement, MemberSelectDomain, Module, Op, Statement,
+    SystemFunctionKind, VarIndex, VarPath, VarSelect,
 };
 use crate::value::Value;
 use crate::{HashMap, HashSet};
@@ -34,6 +34,40 @@ fn position_domain(array: ArraySpan, packed: PackedSpan) -> PositionDomain {
         packed_start: packed.start,
         packed_length: packed.length,
     }
+}
+
+fn packed_mask_overlaps(mask: &crate::BigUint, span: PackedSpan) -> bool {
+    let Ok(start) = u64::try_from(span.start) else {
+        return false;
+    };
+    if mask.bits() <= start {
+        return false;
+    }
+    if span.length == 1 {
+        return mask.bit(start);
+    }
+    if span.start == 0 && u64::try_from(span.end()).is_ok_and(|end| end >= mask.bits()) {
+        return mask.bits() != 0;
+    }
+
+    let first_word = span.start / u64::BITS as usize;
+    let last_word = (span.end() - 1) / u64::BITS as usize;
+    mask.iter_u64_digits()
+        .enumerate()
+        .skip(first_word)
+        .take(last_word - first_word + 1)
+        .any(|(word_index, mut word)| {
+            if word_index == first_word {
+                word &= u64::MAX << (span.start % u64::BITS as usize);
+            }
+            if word_index == last_word {
+                let end_bit = span.end() % u64::BITS as usize;
+                if end_bit != 0 {
+                    word &= (1u64 << end_bit) - 1;
+                }
+            }
+            word != 0
+        })
 }
 
 fn translate_packed_span(span: PackedSpan, offset: isize) -> Option<PackedSpan> {
@@ -177,14 +211,20 @@ fn for_range_has_dynamic_bounds(range: &ForRange) -> bool {
     matches!(start, ForBound::Expression(_)) || matches!(end, ForBound::Expression(_))
 }
 
+#[derive(Clone, Copy)]
+struct RepeatedFragment {
+    local_start: usize,
+    length: usize,
+    output_start: usize,
+}
+
 enum RepeatedProjection {
     Empty,
-    Single {
-        local_start: usize,
-        length: usize,
-        output_start: usize,
+    Exact {
+        first: RepeatedFragment,
+        second: Option<RepeatedFragment>,
     },
-    Multiple,
+    Periodic,
 }
 
 fn project_repeated_span(
@@ -195,13 +235,13 @@ fn project_repeated_span(
     repeat: usize,
 ) -> RepeatedProjection {
     let Some(output_length) = item_length.checked_mul(repeat) else {
-        return RepeatedProjection::Multiple;
+        return RepeatedProjection::Periodic;
     };
     let Some(requested_end) = requested_start.checked_add(requested_length) else {
-        return RepeatedProjection::Multiple;
+        return RepeatedProjection::Periodic;
     };
     let Some(output_end) = output_start.checked_add(output_length) else {
-        return RepeatedProjection::Multiple;
+        return RepeatedProjection::Periodic;
     };
     let overlap_start = requested_start.max(output_start);
     let overlap_end = requested_end.min(output_end);
@@ -212,14 +252,38 @@ fn project_repeated_span(
     let relative_end = overlap_end - output_start;
     let first = relative_start / item_length;
     let last = (relative_end - 1) / item_length;
-    if first != last {
-        return RepeatedProjection::Multiple;
+    let first_output_start = output_start + first * item_length;
+    if first == last {
+        return RepeatedProjection::Exact {
+            first: RepeatedFragment {
+                local_start: relative_start % item_length,
+                length: overlap_end - overlap_start,
+                output_start: first_output_start,
+            },
+            second: None,
+        };
     }
-    RepeatedProjection::Single {
-        local_start: relative_start % item_length,
-        length: overlap_end - overlap_start,
-        output_start: output_start + first * item_length,
+
+    // A range touching exactly two copies has two exact translations whether
+    // either fragment happens to cover a complete copy. Their number is
+    // structurally bounded and independent of `repeat`.
+    if last == first + 1 {
+        let first_end = (first + 1) * item_length;
+        let last_output_start = output_start + last * item_length;
+        return RepeatedProjection::Exact {
+            first: RepeatedFragment {
+                local_start: relative_start % item_length,
+                length: first_end - relative_start,
+                output_start: first_output_start,
+            },
+            second: Some(RepeatedFragment {
+                local_start: 0,
+                length: relative_end - last * item_length,
+                output_start: last_output_start,
+            }),
+        };
     }
+    RepeatedProjection::Periodic
 }
 
 #[cfg(test)]
@@ -228,7 +292,6 @@ use std::cell::Cell;
 #[derive(Clone)]
 struct CallResult {
     region_groups: Vec<(ArraySpan, Vec<(PackedSpan, VersionId)>)>,
-    opaque_sources: Vec<VersionId>,
 }
 
 // Region-split writes query one RHS several times, but a function call in that
@@ -299,7 +362,6 @@ struct FunctionSummary {
     graph: Rc<DependencyDag<SsaKey>>,
     result: FunctionResultSummary,
     writes: Vec<(NodeKey, Option<usize>)>,
-    opaque_sources: Vec<NodeKey>,
     status: AnalysisStatus,
 }
 
@@ -395,14 +457,22 @@ impl<'a> FunctionSummaries<'a> {
             self.module,
             self.bit_part,
             call.id,
-            call.index.as_deref(),
+            &call.receiver_index,
             &mut context,
             self,
         )
         .map(Rc::new);
         self.contexts.push(context);
         if let Some(summary) = summary {
-            self.summaries.insert(key, Some(summary.clone()));
+            // A dynamic receiver summary contains the selector expression of
+            // this call site. Keep only the in-progress entry as a recursion
+            // guard; reusing the completed graph at another call site would
+            // reuse the wrong selector dependencies.
+            if call.index.is_some() || call.receiver_index.0.is_empty() {
+                self.summaries.insert(key, Some(summary.clone()));
+            } else {
+                self.summaries.remove(&key);
+            }
             FunctionSummaryLookup::Ready(summary)
         } else {
             self.summaries.remove(&key);
@@ -467,13 +537,23 @@ pub(crate) fn module_context_entries() -> usize {
 }
 
 pub(super) fn analyze<'a>(
+    module: &'a Module,
     bit_part: &'a BitPartition,
     statements: &[Statement],
+    declaration_index: usize,
     branch_namespace: usize,
     context: &mut ProcedureContext,
     summaries: &mut FunctionSummaries<'a>,
 ) -> ProcedureResult {
-    ProcedureAnalysis::analyze(bit_part, statements, branch_namespace, context, summaries)
+    ProcedureAnalysis::analyze(
+        module,
+        bit_part,
+        statements,
+        declaration_index,
+        branch_namespace,
+        context,
+        summaries,
+    )
 }
 
 pub(super) struct ProcedureResult {
@@ -487,16 +567,11 @@ pub(super) enum AnalysisStatus {
     #[default]
     Complete,
     Partial,
-    Barrier,
 }
 
 impl AnalysisStatus {
     pub(super) fn is_complete(self) -> bool {
         self == Self::Complete
-    }
-
-    pub(super) fn is_barrier(self) -> bool {
-        self == Self::Barrier
     }
 }
 
@@ -510,6 +585,12 @@ pub(super) struct Dependency {
 #[derive(Default)]
 struct ExpressionSources {
     sources: Vec<(VersionId, PositionRelation)>,
+}
+
+struct DestinationSnapshot {
+    key: NodeKey,
+    sources: ExpressionSources,
+    opaque: bool,
 }
 
 #[derive(Default)]
@@ -682,10 +763,11 @@ struct ProcedureAnalysis<'a, 's> {
     call_caches: Vec<CallCache>,
     call_frames: Vec<usize>,
     next_call_frame: usize,
-    receiver_indices: Vec<Option<VarIndex>>,
     function_flows: Vec<FunctionFlow>,
     loop_flows: Vec<LoopFlow>,
     path_condition: PathCondition,
+    effects_only: bool,
+    causal_write_keys: Vec<NodeKey>,
     branch_namespace: usize,
     next_branch: usize,
     status: AnalysisStatus,
@@ -707,10 +789,11 @@ impl<'a, 's> ProcedureAnalysis<'a, 's> {
             call_caches: Vec::new(),
             call_frames: Vec::new(),
             next_call_frame: 0,
-            receiver_indices: Vec::new(),
             function_flows: Vec::new(),
             loop_flows: Vec::new(),
             path_condition: PathCondition::default(),
+            effects_only: false,
+            causal_write_keys: Vec::new(),
             branch_namespace: 0,
             next_branch: 0,
             status: AnalysisStatus::Complete,
@@ -719,8 +802,10 @@ impl<'a, 's> ProcedureAnalysis<'a, 's> {
     }
 
     fn analyze(
+        module: &'a Module,
         bit_part: &'a BitPartition,
         statements: &[Statement],
+        declaration_index: usize,
         branch_namespace: usize,
         context: &mut ProcedureContext,
         summaries: &'s mut FunctionSummaries<'a>,
@@ -729,6 +814,8 @@ impl<'a, 's> ProcedureAnalysis<'a, 's> {
         ctx.begin_analysis_transaction();
         let mut this = Self::from_context(bit_part, ctx, module_scope_ids);
         this.summaries = Some(summaries);
+        this.causal_write_keys =
+            this.process_write_footprint(module, declaration_index, statements);
         this.branch_namespace = branch_namespace;
         this.eval_block(statements, &[]);
         let (graph, destinations) = this.dependency_graph();
@@ -767,25 +854,20 @@ impl<'a, 's> ProcedureAnalysis<'a, 's> {
         module: &'a Module,
         bit_part: &'a BitPartition,
         id: VarId,
-        index: Option<&[usize]>,
+        receiver_index: &VarIndex,
         context: &mut ProcedureContext,
         summaries: &'s mut FunctionSummaries<'a>,
     ) -> Option<FunctionSummary> {
         let function = module.functions.get(&id)?;
-        let body = function.get_function(index.unwrap_or_default())?;
+        let body = function.get_function_for_index(receiver_index)?;
         let formal_ids = body.arg_map.values().copied().collect::<HashSet<_>>();
         let (mut ctx, module_scope_ids) = context.take();
         ctx.begin_analysis_transaction();
         let mut this = Self::from_context(bit_part, ctx, module_scope_ids);
         this.summaries = Some(summaries);
         this.call_caches.push(None);
-        this.receiver_indices.push(
-            (!function.path.path.0.is_empty())
-                .then(|| index.map(concrete_var_index))
-                .flatten(),
-        );
+        this.causal_write_keys = this.statement_write_footprint(&body.statements);
         this.eval_function_body(&body.statements, body.ret, &[]);
-        this.receiver_indices.pop();
         this.call_caches.pop();
 
         let mut visible_keys = this.module_scope_keys();
@@ -806,7 +888,7 @@ impl<'a, 's> ProcedureAnalysis<'a, 's> {
 
         let result_versions: Vec<(ArraySpan, Vec<(PackedSpan, VersionId)>)> = body
             .ret
-            .map(|ret| this.current_region_groups_for_id(ret))
+            .map(|ret| this.current_function_return_region_groups(ret, None))
             .unwrap_or_default();
 
         let mut destinations = this
@@ -862,24 +944,11 @@ impl<'a, 's> ProcedureAnalysis<'a, 's> {
             .collect();
         debug_assert!(root.next().is_none());
 
-        let opaque_sources = if statements_have_unknown(&body.statements) {
-            let mut sources = formal_ids
-                .into_iter()
-                .flat_map(|formal| this.keys_for_id(formal))
-                .collect::<Vec<_>>();
-            sources.sort_unstable();
-            sources.dedup();
-            sources
-        } else {
-            Vec::new()
-        };
-
         let summary = FunctionSummary {
             arg_map: body.arg_map,
             graph,
             result,
             writes,
-            opaque_sources,
             status: this.status,
         };
         this.ctx.rollback_analysis_transaction();
@@ -961,6 +1030,91 @@ impl<'a, 's> ProcedureAnalysis<'a, 's> {
         }
     }
 
+    fn regular_transfer(
+        &mut self,
+        sources: ExpressionSources,
+        initial: PositionRelation,
+        step: PositionRelation,
+        domain: PositionDomain,
+    ) -> ExpressionSources {
+        ExpressionSources {
+            sources: sources
+                .sources
+                .into_iter()
+                .map(|(source, relation)| {
+                    let repeated =
+                        self.ssa
+                            .repeated(source, relation.compose(initial), step, domain);
+                    (repeated, PositionRelation::default())
+                })
+                .collect(),
+        }
+    }
+
+    fn regular_packed_repeat(
+        &mut self,
+        mut sources: ExpressionSources,
+        array: ArraySpan,
+        output_start: usize,
+        output_length: usize,
+        item_length: usize,
+    ) -> ExpressionSources {
+        let (Ok(output_start_offset), Ok(step), Some(domain)) = (
+            isize::try_from(output_start),
+            isize::try_from(item_length),
+            PackedSpan::new(output_start, output_length),
+        ) else {
+            sources.forget_packed_position();
+            return sources;
+        };
+        self.regular_transfer(
+            sources,
+            PositionRelation {
+                array: Some(0),
+                packed: Some(output_start_offset),
+            },
+            PositionRelation {
+                array: Some(0),
+                packed: Some(step),
+            },
+            position_domain(array, domain),
+        )
+    }
+
+    fn regular_array_repeat(
+        &mut self,
+        mut sources: ExpressionSources,
+        packed: PackedSpan,
+        output_start: usize,
+        output_length: usize,
+        item_length: usize,
+    ) -> ExpressionSources {
+        let (Ok(output_start_offset), Ok(step)) =
+            (isize::try_from(output_start), isize::try_from(item_length))
+        else {
+            sources.forget_array_position();
+            return sources;
+        };
+        self.regular_transfer(
+            sources,
+            PositionRelation {
+                array: Some(output_start_offset),
+                packed: Some(0),
+            },
+            PositionRelation {
+                array: Some(step),
+                packed: Some(0),
+            },
+            position_domain(
+                ArraySpan {
+                    start: output_start,
+                    length: output_length,
+                },
+                packed,
+            ),
+        )
+    }
+
     fn is_module_scope_key(&self, key: NodeKey) -> bool {
         self.module_scope_ids.contains(&key.0)
     }
@@ -1011,6 +1165,7 @@ impl<'a, 's> ProcedureAnalysis<'a, 's> {
                         ..
                     }) => unreachable!("call-frame storage is not a visible DAG source"),
                     DependencyDagNode::Internal => DependencyDagNode::Internal,
+                    DependencyDagNode::RegularTransfer => DependencyDagNode::RegularTransfer,
                 })
                 .collect(),
             edges: graph.edges,
@@ -1030,13 +1185,352 @@ impl<'a, 's> ProcedureAnalysis<'a, 's> {
         keys
     }
 
-    fn read_keys(&mut self, id: VarId, index: &VarIndex, select: &VarSelect) -> Vec<NodeKey> {
+    fn process_write_footprint(
+        &mut self,
+        module: &Module,
+        declaration_index: usize,
+        statements: &[Statement],
+    ) -> Vec<NodeKey> {
+        let mut keys = HashSet::default();
+
+        // Prefer the sparse IR destinations. Besides covering ordinary writes
+        // exactly, this avoids scanning a dense assignment mask merely to add
+        // a NodeKey that is already known from the statement itself.
+        let mut visited = HashSet::default();
+        self.collect_statement_write_footprint(statements, &mut keys, &mut visited);
+
+        // `per_decl_refs` is the authoritative, bit-precise ownership record
+        // for writes that the IR cannot recover (for example an unsupported
+        // statement). It prevents an incomplete boundary in one process from
+        // erasing a disjoint bit driven by another process.
+        if let Some(references) = module.per_decl_refs.get(&declaration_index) {
+            for (&id, reference) in references {
+                for key in self.keys_for_id(id) {
+                    if keys.contains(&key) {
+                        continue;
+                    }
+                    let Some(packed) = self.key_span(key) else {
+                        continue;
+                    };
+                    let Some(array_end) = key.1.end() else {
+                        continue;
+                    };
+                    let start = key.1.start.min(reference.mask_assign.len());
+                    let end = array_end.min(reference.mask_assign.len());
+                    if reference.mask_assign[start..end]
+                        .iter()
+                        .any(|mask| packed_mask_overlaps(mask, packed))
+                    {
+                        keys.insert(key);
+                    }
+                }
+            }
+        }
+        let mut keys = keys.into_iter().collect::<Vec<_>>();
+        keys.sort_unstable();
+        keys
+    }
+
+    fn statement_write_footprint(&mut self, statements: &[Statement]) -> Vec<NodeKey> {
+        let mut keys = HashSet::default();
+        let mut visited = HashSet::default();
+        self.collect_statement_write_footprint(statements, &mut keys, &mut visited);
+        let mut keys = keys.into_iter().collect::<Vec<_>>();
+        keys.sort_unstable();
+        keys
+    }
+
+    fn function_call_write_footprint(&mut self, call: &FunctionCall) -> Vec<NodeKey> {
+        let mut keys = HashSet::default();
+        let mut visited = HashSet::default();
+        self.collect_function_call_write_footprint(call, &mut keys, &mut visited);
+        let mut keys = keys.into_iter().collect::<Vec<_>>();
+        keys.sort_unstable();
+        keys
+    }
+
+    fn collect_statement_write_footprint(
+        &mut self,
+        statements: &[Statement],
+        keys: &mut HashSet<NodeKey>,
+        visited: &mut HashSet<FunctionSummaryKey>,
+    ) {
+        for statement in statements {
+            match statement {
+                Statement::Assign(assign) => {
+                    self.collect_expression_write_footprint(&assign.expr, keys, visited);
+                    for destination in &assign.dst {
+                        self.collect_destination_write_footprint(destination, keys, visited);
+                    }
+                }
+                Statement::If(statement) => {
+                    self.collect_expression_write_footprint(&statement.cond, keys, visited);
+                    self.collect_statement_write_footprint(&statement.true_side, keys, visited);
+                    self.collect_statement_write_footprint(&statement.false_side, keys, visited);
+                }
+                Statement::IfReset(statement) => {
+                    self.collect_statement_write_footprint(&statement.true_side, keys, visited);
+                    self.collect_statement_write_footprint(&statement.false_side, keys, visited);
+                }
+                Statement::Case(statement) => {
+                    self.collect_expression_write_footprint(&statement.case_target, keys, visited);
+                    for arm in &statement.arms {
+                        for pattern in &arm.patterns {
+                            match pattern {
+                                crate::ir::CasePattern::Eq(expression) => self
+                                    .collect_expression_write_footprint(expression, keys, visited),
+                                crate::ir::CasePattern::Range { lo, hi, .. } => {
+                                    self.collect_expression_write_footprint(lo, keys, visited);
+                                    self.collect_expression_write_footprint(hi, keys, visited);
+                                }
+                            }
+                        }
+                        self.collect_statement_write_footprint(&arm.body, keys, visited);
+                    }
+                    self.collect_statement_write_footprint(&statement.default, keys, visited);
+                }
+                Statement::For(statement) => {
+                    let (start, end, _) = for_range_bounds(&statement.range);
+                    for bound in [start, end] {
+                        if let ForBound::Expression(expression) = bound {
+                            self.collect_expression_write_footprint(expression, keys, visited);
+                        }
+                    }
+                    self.collect_statement_write_footprint(&statement.body, keys, visited);
+                }
+                Statement::FunctionCall(call) => {
+                    self.collect_function_call_write_footprint(call, keys, visited);
+                }
+                Statement::SystemFunctionCall(call) => {
+                    self.collect_system_call_write_footprint(call, keys, visited);
+                }
+                Statement::TbMethodCall(_)
+                | Statement::Break
+                | Statement::Unsupported(_)
+                | Statement::Null => {}
+            }
+        }
+    }
+
+    fn collect_destination_write_footprint(
+        &mut self,
+        destination: &AssignDestination,
+        keys: &mut HashSet<NodeKey>,
+        visited: &mut HashSet<FunctionSummaryKey>,
+    ) {
+        let mut resolved = destination.clone();
+        resolved.index = self.receiver_index(resolved.id, &resolved.index);
+        for (array, packed) in dst_writes(&resolved, &mut self.ctx) {
+            keys.extend(self.bit_part.overlapping_access(resolved.id, array, packed));
+        }
+        for expression in destination
+            .index
+            .0
+            .iter()
+            .chain(destination.select.0.iter())
+        {
+            self.collect_expression_write_footprint(expression, keys, visited);
+        }
+        if let Some((_, expression)) = &destination.select.1 {
+            self.collect_expression_write_footprint(expression, keys, visited);
+        }
+    }
+
+    fn collect_expression_write_footprint(
+        &mut self,
+        expression: &Expression,
+        keys: &mut HashSet<NodeKey>,
+        visited: &mut HashSet<FunctionSummaryKey>,
+    ) {
+        match expression {
+            Expression::Term(factor) => match factor.as_ref() {
+                Factor::Variable(_, index, select, _) => {
+                    for expression in index.0.iter().chain(select.0.iter()) {
+                        self.collect_expression_write_footprint(expression, keys, visited);
+                    }
+                    if let Some((_, expression)) = &select.1 {
+                        self.collect_expression_write_footprint(expression, keys, visited);
+                    }
+                }
+                Factor::FunctionCall(call) => {
+                    self.collect_function_call_write_footprint(call, keys, visited);
+                }
+                Factor::SystemFunctionCall(call) => {
+                    self.collect_system_call_write_footprint(call, keys, visited);
+                }
+                Factor::Unknown(_)
+                | Factor::HierVariable(_)
+                | Factor::Value(_)
+                | Factor::Anonymous(_) => {}
+            },
+            Expression::Unary(_, expression, _) => {
+                self.collect_expression_write_footprint(expression, keys, visited);
+            }
+            Expression::Binary(left, _, right, _) => {
+                self.collect_expression_write_footprint(left, keys, visited);
+                self.collect_expression_write_footprint(right, keys, visited);
+            }
+            Expression::Ternary(condition, left, right, _) => {
+                self.collect_expression_write_footprint(condition, keys, visited);
+                self.collect_expression_write_footprint(left, keys, visited);
+                self.collect_expression_write_footprint(right, keys, visited);
+            }
+            Expression::Concatenation(parts, _) => {
+                for (expression, repeat) in parts {
+                    self.collect_expression_write_footprint(expression, keys, visited);
+                    if let Some(repeat) = repeat {
+                        self.collect_expression_write_footprint(repeat, keys, visited);
+                    }
+                }
+            }
+            Expression::ArrayLiteral(items, _) => {
+                for item in items {
+                    match item {
+                        ArrayLiteralItem::Value(expression, repeat) => {
+                            self.collect_expression_write_footprint(expression, keys, visited);
+                            if let Some(repeat) = repeat {
+                                self.collect_expression_write_footprint(repeat, keys, visited);
+                            }
+                        }
+                        ArrayLiteralItem::Defaul(expression) => {
+                            self.collect_expression_write_footprint(expression, keys, visited);
+                        }
+                    }
+                }
+            }
+            Expression::StructConstructor(_, fields, _) => {
+                for (_, expression) in fields {
+                    self.collect_expression_write_footprint(expression, keys, visited);
+                }
+            }
+        }
+    }
+
+    fn collect_function_call_write_footprint(
+        &mut self,
+        call: &FunctionCall,
+        keys: &mut HashSet<NodeKey>,
+        visited: &mut HashSet<FunctionSummaryKey>,
+    ) {
+        for actual in call.inputs.values() {
+            self.collect_expression_write_footprint(actual, keys, visited);
+        }
+        for destinations in call.outputs.values() {
+            for destination in destinations {
+                self.collect_destination_write_footprint(destination, keys, visited);
+            }
+        }
+
+        let summary_key = FunctionSummaryKey {
+            id: call.id,
+            index: call.index.clone(),
+        };
+        if !visited.insert(summary_key) {
+            return;
+        }
+        let Some(statements) = self
+            .ctx
+            .functions
+            .get(&call.id)
+            .and_then(|function| function.get_function_for_index(&call.receiver_index))
+            .map(|body| body.statements)
+        else {
+            return;
+        };
+        self.collect_statement_write_footprint(&statements, keys, visited);
+    }
+
+    fn collect_system_call_write_footprint(
+        &mut self,
+        call: &crate::ir::SystemFunctionCall,
+        keys: &mut HashSet<NodeKey>,
+        visited: &mut HashSet<FunctionSummaryKey>,
+    ) {
+        match &call.kind {
+            SystemFunctionKind::Bits(input)
+            | SystemFunctionKind::Size(input)
+            | SystemFunctionKind::Clog2(input)
+            | SystemFunctionKind::Onehot(input)
+            | SystemFunctionKind::Signed(input)
+            | SystemFunctionKind::Unsigned(input) => {
+                self.collect_expression_write_footprint(&input.0, keys, visited);
+            }
+            SystemFunctionKind::Readmemh(input, output) => {
+                self.collect_expression_write_footprint(&input.0, keys, visited);
+                for destination in &output.0 {
+                    self.collect_destination_write_footprint(destination, keys, visited);
+                }
+            }
+            SystemFunctionKind::Display(inputs) | SystemFunctionKind::Write(inputs) => {
+                for input in inputs {
+                    self.collect_expression_write_footprint(&input.0, keys, visited);
+                }
+            }
+            SystemFunctionKind::Assert { cond, args, .. } => {
+                self.collect_expression_write_footprint(&cond.0, keys, visited);
+                for input in args {
+                    self.collect_expression_write_footprint(&input.0, keys, visited);
+                }
+            }
+            SystemFunctionKind::Finish => {}
+        }
+    }
+
+    fn opaque_value(&mut self) -> VersionId {
+        self.status = self.status.max(AnalysisStatus::Partial);
+        self.ssa.definition(Vec::new())
+    }
+
+    fn opaque_kill_keys(&mut self, keys: Vec<NodeKey>, weak: bool) {
+        self.status = self.status.max(AnalysisStatus::Partial);
+        self.bind_opaque_keys(keys, weak);
+    }
+
+    fn bind_opaque_keys(&mut self, keys: Vec<NodeKey>, weak: bool) {
+        for key in keys {
+            let opaque = self.ssa.definition(Vec::new());
+            self.bind_destination(key, opaque, weak);
+        }
+    }
+
+    fn opaque_causal_boundary(&mut self) {
+        self.opaque_kill_keys(self.causal_write_keys.clone(), false);
+    }
+
+    fn opaque_function_call_boundary(&mut self, call: &FunctionCall) {
+        for input in call.inputs.values() {
+            self.eval_expr(input);
+        }
+        let mut keys = self.function_call_write_footprint(call);
+        // This helper is used only when the callee effect summary is missing
+        // or recursive. Its hidden writes may target any key owned by the
+        // current unit, but never a continuous/other-process-only source.
+        keys.extend_from_slice(&self.causal_write_keys);
+        keys.sort_unstable();
+        keys.dedup();
+        self.opaque_kill_keys(keys, false);
+        for destinations in call.outputs.values() {
+            for destination in destinations {
+                // Output lvalue selectors still execute, but an unresolved
+                // callee supplies no proven value or control dependency.
+                self.write_destination(destination, &[], &[]);
+            }
+        }
+    }
+
+    fn read_keys(
+        &mut self,
+        id: VarId,
+        index: &VarIndex,
+        select: &VarSelect,
+        member_select_domain: Option<MemberSelectDomain>,
+    ) -> Vec<NodeKey> {
         if !self.ctx.variables.contains_key(&id) && index.0.is_empty() && select.is_empty() {
             return self.keys_for_id(id);
         }
         let mut keys = Vec::new();
         let index = self.receiver_index(id, index);
-        let accesses = var_reads(id, &index, select, &mut self.ctx);
+        let accesses = var_reads(id, &index, select, member_select_domain, &mut self.ctx);
         if accesses.is_empty() {
             self.status = self.status.max(AnalysisStatus::Partial);
         }
@@ -1048,26 +1542,38 @@ impl<'a, 's> ProcedureAnalysis<'a, 's> {
         keys
     }
 
-    fn write_keys(&mut self, destination: &AssignDestination) -> Vec<NodeKey> {
+    fn write_keys(&mut self, destination: &AssignDestination) -> (Vec<NodeKey>, bool) {
         if !self.ctx.variables.contains_key(&destination.id)
             && destination.index.0.is_empty()
             && destination.select.is_empty()
         {
-            return self.keys_for_id(destination.id);
+            return (self.keys_for_id(destination.id), true);
         }
         let mut keys = Vec::new();
         let mut destination = destination.clone();
         destination.index = self.receiver_index(destination.id, &destination.index);
         let accesses = dst_writes(&destination, &mut self.ctx);
         if accesses.is_empty() {
-            self.status = AnalysisStatus::Barrier;
+            self.status = self.status.max(AnalysisStatus::Partial);
+            keys = if self.module_scope_ids.contains(&destination.id) {
+                self.causal_write_keys
+                    .iter()
+                    .copied()
+                    .filter(|key| key.0 == destination.id)
+                    .collect()
+            } else {
+                self.keys_for_id(destination.id)
+            };
+            keys.sort_unstable();
+            keys.dedup();
+            return (keys, false);
         }
         for (idx, span) in accesses {
             keys.extend(self.bit_part.overlapping_access(destination.id, idx, span));
         }
         keys.sort_unstable();
         keys.dedup();
-        keys
+        (keys, true)
     }
 
     fn destination_is_dynamic(&self, destination: &AssignDestination) -> bool {
@@ -1095,23 +1601,18 @@ impl<'a, 's> ProcedureAnalysis<'a, 's> {
         self.written.insert(key);
     }
 
-    fn receiver_index(&self, id: VarId, index: &VarIndex) -> VarIndex {
-        if !self.ctx.variables.get(&id).is_some_and(|variable| {
-            matches!(
-                variable.affiliation,
-                crate::symbol::Affiliation::Module | crate::symbol::Affiliation::Interface
-            )
-        }) {
-            return index.clone();
-        }
-        self.receiver_indices
-            .last()
-            .and_then(Clone::clone)
-            .unwrap_or_else(|| index.clone())
+    fn receiver_index(&self, _id: VarId, index: &VarIndex) -> VarIndex {
+        index.clone()
     }
 
-    fn read_variable(&mut self, id: VarId, index: &VarIndex, select: &VarSelect) -> Vec<VersionId> {
-        self.read_keys(id, index, select)
+    fn read_variable(
+        &mut self,
+        id: VarId,
+        index: &VarIndex,
+        select: &VarSelect,
+        member_select_domain: Option<MemberSelectDomain>,
+    ) -> Vec<VersionId> {
+        self.read_keys(id, index, select, member_select_domain)
             .into_iter()
             .map(|key| self.read_key(key))
             .collect()
@@ -1136,11 +1637,14 @@ impl<'a, 's> ProcedureAnalysis<'a, 's> {
         if let Some((_, expression)) = &destination.select.1 {
             dependencies.extend(self.eval_expr(expression));
         }
-        let keys = self.write_keys(destination);
-        let dynamic = self.destination_is_dynamic(destination);
-        let version = self
-            .ssa
-            .definition_guarded(dependencies, &self.path_condition);
+        let (keys, resolved) = self.write_keys(destination);
+        let dynamic = !resolved || self.destination_is_dynamic(destination);
+        let version = if resolved {
+            self.ssa
+                .definition_guarded(dependencies, &self.path_condition)
+        } else {
+            self.ssa.definition(Vec::new())
+        };
         for key in keys {
             self.bind_destination(key, version, dynamic);
         }
@@ -1158,14 +1662,13 @@ impl<'a, 's> ProcedureAnalysis<'a, 's> {
         self.bit_part.ranges_of((key.0, key.1)).get(key.2).copied()
     }
 
-    fn write_assignment_destination(
+    fn snapshot_assignment_destination(
         &mut self,
         destination: &AssignDestination,
         expression: &Expression,
         expression_offset: usize,
         expression_context_width: usize,
-        controls: &[VersionId],
-    ) {
+    ) -> Vec<DestinationSnapshot> {
         let variable = self.ctx.variables.get(&destination.id).cloned();
         let selected = if destination.select.is_const_with_range() {
             variable.as_ref().and_then(|variable| {
@@ -1189,24 +1692,17 @@ impl<'a, 's> ProcedureAnalysis<'a, 's> {
                 })
             });
         let destination_index = self.flattened_affine_index(destination.id, &destination.index);
-        let keys = self.write_keys(destination);
-        let dynamic_array = !destination.index.is_const();
-        let dynamic_packed = !destination.select.is_const_with_range();
-        let dynamic = dynamic_array || dynamic_packed;
+        let (keys, resolved) = self.write_keys(destination);
+        let whole_sources = if resolved && (destination_array.is_none() || selected.is_none()) {
+            Some(self.eval_speculatively(|this| this.eval_expr(expression)))
+        } else {
+            None
+        };
+        let mut snapshots = Vec::with_capacity(keys.len());
         for key in keys {
-            let mut whole = controls.to_vec();
-            for selector in destination
-                .index
-                .0
-                .iter()
-                .chain(destination.select.0.iter())
-            {
-                whole.extend(self.eval_expr(selector));
-            }
-            if let Some((_, selector)) = &destination.select.1 {
-                whole.extend(self.eval_expr(selector));
-            }
-            let mut sources = if let (Some(destination_array), Some((_, low)), Some(key_span)) =
+            let mut sources = if !resolved {
+                ExpressionSources::default()
+            } else if let (Some(destination_array), Some((_, low)), Some(key_span)) =
                 (destination_array, selected, self.key_span(key))
             {
                 let destination_region = key.1.intersection(destination_array);
@@ -1228,34 +1724,120 @@ impl<'a, 's> ProcedureAnalysis<'a, 's> {
                     destination_region,
                     key_span.translated(low, expression_offset),
                 ) {
-                    self.eval_expr_requested_in(
-                        expression,
-                        array,
-                        packed,
-                        expression_context_width,
-                        &ProjectionContext {
-                            destination_index: destination_index.clone(),
-                            destination_array: Some(destination_region),
-                        },
-                    )
+                    self.eval_speculatively(|this| {
+                        this.eval_expr_requested_in(
+                            expression,
+                            array,
+                            packed,
+                            expression_context_width,
+                            &ProjectionContext {
+                                destination_index: destination_index.clone(),
+                                destination_array: Some(destination_region),
+                            },
+                        )
+                    })
                 } else {
                     ExpressionSources::default()
                 }
             } else {
-                ExpressionSources::whole(self.eval_expr(expression))
+                ExpressionSources::whole(whole_sources.clone().unwrap_or_default())
             };
-            sources.extend_whole(whole);
-            sources.normalize();
             for (_, relation) in &mut sources.sources {
                 *relation = destination_offset
                     .map(|base| relation.compose(base))
                     .unwrap_or_else(PositionRelation::whole);
             }
-            let version = self
-                .ssa
-                .related_definition_guarded(sources.sources, &self.path_condition);
-            self.bind_destination(key, version, dynamic);
+            snapshots.push(DestinationSnapshot {
+                key,
+                sources,
+                opaque: !resolved,
+            });
         }
+        snapshots
+    }
+
+    fn write_assignment_destination(
+        &mut self,
+        destination: &AssignDestination,
+        snapshots: Vec<DestinationSnapshot>,
+        controls: &[VersionId],
+    ) {
+        let destination_dynamic = self.destination_is_dynamic(destination);
+        for DestinationSnapshot {
+            key,
+            mut sources,
+            opaque,
+        } in snapshots
+        {
+            let mut whole = if opaque {
+                Vec::new()
+            } else {
+                controls.to_vec()
+            };
+            for selector in destination
+                .index
+                .0
+                .iter()
+                .chain(destination.select.0.iter())
+            {
+                let selector = self.eval_expr(selector);
+                if !opaque {
+                    whole.extend(selector);
+                }
+            }
+            if let Some((_, selector)) = &destination.select.1 {
+                let selector = self.eval_expr(selector);
+                if !opaque {
+                    whole.extend(selector);
+                }
+            }
+            sources.extend_whole(whole);
+            sources.normalize();
+            let version = if opaque {
+                self.ssa.definition(Vec::new())
+            } else {
+                self.ssa
+                    .related_definition_guarded(sources.sources, &self.path_condition)
+            };
+            self.bind_destination(key, version, opaque || destination_dynamic);
+        }
+    }
+
+    /// Evaluate an expression once for its procedural effects, then obtain
+    /// positional views of that value from the same pre-evaluation SSA state.
+    /// Versions survive rollback, so cached call results and projected reads
+    /// remain valid when the captured effects are committed afterwards.
+    fn snapshot_expression<T>(
+        &mut self,
+        expression: &Expression,
+        snapshot: impl FnOnce(&mut Self) -> T,
+    ) -> T {
+        let owns_cache = !matches!(self.call_caches.last(), Some(Some(_)));
+        if owns_cache {
+            self.call_caches.push(Some(EvaluationCache::default()));
+        }
+
+        let checkpoint = self.ssa.checkpoint();
+        let parent_effects_only = self.effects_only;
+        self.effects_only = true;
+        self.eval_expr(expression);
+        let effects = self.ssa.capture_and_rollback(checkpoint);
+        self.effects_only = false;
+        let value = snapshot(self);
+        self.ssa.merge([&effects]);
+        self.effects_only = parent_effects_only;
+
+        if owns_cache {
+            self.call_caches.pop();
+        }
+        value
+    }
+
+    fn eval_speculatively<T>(&mut self, eval: impl FnOnce(&mut Self) -> T) -> T {
+        let checkpoint = self.ssa.checkpoint();
+        let value = eval(self);
+        self.ssa.capture_and_rollback(checkpoint);
+        value
     }
 
     fn eval_function_body(
@@ -1391,17 +1973,26 @@ impl<'a, 's> ProcedureAnalysis<'a, 's> {
                     .collect();
                 if widths.iter().all(Option::is_some) {
                     let total_width = widths.iter().flatten().sum();
-                    let mut offset = total_width;
-                    for (destination, width) in assign.dst.iter().zip(widths) {
-                        let width = width.expect("checked above");
-                        offset -= width;
-                        self.write_assignment_destination(
-                            destination,
-                            &assign.expr,
-                            offset,
-                            total_width,
-                            controls,
-                        );
+                    let snapshots = self.snapshot_expression(&assign.expr, |this| {
+                        let mut offset = total_width;
+                        assign
+                            .dst
+                            .iter()
+                            .zip(&widths)
+                            .map(|(destination, width)| {
+                                let width = width.expect("checked above");
+                                offset -= width;
+                                this.snapshot_assignment_destination(
+                                    destination,
+                                    &assign.expr,
+                                    offset,
+                                    total_width,
+                                )
+                            })
+                            .collect::<Vec<_>>()
+                    });
+                    for (destination, snapshots) in assign.dst.iter().zip(snapshots) {
+                        self.write_assignment_destination(destination, snapshots, controls);
                     }
                 } else {
                     let sources = self.eval_expr(&assign.expr);
@@ -1436,7 +2027,7 @@ impl<'a, 's> ProcedureAnalysis<'a, 's> {
                 FlowResult::new(ProcedureFlow::Continue)
             }
             Statement::Unsupported(_) => {
-                self.status = AnalysisStatus::Barrier;
+                self.opaque_causal_boundary();
                 FlowResult::new(ProcedureFlow::Continue)
             }
         }
@@ -1624,11 +2215,17 @@ impl<'a, 's> ProcedureAnalysis<'a, 's> {
         if let Some(iterations) = statement.range.eval_iter(&mut self.ctx) {
             self.eval_known_for_iterations(statement, &range_controls, iterations)
         } else if statement.range.is_over_size_limit(&mut self.ctx) {
-            // A resource limit must not turn a finite, statically known loop
-            // into the more conservative runtime-loop semantics. Without an
-            // exact finite summary, suppress dependencies from this procedure
-            // and report the analysis as incomplete.
-            self.status = AnalysisStatus::Barrier;
+            // Preserve exact analysis after the resource boundary. The body
+            // may change only its own transitive write footprint; an unknown
+            // result replaces those definitions without inventing data edges.
+            let mut keys = self.statement_write_footprint(&statement.body);
+            if statements_have_unsupported(&statement.body) {
+                keys.extend_from_slice(&self.causal_write_keys);
+                keys.sort_unstable();
+                keys.dedup();
+            }
+            let may_skip = !self.for_range_is_proven_nonempty(&statement.range);
+            self.opaque_kill_keys(keys, may_skip);
             FlowResult::new(ProcedureFlow::Continue)
         } else {
             self.eval_runtime_for(statement, &range_controls)
@@ -1656,6 +2253,18 @@ impl<'a, 's> ProcedureAnalysis<'a, 's> {
             && affine_bound(start, &mut self.ctx)
                 .zip(affine_bound(end, &mut self.ctx))
                 .is_some_and(|(start, end)| start == end)
+    }
+
+    fn for_range_is_proven_nonempty(&mut self, range: &ForRange) -> bool {
+        let (start, end, inclusive) = for_range_bounds(range);
+        start
+            .eval_value(&mut self.ctx)
+            .zip(end.eval_value(&mut self.ctx))
+            .is_some_and(
+                |(start, end)| {
+                    if inclusive { start <= end } else { start < end }
+                },
+            )
     }
 
     fn set_known_iterator_value(&mut self, statement: &ForStatement, value: usize) {
@@ -1855,7 +2464,7 @@ impl<'a, 's> ProcedureAnalysis<'a, 's> {
     ) -> ExpressionSources {
         match expression {
             Expression::Term(factor) => match factor.as_ref() {
-                Factor::Variable(id, index, select, _) => {
+                Factor::Variable(id, index, select, comptime) => {
                     let mut selector_sources = Vec::new();
                     for expression in index.0.iter().chain(select.0.iter()) {
                         selector_sources.extend(self.eval_expr(expression));
@@ -1873,7 +2482,13 @@ impl<'a, 's> ProcedureAnalysis<'a, 's> {
                     };
                     if let Some((_, low)) = selected {
                         let mut reads = Vec::new();
-                        let accesses = var_reads(*id, index, select, &mut self.ctx);
+                        let accesses = var_reads(
+                            *id,
+                            index,
+                            select,
+                            comptime.member_select_domain,
+                            &mut self.ctx,
+                        );
                         let dynamic_array_offset = projection
                             .destination_index
                             .clone()
@@ -1954,7 +2569,12 @@ impl<'a, 's> ProcedureAnalysis<'a, 's> {
                             ExpressionSources::whole(selector_sources)
                         }
                     } else {
-                        selector_sources.extend(self.read_variable(*id, index, select));
+                        selector_sources.extend(self.read_variable(
+                            *id,
+                            index,
+                            select,
+                            comptime.member_select_domain,
+                        ));
                         ExpressionSources::whole(selector_sources)
                     }
                 }
@@ -1972,10 +2592,8 @@ impl<'a, 's> ProcedureAnalysis<'a, 's> {
                         .collect(),
                 },
                 Factor::Unknown(_) => {
-                    if self.function_flows.is_empty() {
-                        self.status = AnalysisStatus::Barrier;
-                    }
-                    ExpressionSources::default()
+                    let opaque = self.opaque_value();
+                    ExpressionSources::whole(vec![opaque])
                 }
                 Factor::HierVariable(_) | Factor::Value(_) | Factor::Anonymous(_) => {
                     ExpressionSources::default()
@@ -2202,35 +2820,51 @@ impl<'a, 's> ProcedureAnalysis<'a, 's> {
                         count,
                     ) {
                         RepeatedProjection::Empty => {}
-                        RepeatedProjection::Single {
-                            local_start,
-                            length,
-                            output_start,
-                        } => {
-                            let Some(local) = PackedSpan::new(local_start, length) else {
-                                continue;
-                            };
-                            let mut part =
-                                self.eval_expr_bits_in(part, requested_array, local, projection);
-                            if let Ok(output_start) = isize::try_from(output_start) {
-                                part.translate(PositionRelation {
-                                    array: Some(0),
-                                    packed: Some(output_start),
-                                });
-                            } else {
-                                part.widen_all();
+                        RepeatedProjection::Exact { first, second } => {
+                            for fragment in [Some(first), second].into_iter().flatten() {
+                                let Some(local) =
+                                    PackedSpan::new(fragment.local_start, fragment.length)
+                                else {
+                                    continue;
+                                };
+                                let mut part = self.eval_expr_bits_in(
+                                    part,
+                                    requested_array,
+                                    local,
+                                    projection,
+                                );
+                                if let Ok(output_start) = isize::try_from(fragment.output_start) {
+                                    part.translate(PositionRelation {
+                                        array: Some(0),
+                                        packed: Some(output_start),
+                                    });
+                                } else {
+                                    part.widen_all();
+                                }
+                                reads.extend(part);
                             }
-                            reads.extend(part);
                         }
-                        RepeatedProjection::Multiple => {
+                        RepeatedProjection::Periodic => {
                             let Some(local) = PackedSpan::whole(width) else {
                                 reads.extend_whole(self.eval_expr(part));
                                 continue;
                             };
-                            let mut part =
+                            let part =
                                 self.eval_expr_bits_in(part, requested_array, local, projection);
-                            part.forget_packed_position();
-                            reads.extend(part);
+                            if let Some(output_length) = width.checked_mul(count) {
+                                let part = self.regular_packed_repeat(
+                                    part,
+                                    requested_array,
+                                    low,
+                                    output_length,
+                                    width,
+                                );
+                                reads.extend(part);
+                            } else {
+                                let mut part = part;
+                                part.forget_packed_position();
+                                reads.extend(part);
+                            }
                         }
                     }
                     let Some(part_width) = width.checked_mul(count) else {
@@ -2283,37 +2917,35 @@ impl<'a, 's> ProcedureAnalysis<'a, 's> {
                         count,
                     ) {
                         RepeatedProjection::Empty => {}
-                        RepeatedProjection::Single {
-                            local_start,
-                            length,
-                            output_start,
-                        } => {
-                            let mut item = self.eval_expr_requested_in(
-                                value,
-                                ArraySpan {
-                                    start: local_start,
-                                    length,
-                                },
-                                requested,
-                                value
-                                    .comptime()
-                                    .r#type
-                                    .total_width()
-                                    .unwrap_or(requested.length),
-                                projection,
-                            );
-                            if let Ok(output_start) = isize::try_from(output_start) {
-                                item.translate(PositionRelation {
-                                    array: Some(output_start),
-                                    packed: Some(0),
-                                });
-                            } else {
-                                item.widen_all();
+                        RepeatedProjection::Exact { first, second } => {
+                            for fragment in [Some(first), second].into_iter().flatten() {
+                                let mut item = self.eval_expr_requested_in(
+                                    value,
+                                    ArraySpan {
+                                        start: fragment.local_start,
+                                        length: fragment.length,
+                                    },
+                                    requested,
+                                    value
+                                        .comptime()
+                                        .r#type
+                                        .total_width()
+                                        .unwrap_or(requested.length),
+                                    projection,
+                                );
+                                if let Ok(output_start) = isize::try_from(fragment.output_start) {
+                                    item.translate(PositionRelation {
+                                        array: Some(output_start),
+                                        packed: Some(0),
+                                    });
+                                } else {
+                                    item.widen_all();
+                                }
+                                reads.extend(item);
                             }
-                            reads.extend(item);
                         }
-                        RepeatedProjection::Multiple => {
-                            let mut item = self.eval_expr_requested_in(
+                        RepeatedProjection::Periodic => {
+                            let item = self.eval_expr_requested_in(
                                 value,
                                 ArraySpan {
                                     start: 0,
@@ -2327,8 +2959,20 @@ impl<'a, 's> ProcedureAnalysis<'a, 's> {
                                     .unwrap_or(requested.length),
                                 projection,
                             );
-                            item.forget_array_position();
-                            reads.extend(item);
+                            if let Some(output_length) = item_length.checked_mul(count) {
+                                let item = self.regular_array_repeat(
+                                    item,
+                                    requested,
+                                    cursor,
+                                    output_length,
+                                    item_length,
+                                );
+                                reads.extend(item);
+                            } else {
+                                let mut item = item;
+                                item.forget_array_position();
+                                reads.extend(item);
+                            }
                         }
                     }
                     let Some(item_extent) = item_length.checked_mul(count) else {
@@ -2353,37 +2997,35 @@ impl<'a, 's> ProcedureAnalysis<'a, 's> {
                         count,
                     ) {
                         RepeatedProjection::Empty => {}
-                        RepeatedProjection::Single {
-                            local_start,
-                            length,
-                            output_start,
-                        } => {
-                            let mut item = self.eval_expr_requested_in(
-                                default,
-                                ArraySpan {
-                                    start: local_start,
-                                    length,
-                                },
-                                requested,
-                                default
-                                    .comptime()
-                                    .r#type
-                                    .total_width()
-                                    .unwrap_or(requested.length),
-                                projection,
-                            );
-                            if let Ok(output_start) = isize::try_from(output_start) {
-                                item.translate(PositionRelation {
-                                    array: Some(output_start),
-                                    packed: Some(0),
-                                });
-                            } else {
-                                item.widen_all();
+                        RepeatedProjection::Exact { first, second } => {
+                            for fragment in [Some(first), second].into_iter().flatten() {
+                                let mut item = self.eval_expr_requested_in(
+                                    default,
+                                    ArraySpan {
+                                        start: fragment.local_start,
+                                        length: fragment.length,
+                                    },
+                                    requested,
+                                    default
+                                        .comptime()
+                                        .r#type
+                                        .total_width()
+                                        .unwrap_or(requested.length),
+                                    projection,
+                                );
+                                if let Ok(output_start) = isize::try_from(fragment.output_start) {
+                                    item.translate(PositionRelation {
+                                        array: Some(output_start),
+                                        packed: Some(0),
+                                    });
+                                } else {
+                                    item.widen_all();
+                                }
+                                reads.extend(item);
                             }
-                            reads.extend(item);
                         }
-                        RepeatedProjection::Multiple => {
-                            let mut item = self.eval_expr_requested_in(
+                        RepeatedProjection::Periodic => {
+                            let item = self.eval_expr_requested_in(
                                 default,
                                 ArraySpan {
                                     start: 0,
@@ -2397,8 +3039,23 @@ impl<'a, 's> ProcedureAnalysis<'a, 's> {
                                     .unwrap_or(requested.length),
                                 projection,
                             );
-                            item.forget_array_position();
-                            reads.extend(item);
+                            if let Some(output_length) = item_length
+                                .checked_mul(count)
+                                .map(|length| length.min(remaining))
+                            {
+                                let item = self.regular_array_repeat(
+                                    item,
+                                    requested,
+                                    cursor,
+                                    output_length,
+                                    item_length,
+                                );
+                                reads.extend(item);
+                            } else {
+                                let mut item = item;
+                                item.forget_array_position();
+                                reads.extend(item);
+                            }
                         }
                     }
                 }
@@ -2505,13 +3162,42 @@ impl<'a, 's> ProcedureAnalysis<'a, 's> {
             }
             Expression::Binary(left, op, right, _) => {
                 reads.extend(self.eval_expr_inner(left, prune_constant_branches));
-                let evaluate_right = match (prune_constant_branches, op) {
-                    (true, Op::LogicAnd) => self.constant_truth(left) != Some(false),
-                    (true, Op::LogicOr) => self.constant_truth(left) != Some(true),
-                    _ => true,
+                let execute_right = match (prune_constant_branches, op) {
+                    (true, Op::LogicAnd) => match self.constant_truth(left) {
+                        Some(false) => Some(false),
+                        Some(true) => Some(true),
+                        None => None,
+                    },
+                    (true, Op::LogicOr) => match self.constant_truth(left) {
+                        Some(true) => Some(false),
+                        Some(false) => Some(true),
+                        None => None,
+                    },
+                    _ => Some(true),
                 };
-                if evaluate_right {
-                    reads.extend(self.eval_expr_inner(right, prune_constant_branches));
+                match execute_right {
+                    Some(false) => {}
+                    Some(true) => {
+                        reads.extend(self.eval_expr_inner(right, prune_constant_branches));
+                    }
+                    None => {
+                        let branch = self.expression_branch_id(expression);
+                        let parent_condition = self.path_condition.clone();
+
+                        let checkpoint = self.ssa.checkpoint();
+                        self.path_condition = parent_condition.with_choice(branch, 0);
+                        let right = self.eval_expr_inner(right, prune_constant_branches);
+                        let right = self.ssa.definition_guarded(right, &self.path_condition);
+                        let evaluated_state = self.ssa.capture_and_rollback(checkpoint);
+
+                        let checkpoint = self.ssa.checkpoint();
+                        self.path_condition = parent_condition.with_choice(branch, 1);
+                        let skipped_state = self.ssa.capture_and_rollback(checkpoint);
+
+                        self.ssa.merge([&evaluated_state, &skipped_state]);
+                        self.path_condition = parent_condition;
+                        reads.push(right);
+                    }
                 }
             }
             Expression::Ternary(condition, left, right, _) => {
@@ -2592,23 +3278,22 @@ impl<'a, 's> ProcedureAnalysis<'a, 's> {
 
     fn eval_factor(&mut self, factor: &Factor, reads: &mut Vec<VersionId>) {
         match factor {
-            Factor::Variable(id, index, select, _) => {
+            Factor::Variable(id, index, select, comptime) => {
                 for expression in index.0.iter().chain(select.0.iter()) {
                     reads.extend(self.eval_expr(expression));
                 }
                 if let Some((_, expression)) = &select.1 {
                     reads.extend(self.eval_expr(expression));
                 }
-                reads.extend(self.read_variable(*id, index, select));
+                reads.extend(self.read_variable(*id, index, select, comptime.member_select_domain));
             }
             Factor::FunctionCall(call) => reads.extend(self.eval_call(call, &[])),
             Factor::SystemFunctionCall(call) => {
                 reads.extend(self.eval_system_call(call, &[], true));
             }
             Factor::Unknown(_) => {
-                if self.function_flows.is_empty() {
-                    self.status = AnalysisStatus::Barrier;
-                }
+                let opaque = self.opaque_value();
+                reads.push(opaque);
             }
             Factor::HierVariable(_) | Factor::Value(_) | Factor::Anonymous(_) => {}
         }
@@ -2636,17 +3321,30 @@ impl<'a, 's> ProcedureAnalysis<'a, 's> {
             .and_then(|cache| cache.calls.get(&cache_key))
             .cloned()
         {
+            if self.effects_only {
+                return Vec::new();
+            }
             let result = self.select_call_result(&cached, requested);
             #[cfg(test)]
             FUNCTION_RESULT_VERSIONS.set(FUNCTION_RESULT_VERSIONS.get() + result.len());
             return result;
         }
 
+        // The enclosing expression may need only this call's effects, but the
+        // call body still needs ordinary value evaluation: its return value or
+        // writes can depend on nested calls. Suppress only the result selected
+        // at this boundary, not results used while constructing `CallResult`.
+        let discard_result = self.effects_only;
+        self.effects_only = false;
         let evaluated = self.eval_call_uncached(call, controls);
-        let result = self.select_call_result(&evaluated, requested);
+        self.effects_only = discard_result;
         if let Some(Some(cache)) = self.call_caches.last_mut() {
-            cache.calls.insert(cache_key, evaluated);
+            cache.calls.insert(cache_key, evaluated.clone());
         }
+        if discard_result {
+            return Vec::new();
+        }
+        let result = self.select_call_result(&evaluated, requested);
         #[cfg(test)]
         FUNCTION_RESULT_VERSIONS.set(FUNCTION_RESULT_VERSIONS.get() + result.len());
         result
@@ -2693,7 +3391,6 @@ impl<'a, 's> ProcedureAnalysis<'a, 's> {
                 }
             }
         }
-        result.extend_from_slice(&evaluated.opaque_sources);
         result.sort_unstable();
         result.dedup();
         result
@@ -2712,56 +3409,31 @@ impl<'a, 's> ProcedureAnalysis<'a, 's> {
                 return self.apply_function_summary(call, controls, summary.as_ref());
             }
             Some(FunctionSummaryLookup::Recursive) => {
-                self.status = AnalysisStatus::Barrier;
-                let mut sources = Vec::new();
-                for input in call.inputs.values() {
-                    sources.extend(self.eval_expr(input));
-                }
+                self.opaque_function_call_boundary(call);
                 return CallResult {
                     region_groups: Vec::new(),
-                    opaque_sources: sources,
                 };
             }
             Some(FunctionSummaryLookup::Missing) | None => {}
         }
 
-        let receiver_index = self.ctx.functions.get(&call.id).and_then(|function| {
-            (!function.path.path.0.is_empty())
-                .then(|| call.index.as_deref().map(concrete_var_index))
-                .flatten()
-        });
-        let body = self.ctx.functions.get(&call.id).and_then(|function| {
-            if let Some(index) = &call.index {
-                function.get_function(index)
-            } else {
-                function.get_function(&[])
-            }
-        });
+        let body = self
+            .ctx
+            .functions
+            .get(&call.id)
+            .and_then(|function| function.get_function_for_index(&call.receiver_index));
         let Some(body) = body else {
-            let mut sources = Vec::new();
-            for input in call.inputs.values() {
-                sources.extend(self.eval_expr(input));
-            }
-            for outputs in call.outputs.values() {
-                for destination in outputs {
-                    self.write_destination(destination, &sources, controls);
-                }
-            }
+            self.opaque_function_call_boundary(call);
             return CallResult {
                 region_groups: Vec::new(),
-                opaque_sources: sources,
             };
         };
-        let mut actual_sources = Vec::new();
         let mut input_bindings = Vec::new();
 
         for (path, actual) in &call.inputs {
-            actual_sources.extend(self.eval_expr(actual));
-            let Some(&formal) = body.arg_map.get(path) else {
-                continue;
-            };
-            for key in self.keys_for_id(formal) {
-                let mut sources = self.eval_actual_for_formal_key(actual, key);
+            let formal = body.arg_map.get(path).copied();
+            let (_, snapshots) = self.snapshot_function_actual(actual, formal);
+            for (key, mut sources) in snapshots {
                 sources.normalize();
                 input_bindings.push((key, sources));
             }
@@ -2787,9 +3459,7 @@ impl<'a, 's> ProcedureAnalysis<'a, 's> {
         }
 
         self.call_caches.push(None);
-        self.receiver_indices.push(receiver_index);
         self.eval_function_body(&body.statements, body.ret, controls);
-        self.receiver_indices.pop();
         self.call_caches.pop();
 
         let mut formal_outputs = HashMap::default();
@@ -2803,7 +3473,7 @@ impl<'a, 's> ProcedureAnalysis<'a, 's> {
         }
         let region_groups = body
             .ret
-            .map(|ret| self.current_region_groups_for_id(ret))
+            .map(|ret| self.current_function_return_region_groups(ret, None))
             .unwrap_or_default();
 
         assert_eq!(self.call_frames.pop(), Some(call_frame));
@@ -2845,15 +3515,7 @@ impl<'a, 's> ProcedureAnalysis<'a, 's> {
             }
         }
 
-        let opaque_sources = if statements_have_unknown(&body.statements) {
-            actual_sources
-        } else {
-            Vec::new()
-        };
-        CallResult {
-            region_groups,
-            opaque_sources,
-        }
+        CallResult { region_groups }
     }
 
     fn apply_function_summary(
@@ -2864,8 +3526,14 @@ impl<'a, 's> ProcedureAnalysis<'a, 's> {
     ) -> CallResult {
         self.status = self.status.max(summary.status);
         self.call_caches.push(Some(EvaluationCache::default()));
-        for actual in call.inputs.values() {
-            self.eval_expr(actual);
+        let mut actual_bindings = HashMap::default();
+        for (path, actual) in &call.inputs {
+            let formal = summary.arg_map.get(path).copied();
+            let (_, snapshots) = self.snapshot_function_actual(actual, formal);
+            for (key, mut sources) in snapshots {
+                sources.normalize();
+                actual_bindings.insert(key, sources.sources);
+            }
         }
         let branch_map = self.instantiate_summary_branches(summary);
         let mut bindings = HashMap::default();
@@ -2876,7 +3544,7 @@ impl<'a, 's> ProcedureAnalysis<'a, 's> {
             if !bindings.contains_key(key) {
                 bindings.insert(
                     *key,
-                    self.map_summary_node_source(call, summary, key.node)
+                    self.map_summary_node_source(&actual_bindings, key.node)
                         .sources,
                 );
             }
@@ -2896,8 +3564,7 @@ impl<'a, 's> ProcedureAnalysis<'a, 's> {
             let version = self
                 .ssa
                 .related_definition_guarded(sources.sources, &self.path_condition);
-            self.bind_key(*destination, version);
-            self.written.insert(*destination);
+            self.bind_destination(*destination, version, false);
         }
 
         for (path, destinations) in &call.outputs {
@@ -2962,27 +3629,13 @@ impl<'a, 's> ProcedureAnalysis<'a, 's> {
                 (*array, regions)
             })
             .collect();
-        let opaque_sources = summary
-            .opaque_sources
-            .iter()
-            .flat_map(|source| {
-                self.map_summary_node_source(call, summary, *source)
-                    .sources
-                    .into_iter()
-                    .map(|(version, _)| version)
-            })
-            .collect();
         self.call_caches.pop();
-        CallResult {
-            region_groups,
-            opaque_sources,
-        }
+        CallResult { region_groups }
     }
 
     fn map_summary_node_source(
         &mut self,
-        call: &FunctionCall,
-        summary: &FunctionSummary,
+        actual_bindings: &HashMap<NodeKey, Vec<(VersionId, PositionRelation)>>,
         source: NodeKey,
     ) -> ExpressionSources {
         if self.is_module_scope_key(source) {
@@ -2990,19 +3643,9 @@ impl<'a, 's> ProcedureAnalysis<'a, 's> {
                 sources: vec![(self.read_key(source), PositionRelation::default())],
             };
         }
-        let actual = summary.arg_map.iter().find_map(|(path, formal)| {
-            (*formal == source.0)
-                .then(|| {
-                    call.inputs
-                        .iter()
-                        .find_map(|(actual_path, actual)| (actual_path == path).then_some(actual))
-                })
-                .flatten()
-        });
-        let Some(actual) = actual else {
-            return ExpressionSources::default();
-        };
-        self.eval_actual_for_formal_key(actual, source)
+        ExpressionSources {
+            sources: actual_bindings.get(&source).cloned().unwrap_or_default(),
+        }
     }
 
     fn instantiate_summary_branches(
@@ -3107,6 +3750,44 @@ impl<'a, 's> ProcedureAnalysis<'a, 's> {
         groups
     }
 
+    fn current_function_return_region_groups(
+        &mut self,
+        id: VarId,
+        storage_span: Option<ArraySpan>,
+    ) -> Vec<(ArraySpan, Vec<(PackedSpan, VersionId)>)> {
+        let groups = self.current_region_groups_for_id(id);
+        let Some(storage_span) = storage_span else {
+            return groups;
+        };
+        let array_offset = isize::try_from(storage_span.start)
+            .ok()
+            .and_then(isize::checked_neg);
+        let mut selected = Vec::new();
+        for (array, regions) in groups {
+            let Some(array) = array
+                .intersection(storage_span)
+                .and_then(|array| array.translated(storage_span.start, 0))
+            else {
+                continue;
+            };
+            let regions = regions
+                .into_iter()
+                .map(|(packed, version)| {
+                    let version = self.ssa.related_definition(vec![(
+                        version,
+                        PositionRelation {
+                            array: array_offset,
+                            packed: Some(0),
+                        },
+                    )]);
+                    (packed, version)
+                })
+                .collect();
+            selected.push((array, regions));
+        }
+        selected
+    }
+
     fn eval_actual_for_formal_key(
         &mut self,
         actual: &Expression,
@@ -3116,6 +3797,33 @@ impl<'a, 's> ProcedureAnalysis<'a, 's> {
             return ExpressionSources::whole(self.eval_expr(actual));
         };
         self.eval_expr_bits(actual, formal_key.1, span)
+    }
+
+    fn snapshot_function_actual(
+        &mut self,
+        actual: &Expression,
+        formal: Option<VarId>,
+    ) -> (Vec<VersionId>, Vec<(NodeKey, ExpressionSources)>) {
+        let formal_keys = formal.map_or_else(Vec::new, |formal| self.keys_for_id(formal));
+        let snapshots: Vec<(NodeKey, ExpressionSources)> =
+            self.snapshot_expression(actual, |this| {
+                formal_keys
+                    .into_iter()
+                    .map(|key| {
+                        let sources = this.eval_speculatively(|this| {
+                            this.eval_actual_for_formal_key(actual, key)
+                        });
+                        (key, sources)
+                    })
+                    .collect()
+            });
+        let mut whole_sources = snapshots
+            .iter()
+            .flat_map(|(_, sources)| sources.sources.iter().map(|(version, _)| *version))
+            .collect::<Vec<_>>();
+        whole_sources.sort_unstable();
+        whole_sources.dedup();
+        (whole_sources, snapshots)
     }
 
     fn write_formal_output(
@@ -3148,8 +3856,14 @@ impl<'a, 's> ProcedureAnalysis<'a, 's> {
                     packed: Some(signed_difference(low, formal_offset)?),
                 })
             });
-        let dynamic = self.destination_is_dynamic(destination);
-        for key in self.write_keys(destination) {
+        let (keys, resolved) = self.write_keys(destination);
+        let dynamic = !resolved || self.destination_is_dynamic(destination);
+        for key in keys {
+            if !resolved {
+                let opaque = self.ssa.definition(Vec::new());
+                self.bind_destination(key, opaque, true);
+                continue;
+            }
             let mut positional = Vec::new();
             let mut whole = controls.to_vec();
             if let (Some(destination_array), Some((_, low)), Some(span), Some(position_offset)) = (
@@ -3234,68 +3948,25 @@ impl<'a, 's> ProcedureAnalysis<'a, 's> {
     }
 }
 
-fn statements_have_unknown(statements: &[Statement]) -> bool {
+fn statements_have_unsupported(statements: &[Statement]) -> bool {
     statements.iter().any(|statement| match statement {
-        Statement::Assign(assign) => expression_has_unknown(&assign.expr),
         Statement::If(statement) => {
-            expression_has_unknown(&statement.cond)
-                || statements_have_unknown(&statement.true_side)
-                || statements_have_unknown(&statement.false_side)
+            statements_have_unsupported(&statement.true_side)
+                || statements_have_unsupported(&statement.false_side)
+        }
+        Statement::IfReset(statement) => {
+            statements_have_unsupported(&statement.true_side)
+                || statements_have_unsupported(&statement.false_side)
         }
         Statement::Case(statement) => {
-            expression_has_unknown(&statement.case_target)
-                || statement
-                    .arms
-                    .iter()
-                    .any(|arm| statements_have_unknown(&arm.body))
-                || statements_have_unknown(&statement.default)
+            statement
+                .arms
+                .iter()
+                .any(|arm| statements_have_unsupported(&arm.body))
+                || statements_have_unsupported(&statement.default)
         }
-        Statement::For(statement) => statements_have_unknown(&statement.body),
+        Statement::For(statement) => statements_have_unsupported(&statement.body),
+        Statement::Unsupported(_) => true,
         _ => false,
     })
-}
-
-fn concrete_var_index(index: &[usize]) -> VarIndex {
-    VarIndex(
-        index
-            .iter()
-            .map(|index| {
-                Expression::create_value(
-                    Value::new(*index as u64, 32, false),
-                    veryl_parser::token_range::TokenRange::default(),
-                )
-            })
-            .collect(),
-    )
-}
-
-fn expression_has_unknown(expression: &Expression) -> bool {
-    match expression {
-        Expression::Term(factor) => matches!(factor.as_ref(), Factor::Unknown(_)),
-        Expression::Unary(_, expression, _) => expression_has_unknown(expression),
-        Expression::Binary(left, _, right, _) => {
-            expression_has_unknown(left) || expression_has_unknown(right)
-        }
-        Expression::Ternary(condition, left, right, _) => {
-            expression_has_unknown(condition)
-                || expression_has_unknown(left)
-                || expression_has_unknown(right)
-        }
-        Expression::Concatenation(parts, _) => parts.iter().any(|(expression, repeat)| {
-            expression_has_unknown(expression)
-                || repeat.as_ref().is_some_and(expression_has_unknown)
-        }),
-        Expression::ArrayLiteral(items, _) => items.iter().any(|item| match item {
-            ArrayLiteralItem::Value(expression, repeat) => {
-                expression_has_unknown(expression)
-                    || repeat
-                        .as_ref()
-                        .is_some_and(|expression| expression_has_unknown(expression.as_ref()))
-            }
-            ArrayLiteralItem::Defaul(expression) => expression_has_unknown(expression),
-        }),
-        Expression::StructConstructor(_, fields, _) => fields
-            .iter()
-            .any(|(_, expression)| expression_has_unknown(expression)),
-    }
 }
