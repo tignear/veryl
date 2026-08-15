@@ -2547,6 +2547,54 @@ fn instance_actual_regions_share_source_summary_walks() {
 }
 
 #[test]
+fn instance_output_fragment_queries_do_not_rescan_the_whole_concatenation() {
+    const WIDTH: usize = 128;
+    let child_outputs = (0..WIDTH)
+        .map(|bit| format!("assign o[{bit}] = i[{bit}];"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let destinations = (0..WIDTH)
+        .rev()
+        .map(|bit| format!("passed[{bit}]"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let clears = (1..WIDTH)
+        .map(|bit| format!("assign feedback[{bit}] = 0;"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    crate::comb_loop_detect::reset_instance_fragment_probes();
+    assert_comb_loop(
+        "per-bit output regions query a cached concatenation layout",
+        &format!(
+            r#"
+            module Child (
+                i: input  logic<{WIDTH}>,
+                o: output logic<{WIDTH}>,
+            ) {{
+                {child_outputs}
+            }}
+            module Top (o: output logic) {{
+                var feedback: logic<{WIDTH}>;
+                var passed: logic<{WIDTH}>;
+                inst child: Child (
+                    i: feedback,
+                    o: {{{destinations}}},
+                );
+                assign feedback[0] = passed[0];
+                {clears}
+                assign o = passed[0];
+            }}
+            "#,
+        ),
+        true,
+    );
+    assert!(
+        crate::comb_loop_detect::instance_fragment_probes() <= WIDTH * 8,
+        "each child region must inspect only overlapping cached fragments",
+    );
+}
+
+#[test]
 fn comb_loop_module_formal_high_bit_ignores_short_unsigned_actual() {
     assert_comb_loop(
         "a module formal high bit does not read an unsigned short actual",
