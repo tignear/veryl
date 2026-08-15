@@ -67,6 +67,7 @@ impl ProcedureContext {
     pub(super) fn new(module: &Module) -> Self {
         let mut ctx = Context::default();
         ctx.variables = module.variables.clone();
+        ctx.variables.extend(module.interface_members.clone());
         ctx.functions = module.functions.clone();
         #[cfg(test)]
         MODULE_CONTEXT_ENTRIES

@@ -28,7 +28,7 @@ use crate::conv::Context;
 use crate::ir::VarId;
 use crate::ir::{
     AssignDestination, Component, Declaration, Expression, Factor, FunctionCall, InstDeclaration,
-    Ir, Module, Op, Statement, SystemFunctionKind, VarSelect, Variable,
+    InstInterfaceBinding, Ir, Module, Op, Statement, SystemFunctionKind, VarSelect, Variable,
 };
 use crate::symbol::{Affiliation, Direction};
 use daggy::petgraph::Graph;
@@ -38,8 +38,9 @@ use daggy::petgraph::visit::EdgeRef;
 use std::collections::VecDeque;
 use veryl_parser::resource_table::StrId;
 
-/// `feedthrough[child_in_id] = { child_out_ids reachable purely combinationally }`.
-/// Port-level only -- the parent keeps bit precision via `BitPartition`.
+/// `feedthrough[source_id] = { destination IDs reachable purely combinationally }`.
+/// Sources and destinations include ordinary ports and interface members
+/// captured by functions imported through a modport.
 #[derive(Clone, Debug, Default)]
 struct ModuleCombSummary {
     feedthrough: HashMap<VarId, HashSet<VarId>>,
@@ -910,6 +911,7 @@ fn build_module_graph(
 ) -> Graph<NodeKey, ()> {
     let mut ctx = Context::default();
     ctx.variables = module.variables.clone();
+    ctx.variables.extend(module.interface_members.clone());
     ctx.functions = module.functions.clone();
     let bit_part = build_bit_partition(module, &mut ctx);
 
@@ -1017,16 +1019,55 @@ fn add_inst_feedthrough_edges<'a>(
         }
     }
 
-    for (child_in_id, out_set) in &summary.feedthrough {
-        let Some(parent_reads) = input_reads.get(child_in_id) else {
-            continue;
-        };
-        for child_out_id in out_set {
-            let Some(parent_dsts) = output_dsts.get(child_out_id) else {
-                continue;
-            };
-            for r in parent_reads {
-                for d in parent_dsts {
+    let mut interface_nodes: HashMap<VarId, Vec<NodeKey>> = HashMap::default();
+    for binding in &inst.interface_bindings {
+        let keys = interface_binding_keys(binding, bit_part, ctx);
+        if !keys.is_empty() {
+            interface_nodes
+                .entry(binding.child)
+                .or_default()
+                .extend(keys);
+        }
+    }
+    for keys in interface_nodes.values_mut() {
+        keys.sort_unstable();
+        keys.dedup();
+    }
+
+    for (child_source_id, destination_set) in &summary.feedthrough {
+        let mut parent_sources = input_reads
+            .get(child_source_id)
+            .into_iter()
+            .flatten()
+            .copied()
+            .collect::<Vec<_>>();
+        parent_sources.extend(
+            interface_nodes
+                .get(child_source_id)
+                .into_iter()
+                .flatten()
+                .copied(),
+        );
+        parent_sources.sort_unstable();
+        parent_sources.dedup();
+        for child_destination_id in destination_set {
+            let mut parent_destinations = output_dsts
+                .get(child_destination_id)
+                .into_iter()
+                .flatten()
+                .copied()
+                .collect::<Vec<_>>();
+            parent_destinations.extend(
+                interface_nodes
+                    .get(child_destination_id)
+                    .into_iter()
+                    .flatten()
+                    .copied(),
+            );
+            parent_destinations.sort_unstable();
+            parent_destinations.dedup();
+            for r in &parent_sources {
+                for d in &parent_destinations {
                     let s = ensure_node(graph, node_map, *r);
                     let t = ensure_node(graph, node_map, *d);
                     graph.add_edge(s, t, ());
@@ -1034,6 +1075,18 @@ fn add_inst_feedthrough_edges<'a>(
             }
         }
     }
+}
+
+fn interface_binding_keys(
+    binding: &InstInterfaceBinding,
+    bit_part: &BitPartition,
+    ctx: &mut Context,
+) -> Vec<NodeKey> {
+    let mut keys = Vec::new();
+    for (index, span) in var_reads(binding.parent, &binding.index, &binding.select, ctx) {
+        keys.extend(bit_part.overlapping_access(binding.parent, index, span));
+    }
+    keys
 }
 
 fn add_sparse_whole_port_copy_edges(
@@ -1444,25 +1497,35 @@ fn compute_module_summary(module: &Module, graph: &Graph<NodeKey, ()>) -> Module
             _ => {}
         }
     }
+    let interface_ids = module
+        .interface_members
+        .keys()
+        .copied()
+        .collect::<HashSet<_>>();
+    let mut source_ids = input_ids;
+    source_ids.extend(interface_ids.iter().copied());
+    let mut destination_ids = output_ids;
+    destination_ids.extend(interface_ids);
 
     let mut feedthrough: HashMap<VarId, HashSet<VarId>> = HashMap::default();
     let mut visited: HashSet<NodeIndex> = HashSet::default();
     let mut stack: Vec<NodeIndex> = Vec::new();
     for ni in graph.node_indices() {
         let key = graph[ni];
-        if !input_ids.contains(&key.0) {
+        if !source_ids.contains(&key.0) {
             continue;
         }
         visited.clear();
         stack.clear();
-        stack.push(ni);
+        visited.insert(ni);
+        stack.extend(graph.edges(ni).map(|edge| edge.target()));
         while let Some(n) = stack.pop() {
+            let nk = graph[n];
+            if destination_ids.contains(&nk.0) {
+                feedthrough.entry(key.0).or_default().insert(nk.0);
+            }
             if !visited.insert(n) {
                 continue;
-            }
-            let nk = graph[n];
-            if output_ids.contains(&nk.0) {
-                feedthrough.entry(key.0).or_default().insert(nk.0);
             }
             for e in graph.edges(n) {
                 stack.push(e.target());
