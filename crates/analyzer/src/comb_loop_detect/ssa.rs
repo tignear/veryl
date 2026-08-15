@@ -1299,6 +1299,7 @@ where
         version
     }
 
+    #[cfg(test)]
     pub(super) fn has_structural_dependency(&self, version: VersionId) -> bool {
         let mut visited = HashSet::default();
         let mut queue = VecDeque::from([version]);
@@ -1938,6 +1939,7 @@ where
         sources
     }
 
+    #[cfg(test)]
     pub(super) fn root_source_relations_guarded(
         &self,
         version: VersionId,

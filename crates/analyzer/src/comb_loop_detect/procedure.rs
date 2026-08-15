@@ -634,12 +634,113 @@ thread_local! {
     static EXPRESSION_LAYOUT_VISITS: Cell<usize> = const { Cell::new(0) };
 }
 
-#[derive(Clone)]
 struct CallResult {
     region_groups: Vec<(ArraySpan, Vec<(PackedSpan, VersionId)>)>,
 }
 
-#[derive(Clone)]
+impl CallResult {
+    fn for_each_region_group(
+        &self,
+        requested: Option<ArraySpan>,
+        mut visit: impl FnMut(ArraySpan, &[(PackedSpan, VersionId)]),
+    ) {
+        let (first, requested_end) = requested
+            .and_then(|requested| {
+                Some((
+                    self.region_groups.partition_point(|(array, _)| {
+                        #[cfg(test)]
+                        FUNCTION_RESULT_REGION_PROBES.set(FUNCTION_RESULT_REGION_PROBES.get() + 1);
+                        array.end().is_some_and(|end| end <= requested.start)
+                    }),
+                    requested.end()?,
+                ))
+            })
+            .unwrap_or((0, usize::MAX));
+        for (array, regions) in &self.region_groups[first..] {
+            #[cfg(test)]
+            FUNCTION_RESULT_REGION_PROBES.set(FUNCTION_RESULT_REGION_PROBES.get() + 1);
+            if array.start >= requested_end {
+                break;
+            }
+            if requested.is_none_or(|requested| array.overlaps(requested)) {
+                visit(*array, regions);
+            }
+        }
+    }
+}
+
+struct FormalVersionLayout {
+    groups: Vec<(ArraySpan, Vec<(PackedSpan, VersionId)>)>,
+}
+
+impl FormalVersionLayout {
+    fn new(versions: &[(NodeKey, VersionId)], bit_part: &BitPartition) -> FormalVersionLayout {
+        let mut groups: Vec<(ArraySpan, Vec<(PackedSpan, VersionId)>)> = Vec::new();
+        for &(key, version) in versions {
+            let Some(packed) = bit_part.ranges_of((key.0, key.1)).get(key.2).copied() else {
+                continue;
+            };
+            if groups.last().is_none_or(|(array, _)| *array != key.1) {
+                groups.push((key.1, Vec::new()));
+            }
+            groups
+                .last_mut()
+                .expect("formal version group was just inserted")
+                .1
+                .push((packed, version));
+        }
+        debug_assert!(
+            groups
+                .windows(2)
+                .all(|pair| { pair[0].0.end().is_some_and(|end| end <= pair[1].0.start) })
+        );
+        debug_assert!(groups.iter().all(|(_, regions)| {
+            regions
+                .windows(2)
+                .all(|pair| pair[0].0.end() <= pair[1].0.start)
+        }));
+        Self { groups }
+    }
+
+    fn overlapping(&self, array: ArraySpan, packed: PackedSpan) -> Vec<VersionId> {
+        let Some(array_end) = array.end() else {
+            return Vec::new();
+        };
+        let first = self.groups.partition_point(|(candidate, _)| {
+            #[cfg(test)]
+            FORMAL_OUTPUT_REGION_PROBES.set(FORMAL_OUTPUT_REGION_PROBES.get() + 1);
+            candidate.end().is_some_and(|end| end <= array.start)
+        });
+        let mut result = Vec::new();
+        for (candidate, regions) in &self.groups[first..] {
+            #[cfg(test)]
+            FORMAL_OUTPUT_REGION_PROBES.set(FORMAL_OUTPUT_REGION_PROBES.get() + 1);
+            if candidate.start >= array_end {
+                break;
+            }
+            if !candidate.overlaps(array) {
+                continue;
+            }
+            let first = regions.partition_point(|(candidate, _)| {
+                #[cfg(test)]
+                FORMAL_OUTPUT_REGION_PROBES.set(FORMAL_OUTPUT_REGION_PROBES.get() + 1);
+                candidate.end() <= packed.start
+            });
+            for (candidate, version) in &regions[first..] {
+                #[cfg(test)]
+                FORMAL_OUTPUT_REGION_PROBES.set(FORMAL_OUTPUT_REGION_PROBES.get() + 1);
+                if candidate.start >= packed.end() {
+                    break;
+                }
+                if candidate.overlaps(packed) {
+                    result.push(*version);
+                }
+            }
+        }
+        result
+    }
+}
+
 struct FrozenVariableRead {
     selectors: Vec<VersionId>,
     versions: Vec<(NodeKey, VersionId)>,
@@ -661,7 +762,6 @@ impl PackedProjectionFragment {
     }
 }
 
-#[derive(Clone)]
 struct PackedProjectionLayout {
     fragments: Vec<PackedProjectionFragment>,
     controls: Vec<VersionId>,
@@ -682,7 +782,6 @@ impl ArrayProjectionFragment {
     }
 }
 
-#[derive(Clone)]
 struct ArrayProjectionLayout {
     fragments: Vec<ArrayProjectionFragment>,
     controls: Vec<VersionId>,
@@ -703,16 +802,148 @@ impl FrozenVariableRead {
 // call nodes in a cloned callee body must never enter the caller's cache.
 #[derive(Default)]
 struct EvaluationCache {
-    calls: HashMap<*const FunctionCall, CallResult>,
+    calls: HashMap<*const FunctionCall, Rc<CallResult>>,
     expression_branches: HashMap<*const Expression, BranchId>,
     // These addresses identify occurrences in the immutable caller IR only
     // while `snapshot_expression` owns this cache. Callee evaluation pushes an
     // invocation barrier, so temporary/cloned body nodes never enter it, and
     // the cache is dropped before its caller expression can cease to exist.
-    variable_reads: HashMap<*const Factor, FrozenVariableRead>,
-    packed_layouts: HashMap<*const Expression, PackedProjectionLayout>,
-    array_layouts: HashMap<*const Expression, ArrayProjectionLayout>,
-    struct_layouts: HashMap<*const Expression, PackedProjectionLayout>,
+    variable_reads: HashMap<*const Factor, Rc<FrozenVariableRead>>,
+    packed_layouts: HashMap<*const Expression, Rc<PackedProjectionLayout>>,
+    array_layouts: HashMap<*const Expression, Rc<ArrayProjectionLayout>>,
+    struct_layouts: HashMap<*const Expression, Rc<PackedProjectionLayout>>,
+}
+
+#[cfg(test)]
+mod evaluation_cache_tests {
+    use super::*;
+    use std::hash::Hash;
+    use std::ptr::NonNull;
+
+    const WIDTH: usize = 256;
+
+    fn assert_shared_lookups<K, T>(cache: &HashMap<K, Rc<T>>, key: K, expected: &Rc<T>)
+    where
+        K: Copy + Eq + Hash,
+    {
+        for _ in 0..WIDTH {
+            let cached = cache.get(&key).cloned().expect("cached large value");
+            assert!(Rc::ptr_eq(&cached, expected));
+        }
+        assert_eq!(Rc::strong_count(expected), 2);
+    }
+
+    #[test]
+    fn large_value_lookups_clone_only_shared_handles() {
+        // W projected regions repeatedly query cache payloads containing W
+        // elements. The payload types intentionally do not implement Clone;
+        // every lookup below must therefore remain an O(1) Rc clone rather
+        // than restoring the former W x W Vec-copy path.
+        let call = Rc::new(CallResult {
+            region_groups: (0..WIDTH)
+                .map(|start| {
+                    (
+                        ArraySpan { start, length: 1 },
+                        vec![(PackedSpan::new(0, 1).expect("unit span"), start)],
+                    )
+                })
+                .collect(),
+        });
+        let variable = Rc::new(FrozenVariableRead {
+            selectors: (0..WIDTH).collect(),
+            versions: (0..WIDTH)
+                .map(|start| {
+                    (
+                        (VarId::from_raw(0), ArraySpan { start, length: 1 }, 0),
+                        start,
+                    )
+                })
+                .collect(),
+        });
+        let packed = Rc::new(PackedProjectionLayout {
+            fragments: (0..WIDTH)
+                .map(|output_start| PackedProjectionFragment {
+                    part: output_start,
+                    output_start,
+                    item_width: 1,
+                    repeat: 1,
+                })
+                .collect(),
+            controls: (0..WIDTH).collect(),
+        });
+        let array = Rc::new(ArrayProjectionLayout {
+            fragments: (0..WIDTH)
+                .map(|output_start| ArrayProjectionFragment {
+                    item: output_start,
+                    output_start,
+                    item_length: 1,
+                    repeat: 1,
+                    output_length: 1,
+                })
+                .collect(),
+            controls: (0..WIDTH).collect(),
+            total: WIDTH,
+        });
+        let r#struct = Rc::new(PackedProjectionLayout {
+            fragments: (0..WIDTH)
+                .map(|output_start| PackedProjectionFragment {
+                    part: output_start,
+                    output_start,
+                    item_width: 1,
+                    repeat: 1,
+                })
+                .collect(),
+            controls: Vec::new(),
+        });
+
+        let call_key = NonNull::<FunctionCall>::dangling().as_ptr().cast_const();
+        let variable_key = NonNull::<Factor>::dangling().as_ptr().cast_const();
+        let expression_key = NonNull::<Expression>::dangling().as_ptr().cast_const();
+        let mut cache = EvaluationCache::default();
+        cache.calls.insert(call_key, Rc::clone(&call));
+        cache
+            .variable_reads
+            .insert(variable_key, Rc::clone(&variable));
+        cache
+            .packed_layouts
+            .insert(expression_key, Rc::clone(&packed));
+        cache
+            .array_layouts
+            .insert(expression_key, Rc::clone(&array));
+        cache
+            .struct_layouts
+            .insert(expression_key, Rc::clone(&r#struct));
+
+        assert_shared_lookups(&cache.calls, call_key, &call);
+        assert_shared_lookups(&cache.variable_reads, variable_key, &variable);
+        assert_shared_lookups(&cache.packed_layouts, expression_key, &packed);
+        assert_shared_lookups(&cache.array_layouts, expression_key, &array);
+        assert_shared_lookups(&cache.struct_layouts, expression_key, &r#struct);
+    }
+
+    #[test]
+    fn unpacked_call_result_queries_do_not_scan_every_array_group() {
+        let result = CallResult {
+            region_groups: (0..WIDTH)
+                .map(|start| {
+                    (
+                        ArraySpan { start, length: 1 },
+                        vec![(PackedSpan::new(0, 1).expect("unit span"), start)],
+                    )
+                })
+                .collect(),
+        };
+
+        FUNCTION_RESULT_REGION_PROBES.set(0);
+        for start in 0..WIDTH {
+            let mut found = Vec::new();
+            result.for_each_region_group(Some(ArraySpan { start, length: 1 }), |array, regions| {
+                found.push((array, regions.len()))
+            });
+            assert_eq!(found, vec![(ArraySpan { start, length: 1 }, 1)]);
+        }
+        assert!(FUNCTION_RESULT_REGION_PROBES.get() <= WIDTH * 12);
+    }
 }
 
 type CallCache = Option<EvaluationCache>;
@@ -1383,6 +1614,11 @@ struct FunctionSummaryKey {
 struct FunctionSummary {
     arg_map: HashMap<VarPath, VarId>,
     graph: Rc<DependencyDag<SsaKey>>,
+    /// Metadata derived from the immutable summary graph. Keep it with the
+    /// summary so applying an N-node body at N call sites does not rescan the
+    /// whole graph at every call.
+    external_keys: Vec<SsaKey>,
+    branches: Vec<BranchId>,
     result: FunctionResultSummary,
     writes: Vec<(NodeKey, Option<usize>)>,
     status: AnalysisStatus,
@@ -1509,9 +1745,11 @@ thread_local! {
     static FUNCTION_EVALUATIONS: Cell<usize> = const { Cell::new(0) };
     static FUNCTION_RESULT_VERSIONS: Cell<usize> = const { Cell::new(0) };
     static FUNCTION_RESULT_REGION_PROBES: Cell<usize> = const { Cell::new(0) };
+    static FORMAL_OUTPUT_REGION_PROBES: Cell<usize> = const { Cell::new(0) };
     static FUNCTION_BARRIER_EVALUATIONS: Cell<usize> = const { Cell::new(0) };
     static FUNCTION_SUMMARY_GRAPH_NODES: Cell<usize> = const { Cell::new(0) };
     static MODULE_CONTEXT_ENTRIES: Cell<usize> = const { Cell::new(0) };
+    static FUNCTION_SUMMARY_METADATA_VISITS: Cell<usize> = const { Cell::new(0) };
 }
 
 #[cfg(test)]
@@ -1519,9 +1757,11 @@ pub(crate) fn reset_function_evaluation_count() {
     FUNCTION_EVALUATIONS.set(0);
     FUNCTION_RESULT_VERSIONS.set(0);
     FUNCTION_RESULT_REGION_PROBES.set(0);
+    FORMAL_OUTPUT_REGION_PROBES.set(0);
     FUNCTION_BARRIER_EVALUATIONS.set(0);
     FUNCTION_SUMMARY_GRAPH_NODES.set(0);
     MODULE_CONTEXT_ENTRIES.set(0);
+    FUNCTION_SUMMARY_METADATA_VISITS.set(0);
     EXPRESSION_LAYOUT_VISITS.set(0);
 }
 
@@ -1538,6 +1778,11 @@ pub(crate) fn function_result_version_count() -> usize {
 #[cfg(test)]
 pub(crate) fn function_result_region_probe_count() -> usize {
     FUNCTION_RESULT_REGION_PROBES.get()
+}
+
+#[cfg(test)]
+pub(crate) fn formal_output_region_probe_count() -> usize {
+    FORMAL_OUTPUT_REGION_PROBES.get()
 }
 
 #[cfg(test)]
@@ -1558,6 +1803,11 @@ pub(crate) fn reset_module_context_entries() {
 #[cfg(test)]
 pub(crate) fn module_context_entries() -> usize {
     MODULE_CONTEXT_ENTRIES.get()
+}
+
+#[cfg(test)]
+pub(crate) fn function_summary_metadata_visits() -> usize {
+    FUNCTION_SUMMARY_METADATA_VISITS.get()
 }
 
 #[cfg(test)]
@@ -1799,6 +2049,8 @@ struct ProcedureAnalysis<'a, 's> {
     ctx: Context,
     module_scope_ids: Rc<HashSet<VarId>>,
     ssa: SsaStore<SsaKey>,
+    structural_dependency_cache: HashMap<VersionId, bool>,
+    projection_source_cache: SourceCache<SsaKey>,
     flow_store: FlowStore,
     written: HashSet<NodeKey>,
     call_caches: Vec<CallCache>,
@@ -1829,6 +2081,8 @@ impl<'a, 's> ProcedureAnalysis<'a, 's> {
             ctx,
             module_scope_ids,
             ssa: SsaStore::default(),
+            structural_dependency_cache: HashMap::default(),
+            projection_source_cache: SourceCache::default(),
             flow_store: FlowStore::default(),
             written: HashSet::default(),
             call_caches: Vec::new(),
@@ -1958,22 +2212,6 @@ impl<'a, 's> ProcedureAnalysis<'a, 's> {
         this.eval_function_body(&body.statements, body.ret, &[]);
         this.call_caches.pop();
 
-        let mut visible_keys = this.module_scope_keys();
-        visible_keys.extend(
-            formal_ids
-                .iter()
-                .flat_map(|formal| this.keys_for_id(*formal)),
-        );
-        visible_keys.sort_unstable();
-        visible_keys.dedup();
-        let allowed = visible_keys
-            .into_iter()
-            .map(|node| SsaKey {
-                node,
-                call_frame: None,
-            })
-            .collect::<HashSet<_>>();
-
         let result_versions: Vec<(ArraySpan, Vec<(PackedSpan, VersionId)>)> = body
             .ret
             .map(|ret| this.current_function_return_region_groups(ret, None))
@@ -1987,6 +2225,7 @@ impl<'a, 's> ProcedureAnalysis<'a, 's> {
                 formal_ids.contains(&destination.0) || this.is_module_scope_key(*destination)
             })
             .collect::<Vec<_>>();
+
         destinations.sort_unstable();
         let write_versions = destinations
             .into_iter()
@@ -1995,6 +2234,20 @@ impl<'a, 's> ProcedureAnalysis<'a, 's> {
                 (destination, version)
             })
             .collect::<Vec<_>>();
+
+        // Only entry versions that were actually created can appear as DAG
+        // sources. Enumerating every partition of every visible variable for
+        // each procedure/function makes N sparse declarations cost N^2.
+        // Take this snapshot after all result/write roots have been read.
+        let allowed = this
+            .ssa
+            .entry_keys()
+            .filter(|key| {
+                key.call_frame.is_none()
+                    && (formal_ids.contains(&key.node.0)
+                        || this.module_scope_ids.contains(&key.node.0))
+            })
+            .collect::<HashSet<_>>();
 
         let mut roots = result_versions
             .iter()
@@ -2032,9 +2285,23 @@ impl<'a, 's> ProcedureAnalysis<'a, 's> {
             .collect();
         debug_assert!(root.next().is_none());
 
+        let mut external_keys = Vec::new();
+        let mut seen_external_keys = HashSet::default();
+        for node in &graph.nodes {
+            if let DependencyDagNode::External(key) = node
+                && seen_external_keys.insert(*key)
+            {
+                external_keys.push(*key);
+            }
+        }
+        let branches =
+            PathCondition::collect_branches(graph.edges.iter().map(|edge| &edge.condition));
+
         let summary = FunctionSummary {
             arg_map: body.arg_map,
             graph,
+            external_keys,
+            branches,
             result,
             writes,
             status: this.status,
@@ -2046,19 +2313,21 @@ impl<'a, 's> ProcedureAnalysis<'a, 's> {
 
     fn dependencies(&mut self) -> Vec<Dependency> {
         let mut dependencies = Vec::new();
-        let mut source_cache =
-            SourceCache::restricted(self.module_scope_keys().into_iter().map(|node| SsaKey {
-                node,
-                call_frame: None,
-            }));
-        let destinations: Vec<_> = self
+        let destinations = self
             .written
             .iter()
             .copied()
             .filter(|key| self.is_module_scope_key(*key))
-            .collect();
-        for destination in destinations {
-            let version = self.read_key(destination);
+            .collect::<Vec<_>>();
+        let destination_versions = destinations
+            .into_iter()
+            .map(|destination| (destination, self.read_key(destination)))
+            .collect::<Vec<_>>();
+        let mut source_cache =
+            SourceCache::restricted(self.ssa.entry_keys().filter(|key| {
+                key.call_frame.is_none() && self.module_scope_ids.contains(&key.node.0)
+            }));
+        for (destination, version) in destination_versions {
             let sources = self
                 .ssa
                 .root_source_relations_guarded_cached(version, &mut source_cache);
@@ -2102,7 +2371,12 @@ impl<'a, 's> ProcedureAnalysis<'a, 's> {
             .iter()
             .map(|destination| self.read_key(*destination))
             .collect::<Vec<_>>();
-        let allowed = self.module_scope_keys().into_iter().collect::<HashSet<_>>();
+        let allowed = self
+            .ssa
+            .entry_keys()
+            .filter(|key| key.call_frame.is_none() && self.module_scope_ids.contains(&key.node.0))
+            .map(|key| key.node)
+            .collect::<HashSet<_>>();
         let graph = self.dependency_dag_for_nodes(&roots, allowed);
         let destinations = destinations
             .into_iter()
@@ -2261,17 +2535,6 @@ impl<'a, 's> ProcedureAnalysis<'a, 's> {
             domains: graph.domains,
             incoming: OnceCell::new(),
         }
-    }
-
-    fn module_scope_keys(&self) -> Vec<NodeKey> {
-        let mut keys = self
-            .module_scope_ids
-            .iter()
-            .flat_map(|&id| self.keys_for_id(id))
-            .collect::<Vec<_>>();
-        keys.sort_unstable();
-        keys.dedup();
-        keys
     }
 
     fn process_write_footprint(
@@ -3921,7 +4184,7 @@ impl<'a, 's> ProcedureAnalysis<'a, 's> {
         &mut self,
         expression: &Expression,
         parts: &[(Expression, Option<Expression>)],
-    ) -> Option<PackedProjectionLayout> {
+    ) -> Option<Rc<PackedProjectionLayout>> {
         let key = std::ptr::from_ref(expression);
         if let Some(layout) = self
             .call_caches
@@ -3959,12 +4222,12 @@ impl<'a, 's> ProcedureAnalysis<'a, 's> {
         }
         controls.sort_unstable();
         controls.dedup();
-        let layout = PackedProjectionLayout {
+        let layout = Rc::new(PackedProjectionLayout {
             fragments,
             controls,
-        };
+        });
         if let Some(Some(cache)) = self.call_caches.last_mut() {
-            cache.packed_layouts.insert(key, layout.clone());
+            cache.packed_layouts.insert(key, Rc::clone(&layout));
         }
         Some(layout)
     }
@@ -3973,7 +4236,7 @@ impl<'a, 's> ProcedureAnalysis<'a, 's> {
         &mut self,
         expression: &Expression,
         items: &[ArrayLiteralItem],
-    ) -> Option<ArrayProjectionLayout> {
+    ) -> Option<Rc<ArrayProjectionLayout>> {
         let key = std::ptr::from_ref(expression);
         if let Some(layout) = self
             .call_caches
@@ -4039,13 +4302,13 @@ impl<'a, 's> ProcedureAnalysis<'a, 's> {
         }
         controls.sort_unstable();
         controls.dedup();
-        let layout = ArrayProjectionLayout {
+        let layout = Rc::new(ArrayProjectionLayout {
             fragments,
             controls,
             total,
-        };
+        });
         if let Some(Some(cache)) = self.call_caches.last_mut() {
-            cache.array_layouts.insert(key, layout.clone());
+            cache.array_layouts.insert(key, Rc::clone(&layout));
         }
         Some(layout)
     }
@@ -4055,7 +4318,7 @@ impl<'a, 's> ProcedureAnalysis<'a, 's> {
         expression: &Expression,
         r#type: &crate::ir::Type,
         fields: &[(veryl_parser::resource_table::StrId, Expression)],
-    ) -> Option<PackedProjectionLayout> {
+    ) -> Option<Rc<PackedProjectionLayout>> {
         let key = std::ptr::from_ref(expression);
         if let Some(layout) = self
             .call_caches
@@ -4078,12 +4341,12 @@ impl<'a, 's> ProcedureAnalysis<'a, 's> {
             });
             output_start = output_start.checked_add(item_width)?;
         }
-        let layout = PackedProjectionLayout {
+        let layout = Rc::new(PackedProjectionLayout {
             fragments,
             controls: Vec::new(),
-        };
+        });
         if let Some(Some(cache)) = self.call_caches.last_mut() {
-            cache.struct_layouts.insert(key, layout.clone());
+            cache.struct_layouts.insert(key, Rc::clone(&layout));
         }
         Some(layout)
     }
@@ -4524,7 +4787,7 @@ impl<'a, 's> ProcedureAnalysis<'a, 's> {
                     return ExpressionSources::whole(self.eval_expr(expression));
                 };
                 let mut reads = ExpressionSources::default();
-                reads.extend_whole(layout.controls);
+                reads.extend_whole(layout.controls.iter().copied());
                 let first = layout.fragments.partition_point(|fragment| {
                     fragment
                         .output_end()
@@ -4603,7 +4866,7 @@ impl<'a, 's> ProcedureAnalysis<'a, 's> {
                     && requested_end <= layout.total
                 {
                     let mut reads = ExpressionSources::default();
-                    reads.extend_whole(layout.controls);
+                    reads.extend_whole(layout.controls.iter().copied());
                     let first = layout.fragments.partition_point(|fragment| {
                         fragment
                             .output_end()
@@ -5129,8 +5392,8 @@ impl<'a, 's> ProcedureAnalysis<'a, 's> {
                     .and_then(|cache| cache.variable_reads.get(&std::ptr::from_ref(factor)))
                     .cloned()
                 {
-                    reads.extend(frozen.selectors);
-                    reads.extend(frozen.versions.into_iter().map(|(_, version)| version));
+                    reads.extend(frozen.selectors.iter().copied());
+                    reads.extend(frozen.versions.iter().map(|(_, version)| *version));
                     return;
                 }
                 if self.projection_only {
@@ -5157,10 +5420,10 @@ impl<'a, 's> ProcedureAnalysis<'a, 's> {
                 if let Some(Some(cache)) = self.call_caches.last_mut() {
                     cache.variable_reads.insert(
                         std::ptr::from_ref(factor),
-                        FrozenVariableRead {
+                        Rc::new(FrozenVariableRead {
                             selectors,
                             versions,
-                        },
+                        }),
                     );
                 }
             }
@@ -5222,10 +5485,10 @@ impl<'a, 's> ProcedureAnalysis<'a, 's> {
         // at this boundary, not results used while constructing `CallResult`.
         let discard_result = self.effects_only;
         self.effects_only = false;
-        let evaluated = self.eval_call_uncached(call, controls);
+        let evaluated = Rc::new(self.eval_call_uncached(call, controls));
         self.effects_only = discard_result;
         if let Some(Some(cache)) = self.call_caches.last_mut() {
-            cache.calls.insert(cache_key, evaluated.clone());
+            cache.calls.insert(cache_key, Rc::clone(&evaluated));
         }
         if discard_result {
             return Vec::new();
@@ -5242,10 +5505,7 @@ impl<'a, 's> ProcedureAnalysis<'a, 's> {
         requested: Option<(ArraySpan, PackedSpan)>,
     ) -> Vec<VersionId> {
         let mut result = Vec::new();
-        for (array, regions) in &evaluated.region_groups {
-            if requested.is_some_and(|(requested_array, _)| !array.overlaps(requested_array)) {
-                continue;
-            }
+        evaluated.for_each_region_group(requested.map(|(array, _)| array), |array, regions| {
             let requested_packed = requested.map(|(_, packed)| packed);
             let first = requested_packed.map_or(0, |requested| {
                 regions.partition_point(|(span, _)| {
@@ -5261,7 +5521,7 @@ impl<'a, 's> ProcedureAnalysis<'a, 's> {
                     break;
                 }
                 if let Some((requested_array, requested_packed)) = requested {
-                    if requested_array.intersection(*array) == Some(*array)
+                    if requested_array.intersection(array) == Some(array)
                         && requested_packed.intersection(*span) == Some(*span)
                     {
                         result.push(*version);
@@ -5276,7 +5536,7 @@ impl<'a, 's> ProcedureAnalysis<'a, 's> {
                     result.push(*version);
                 }
             }
-        }
+        });
         result.sort_unstable();
         result.dedup();
         result
@@ -5375,6 +5635,7 @@ impl<'a, 's> ProcedureAnalysis<'a, 's> {
                 .get(&formal)
                 .map(Vec::as_slice)
                 .unwrap_or_default();
+            let formal_layout = FormalVersionLayout::new(formal_versions, self.bit_part);
             let widths: Vec<_> = destinations
                 .iter()
                 .map(|destination| self.destination_width(destination))
@@ -5395,6 +5656,7 @@ impl<'a, 's> ProcedureAnalysis<'a, 's> {
                     self.write_formal_output(
                         destination,
                         formal_versions,
+                        &formal_layout,
                         offset,
                         coercion,
                         controls,
@@ -5435,24 +5697,22 @@ impl<'a, 's> ProcedureAnalysis<'a, 's> {
         let branch_map = self.instantiate_summary_branches(call, summary);
         let branch_remapper = SsaStore::<SsaKey>::branch_remapper(branch_map);
         let mut bindings = HashMap::default();
-        for node in &summary.graph.nodes {
-            let DependencyDagNode::External(key) = node else {
-                continue;
-            };
-            if !bindings.contains_key(key) {
-                bindings.insert(
-                    *key,
-                    self.map_summary_node_source(&actual_bindings, key.node)
-                        .sources,
-                );
-            }
+        for key in &summary.external_keys {
+            #[cfg(test)]
+            FUNCTION_SUMMARY_METADATA_VISITS.set(FUNCTION_SUMMARY_METADATA_VISITS.get() + 1);
+            bindings.insert(
+                *key,
+                self.map_summary_node_source(&actual_bindings, key.node)
+                    .sources,
+            );
         }
+        let bindings = Rc::new(bindings);
 
         for (destination, root) in &summary.writes {
-            let imported = self.ssa.imported(
+            let imported = self.ssa.imported_shared(
                 summary.graph.clone(),
                 *root,
-                bindings.clone(),
+                Rc::clone(&bindings),
                 branch_remapper.clone(),
             );
             let mut sources = ExpressionSources {
@@ -5480,6 +5740,7 @@ impl<'a, 's> ProcedureAnalysis<'a, 's> {
                 && widths.iter().all(Option::is_some)
             {
                 let formal_versions = self.current_key_versions_for_id(formal);
+                let formal_layout = FormalVersionLayout::new(&formal_versions, self.bit_part);
                 let total_width = widths.iter().flatten().sum();
                 let coercion = FormalOutputCoercion {
                     actual_width: total_width,
@@ -5493,6 +5754,7 @@ impl<'a, 's> ProcedureAnalysis<'a, 's> {
                     self.write_formal_output(
                         destination,
                         &formal_versions,
+                        &formal_layout,
                         offset,
                         coercion,
                         controls,
@@ -5518,10 +5780,10 @@ impl<'a, 's> ProcedureAnalysis<'a, 's> {
                 let regions = regions
                     .iter()
                     .map(|(span, root)| {
-                        let imported = self.ssa.imported(
+                        let imported = self.ssa.imported_shared(
                             summary.graph.clone(),
                             *root,
-                            bindings.clone(),
+                            Rc::clone(&bindings),
                             branch_remapper.clone(),
                         );
                         let version = if self.path_condition.is_unconditional() {
@@ -5562,11 +5824,14 @@ impl<'a, 's> ProcedureAnalysis<'a, 's> {
         call: &FunctionCall,
         summary: &FunctionSummary,
     ) -> HashMap<BranchId, BranchId> {
-        let branches =
-            PathCondition::collect_branches(summary.graph.edges.iter().map(|edge| &edge.condition));
+        #[cfg(test)]
+        FUNCTION_SUMMARY_METADATA_VISITS
+            .set(FUNCTION_SUMMARY_METADATA_VISITS.get() + summary.branches.len());
         if let Some(&call) = self.top_expression_calls.get(&std::ptr::from_ref(call)) {
-            branches
-                .into_iter()
+            summary
+                .branches
+                .iter()
+                .copied()
                 .enumerate()
                 .map(|(local, branch)| {
                     (
@@ -5581,8 +5846,10 @@ impl<'a, 's> ProcedureAnalysis<'a, 's> {
                 })
                 .collect()
         } else {
-            branches
-                .into_iter()
+            summary
+                .branches
+                .iter()
+                .copied()
                 .map(|branch| (branch, self.next_branch_id(branch.arms())))
                 .collect()
         }
@@ -5615,13 +5882,18 @@ impl<'a, 's> ProcedureAnalysis<'a, 's> {
         requested_array: ArraySpan,
         requested_packed: PackedSpan,
     ) -> Vec<VersionId> {
-        if self.ssa.has_structural_dependency(version) {
+        if self
+            .ssa
+            .has_structural_dependency_cached(version, &mut self.structural_dependency_cache)
+        {
             return vec![
                 self.ssa
                     .projected(version, position_domain(requested_array, requested_packed)),
             ];
         }
-        let sources = self.ssa.root_source_relations_guarded(version);
+        let sources = self
+            .ssa
+            .root_source_relations_guarded_cached(version, &mut self.projection_source_cache);
         if sources.is_empty() {
             return vec![version];
         }
@@ -5766,6 +6038,7 @@ impl<'a, 's> ProcedureAnalysis<'a, 's> {
         &mut self,
         destination: &AssignDestination,
         formal_versions: &[(NodeKey, VersionId)],
+        formal_layout: &FormalVersionLayout,
         formal_offset: usize,
         coercion: FormalOutputCoercion,
         controls: &[VersionId],
@@ -5845,24 +6118,12 @@ impl<'a, 's> ProcedureAnalysis<'a, 's> {
                         if let Some(copied) = PackedSpan::whole(formal_width)
                             .and_then(|formal| formal.intersection(requested))
                         {
-                            for (formal_key, version) in formal_versions {
-                                if !formal_key.1.overlaps(requested_array) {
-                                    continue;
-                                }
-                                let Some(formal_span) = self.key_span(*formal_key) else {
-                                    continue;
-                                };
-                                if formal_span.overlaps(copied) {
-                                    positional.extend(
-                                        self.project_version_sources(
-                                            *version,
-                                            requested_array,
-                                            copied,
-                                        )
+                            for version in formal_layout.overlapping(requested_array, copied) {
+                                positional.extend(
+                                    self.project_version_sources(version, requested_array, copied)
                                         .into_iter()
                                         .map(|version| (version, position_offset)),
-                                    );
-                                }
+                                );
                             }
                         }
                         if formal_signed
@@ -5878,24 +6139,12 @@ impl<'a, 's> ProcedureAnalysis<'a, 's> {
                                 array: position_offset.array,
                                 packed: None,
                             };
-                            for (formal_key, version) in formal_versions {
-                                if !formal_key.1.overlaps(requested_array) {
-                                    continue;
-                                }
-                                let Some(formal_span) = self.key_span(*formal_key) else {
-                                    continue;
-                                };
-                                if formal_span.overlaps(sign) {
-                                    positional.extend(
-                                        self.project_version_sources(
-                                            *version,
-                                            requested_array,
-                                            sign,
-                                        )
+                            for version in formal_layout.overlapping(requested_array, sign) {
+                                positional.extend(
+                                    self.project_version_sources(version, requested_array, sign)
                                         .into_iter()
                                         .map(|version| (version, sign_relation)),
-                                    );
-                                }
+                                );
                             }
                         }
                     }

@@ -110,6 +110,60 @@ fn cumulative_unique_writes_and_early_returns_are_aggregated_linearly() {
 }
 
 #[test]
+fn repeated_summary_application_reuses_graph_metadata() {
+    const WIDTH: usize = 128;
+    let declarations = (0..WIDTH)
+        .map(|index| format!("var value_{index}: logic;"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let chain = (0..WIDTH)
+        .map(|index| {
+            let source = if index == 0 {
+                "input_value".to_owned()
+            } else {
+                format!("value_{}", index - 1)
+            };
+            format!("value_{index} = {source};")
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let calls = (0..WIDTH)
+        .map(|_| "result = propagate(seed);")
+        .collect::<Vec<_>>()
+        .join("\n");
+    let code = format!(
+        r#"
+        module Top (seed: input logic, o: output logic) {{
+            var result: logic;
+            function propagate (input_value: input logic) -> logic {{
+                {declarations}
+                {chain}
+                return value_{};
+            }}
+            always_comb {{
+                result = 0;
+                {calls}
+                o = result;
+            }}
+        }}
+        "#,
+        WIDTH - 1,
+    );
+
+    crate::comb_loop_detect::reset_function_evaluation_count();
+    let errors = analyze(&code);
+    assert!(
+        errors.is_empty(),
+        "repeated propagation is acyclic: {errors:#?}"
+    );
+    let visits = crate::comb_loop_detect::function_summary_metadata_visits();
+    assert!(
+        visits <= WIDTH * 4,
+        "summary applications must use cached external-key/branch metadata: {visits}"
+    );
+}
+
+#[test]
 fn comb_loop_false_negative_early_return_controls_a_later_captured_write() {
     // update(stop) leaves value at zero on the return path and writes one on
     // the continuation path. Since stop = value, the captured write is in a
@@ -1204,6 +1258,48 @@ fn comb_loop_split_destination_reuses_one_function_evaluation() {
     assert!(
         crate::comb_loop_detect::function_result_region_probe_count() <= WIDTH * 12,
         "return-region lookup must be logarithmic rather than scanning all regions per bit"
+    );
+}
+
+#[test]
+fn comb_loop_split_function_output_queries_only_matching_formal_regions() {
+    const WIDTH: usize = 128;
+    let copies = (0..WIDTH)
+        .map(|bit| format!("y[{bit}] = x[{bit}];"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let observations = (0..WIDTH)
+        .map(|bit| format!("assign observed[{bit}] = result[{bit}];"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    crate::comb_loop_detect::reset_function_evaluation_count();
+    let errors = analyze(&format!(
+        r#"
+        module Top (
+            i       : input  logic<{WIDTH}>,
+            observed: output logic<{WIDTH}>,
+        ) {{
+            function copy (
+                x: input  logic<{WIDTH}>,
+                y: output logic<{WIDTH}>,
+            ) {{
+                {copies}
+            }}
+            var result: logic<{WIDTH}>;
+            always_comb {{
+                copy(i, result);
+            }}
+            {observations}
+        }}
+        "#
+    ));
+    assert!(
+        errors.is_empty(),
+        "split function output is acyclic: {errors:#?}"
+    );
+    assert!(
+        crate::comb_loop_detect::formal_output_region_probe_count() <= WIDTH * 16,
+        "formal output lookup must not scan every formal region per destination"
     );
 }
 
