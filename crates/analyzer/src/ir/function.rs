@@ -13,6 +13,7 @@ use crate::value::{Value, ValueBigUint};
 use crate::{AnalyzerError, HashMap, HashSet, ir_error};
 use indent::indent_all_by;
 use std::fmt;
+use std::sync::Arc;
 use veryl_parser::resource_table::StrId;
 use veryl_parser::token_range::TokenRange;
 
@@ -75,11 +76,15 @@ pub struct Function {
     /// Storage objects owned by this receiver, independent of whether the
     /// receiver itself is scalar or arrayed. This ownership is what decides
     /// whether an enclosing receiver axis composes with a nested method.
-    pub receiver_variables: HashSet<VarId>,
+    pub(crate) receiver_variables: Arc<HashSet<VarId>>,
     /// Number of leading receiver coordinates owned by each referenced
     /// storage object. Different variables can belong to different nested
     /// receiver axes (for example outer interface and modport-array formal).
     pub receiver_prefixes: HashMap<VarId, usize>,
+    /// Direct storage references in the unspecialized body. Cached once so
+    /// composing multiple nested receiver axes does not rewalk every body at
+    /// every enclosing level.
+    pub(crate) receiver_references: Option<Arc<HashSet<VarId>>>,
     pub is_const: bool,
     pub functions: Vec<FunctionBody>,
     pub token: TokenRange,
@@ -128,11 +133,15 @@ impl Function {
     pub(crate) fn prepend_receiver(
         &mut self,
         array: &ShapeRef,
-        receiver_variables: &HashSet<VarId>,
+        receiver_variables: &Arc<HashSet<VarId>>,
+        receiver_prefix_variables: &HashSet<VarId>,
         receiver_functions: &HashSet<VarId>,
     ) {
-        self.receiver_variables
-            .extend(receiver_variables.iter().copied());
+        if self.receiver_variables.is_empty() {
+            self.receiver_variables = Arc::clone(receiver_variables);
+        } else if !Arc::ptr_eq(&self.receiver_variables, receiver_variables) {
+            Arc::make_mut(&mut self.receiver_variables).extend(receiver_variables.iter().copied());
+        }
         if array.is_empty() {
             return;
         }
@@ -140,7 +149,7 @@ impl Function {
         combined.append(&mut self.array);
         self.array = combined;
         let added_dims = array.dims();
-        for variable in receiver_variables {
+        for variable in receiver_prefix_variables {
             self.receiver_prefixes
                 .entry(*variable)
                 .and_modify(|prefix| *prefix += added_dims)

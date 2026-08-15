@@ -13,6 +13,34 @@ use std::fmt;
 use veryl_parser::resource_table::{self, StrId};
 use veryl_parser::token_range::TokenRange;
 
+#[cfg(test)]
+thread_local! {
+    static VAR_PATH_PREFIX_COMPARISONS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+    static COUNT_VAR_PATH_PREFIX_COMPARISONS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+#[inline]
+fn count_var_path_prefix_comparison() {
+    COUNT_VAR_PATH_PREFIX_COMPARISONS.with(|depth| {
+        if depth.get() != 0 {
+            VAR_PATH_PREFIX_COMPARISONS.with(|comparisons| comparisons.set(comparisons.get() + 1));
+        }
+    });
+}
+
+#[cfg(test)]
+pub(crate) struct VarPathPrefixComparisonGuard;
+
+#[cfg(test)]
+impl Drop for VarPathPrefixComparisonGuard {
+    fn drop(&mut self) {
+        COUNT_VAR_PATH_PREFIX_COMPARISONS.with(|depth| depth.set(depth.get() - 1));
+    }
+}
+
 #[derive(Clone, Copy, Eq, PartialEq, PartialOrd, Ord, Hash, Debug, Default)]
 pub struct VarId(u32);
 
@@ -343,6 +371,22 @@ impl From<VarPathSelect> for (VarPath, VarSelect, TokenRange) {
 pub struct VarPath(pub Vec<StrId>);
 
 impl VarPath {
+    #[cfg(test)]
+    pub(crate) fn count_prefix_comparisons() -> VarPathPrefixComparisonGuard {
+        COUNT_VAR_PATH_PREFIX_COMPARISONS.with(|depth| depth.set(depth.get() + 1));
+        VarPathPrefixComparisonGuard
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reset_prefix_comparisons() {
+        VAR_PATH_PREFIX_COMPARISONS.with(|comparisons| comparisons.set(0));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn prefix_comparisons() -> usize {
+        VAR_PATH_PREFIX_COMPARISONS.with(std::cell::Cell::get)
+    }
+
     pub fn new(x: StrId) -> Self {
         Self(vec![x])
     }
@@ -373,6 +417,8 @@ impl VarPath {
         }
     }
     pub fn starts_with(&self, x: &[StrId]) -> bool {
+        #[cfg(test)]
+        count_var_path_prefix_comparison();
         self.0.starts_with(x)
     }
     pub fn first(&self) -> StrId {
