@@ -7,7 +7,7 @@ use super::region::{
 };
 use super::ssa::{
     BranchId, BranchState, Checkpoint, DependencyDag, DependencyDagNode, PathCondition,
-    PositionDomain, PositionRelation, SourceCache, SsaStore, VersionId,
+    PositionDomain, PositionRelation, SourceCache, SsaStore, StateRevision, VersionId,
 };
 use crate::conv::Context;
 use crate::ir::VarId;
@@ -289,9 +289,73 @@ fn project_repeated_span(
 #[cfg(test)]
 use std::cell::Cell;
 
+#[cfg(test)]
+thread_local! {
+    static EXPRESSION_LAYOUT_VISITS: Cell<usize> = const { Cell::new(0) };
+}
+
 #[derive(Clone)]
 struct CallResult {
     region_groups: Vec<(ArraySpan, Vec<(PackedSpan, VersionId)>)>,
+}
+
+#[derive(Clone)]
+struct FrozenVariableRead {
+    selectors: Vec<VersionId>,
+    versions: Vec<(NodeKey, VersionId)>,
+}
+
+#[derive(Clone, Copy)]
+struct PackedProjectionFragment {
+    part: usize,
+    output_start: usize,
+    item_width: usize,
+    repeat: usize,
+}
+
+impl PackedProjectionFragment {
+    fn output_end(self) -> Option<usize> {
+        self.item_width
+            .checked_mul(self.repeat)?
+            .checked_add(self.output_start)
+    }
+}
+
+#[derive(Clone)]
+struct PackedProjectionLayout {
+    fragments: Vec<PackedProjectionFragment>,
+    controls: Vec<VersionId>,
+}
+
+#[derive(Clone, Copy)]
+struct ArrayProjectionFragment {
+    item: usize,
+    output_start: usize,
+    item_length: usize,
+    repeat: usize,
+    output_length: usize,
+}
+
+impl ArrayProjectionFragment {
+    fn output_end(self) -> Option<usize> {
+        self.output_start.checked_add(self.output_length)
+    }
+}
+
+#[derive(Clone)]
+struct ArrayProjectionLayout {
+    fragments: Vec<ArrayProjectionFragment>,
+    controls: Vec<VersionId>,
+    total: usize,
+}
+
+impl FrozenVariableRead {
+    fn version(&self, key: NodeKey) -> Option<VersionId> {
+        self.versions
+            .binary_search_by_key(&key, |(key, _)| *key)
+            .ok()
+            .map(|index| self.versions[index].1)
+    }
 }
 
 // Region-split writes query one RHS several times, but a function call in that
@@ -301,9 +365,159 @@ struct CallResult {
 struct EvaluationCache {
     calls: HashMap<*const FunctionCall, CallResult>,
     expression_branches: HashMap<*const Expression, BranchId>,
+    // These addresses identify occurrences in the immutable caller IR only
+    // while `snapshot_expression` owns this cache. Callee evaluation pushes an
+    // invocation barrier, so temporary/cloned body nodes never enter it, and
+    // the cache is dropped before its caller expression can cease to exist.
+    variable_reads: HashMap<*const Factor, FrozenVariableRead>,
+    packed_layouts: HashMap<*const Expression, PackedProjectionLayout>,
+    array_layouts: HashMap<*const Expression, ArrayProjectionLayout>,
+    struct_layouts: HashMap<*const Expression, PackedProjectionLayout>,
 }
 
 type CallCache = Option<EvaluationCache>;
+
+#[derive(Default)]
+struct ExpressionBranchLayout {
+    conditionals: Vec<*const Expression>,
+    calls: Vec<*const FunctionCall>,
+}
+
+fn collect_expression_branch_layout(expression: &Expression, layout: &mut ExpressionBranchLayout) {
+    #[cfg(test)]
+    EXPRESSION_LAYOUT_VISITS.set(EXPRESSION_LAYOUT_VISITS.get() + 1);
+    if matches!(expression, Expression::Ternary(..))
+        || matches!(
+            expression,
+            Expression::Binary(_, Op::LogicAnd | Op::LogicOr, _, _)
+        )
+    {
+        layout.conditionals.push(std::ptr::from_ref(expression));
+    }
+
+    match expression {
+        Expression::Term(factor) => match factor.as_ref() {
+            Factor::Variable(_, index, select, _) => {
+                collect_var_access_expressions(index, select, layout);
+            }
+            Factor::HierVariable(reference) => {
+                collect_var_access_expressions(&reference.index, &reference.select, layout);
+            }
+            Factor::FunctionCall(call) => {
+                let call_key = std::ptr::from_ref(call);
+                // The expression IR is an owned tree: a syntactic call
+                // occurrence is reached exactly once by this preorder walk.
+                layout.calls.push(call_key);
+                for expression in &call.receiver_index.0 {
+                    collect_expression_branch_layout(expression, layout);
+                }
+                for expression in call.inputs.values() {
+                    collect_expression_branch_layout(expression, layout);
+                }
+                for destinations in call.outputs.values() {
+                    for destination in destinations {
+                        collect_var_access_expressions(
+                            &destination.index,
+                            &destination.select,
+                            layout,
+                        );
+                    }
+                }
+            }
+            Factor::SystemFunctionCall(call) => {
+                collect_system_call_branch_layout(call, layout);
+            }
+            Factor::Value(_) | Factor::Anonymous(_) | Factor::Unknown(_) => {}
+        },
+        Expression::Unary(_, operand, _) => {
+            collect_expression_branch_layout(operand, layout);
+        }
+        Expression::Binary(left, _, right, _) => {
+            collect_expression_branch_layout(left, layout);
+            collect_expression_branch_layout(right, layout);
+        }
+        Expression::Ternary(condition, left, right, _) => {
+            collect_expression_branch_layout(condition, layout);
+            collect_expression_branch_layout(left, layout);
+            collect_expression_branch_layout(right, layout);
+        }
+        Expression::Concatenation(parts, _) => {
+            for (part, repeat) in parts {
+                collect_expression_branch_layout(part, layout);
+                if let Some(repeat) = repeat {
+                    collect_expression_branch_layout(repeat, layout);
+                }
+            }
+        }
+        Expression::ArrayLiteral(items, _) => {
+            for item in items {
+                match item {
+                    ArrayLiteralItem::Value(value, repeat) => {
+                        collect_expression_branch_layout(value, layout);
+                        if let Some(repeat) = repeat {
+                            collect_expression_branch_layout(repeat, layout);
+                        }
+                    }
+                    ArrayLiteralItem::Defaul(value) => {
+                        collect_expression_branch_layout(value, layout);
+                    }
+                }
+            }
+        }
+        Expression::StructConstructor(_, fields, _) => {
+            for (_, value) in fields {
+                collect_expression_branch_layout(value, layout);
+            }
+        }
+    }
+}
+
+fn collect_var_access_expressions(
+    index: &VarIndex,
+    select: &VarSelect,
+    layout: &mut ExpressionBranchLayout,
+) {
+    for expression in index.0.iter().chain(select.0.iter()) {
+        collect_expression_branch_layout(expression, layout);
+    }
+    if let Some((_, expression)) = &select.1 {
+        collect_expression_branch_layout(expression, layout);
+    }
+}
+
+fn collect_system_call_branch_layout(
+    call: &crate::ir::SystemFunctionCall,
+    layout: &mut ExpressionBranchLayout,
+) {
+    match &call.kind {
+        SystemFunctionKind::Bits(input)
+        | SystemFunctionKind::Size(input)
+        | SystemFunctionKind::Clog2(input)
+        | SystemFunctionKind::Onehot(input)
+        | SystemFunctionKind::Signed(input)
+        | SystemFunctionKind::Unsigned(input) => {
+            collect_expression_branch_layout(&input.0, layout);
+        }
+        SystemFunctionKind::Readmemh(input, output) => {
+            collect_expression_branch_layout(&input.0, layout);
+            for destination in &output.0 {
+                collect_var_access_expressions(&destination.index, &destination.select, layout);
+            }
+        }
+        SystemFunctionKind::Display(inputs) | SystemFunctionKind::Write(inputs) => {
+            for input in inputs {
+                collect_expression_branch_layout(&input.0, layout);
+            }
+        }
+        SystemFunctionKind::Assert { cond, args, .. } => {
+            collect_expression_branch_layout(&cond.0, layout);
+            for input in args {
+                collect_expression_branch_layout(&input.0, layout);
+            }
+        }
+        SystemFunctionKind::Finish => {}
+    }
+}
 
 // Module and interface storage is shared by every call. Function-owned
 // storage is automatic, so its SSA identity also includes the invocation.
@@ -313,31 +527,484 @@ struct SsaKey {
     call_frame: Option<usize>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum ProcedureFlow {
     Continue,
     Break,
     Return,
 }
 
-struct FlowResult {
-    flow: ProcedureFlow,
-    continuation_controls: Vec<VersionId>,
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct FlowPredicate {
+    expression: PredicateExpression,
+    controls: Vec<VersionId>,
 }
 
-impl FlowResult {
-    fn new(flow: ProcedureFlow) -> Self {
+impl FlowPredicate {
+    fn expression(expression: &Expression, controls: &[VersionId]) -> Self {
+        let mut controls = controls.to_vec();
+        controls.sort_unstable();
+        controls.dedup();
         Self {
-            flow,
-            continuation_controls: Vec::new(),
+            expression: PredicateExpression::from_expression(expression),
+            controls,
+        }
+    }
+
+    fn opaque(identity: usize, controls: &[VersionId]) -> Self {
+        let mut controls = controls.to_vec();
+        controls.sort_unstable();
+        controls.dedup();
+        Self {
+            expression: PredicateExpression::Opaque(identity),
+            controls,
         }
     }
 }
 
+#[derive(Clone, PartialEq, Eq, Hash)]
+enum PredicateExpression {
+    Variable {
+        id: VarId,
+        index: Vec<PredicateExpression>,
+        select: Vec<PredicateExpression>,
+        range: Option<(u8, Box<PredicateExpression>)>,
+    },
+    Value(crate::ir::ValueVariant),
+    Unary(Op, Box<PredicateExpression>),
+    Binary(Box<PredicateExpression>, Op, Box<PredicateExpression>),
+    Ternary(
+        Box<PredicateExpression>,
+        Box<PredicateExpression>,
+        Box<PredicateExpression>,
+    ),
+    Concatenation(Vec<(PredicateExpression, Option<PredicateExpression>)>),
+    ArrayLiteral(Vec<(Option<PredicateExpression>, PredicateExpression)>),
+    StructConstructor(Vec<(veryl_parser::resource_table::StrId, PredicateExpression)>),
+    Opaque(usize),
+}
+
+impl PredicateExpression {
+    fn from_expression(expression: &Expression) -> Self {
+        match expression {
+            Expression::Term(factor) => match factor.as_ref() {
+                Factor::Variable(id, index, select, _) => Self::Variable {
+                    id: *id,
+                    index: index.0.iter().map(Self::from_expression).collect(),
+                    select: select.0.iter().map(Self::from_expression).collect(),
+                    range: select.1.as_ref().map(|(op, expression)| {
+                        let op = match op {
+                            crate::ir::VarSelectOp::Colon => 0,
+                            crate::ir::VarSelectOp::PlusColon => 1,
+                            crate::ir::VarSelectOp::MinusColon => 2,
+                            crate::ir::VarSelectOp::Step => 3,
+                        };
+                        (op, Box::new(Self::from_expression(expression)))
+                    }),
+                },
+                Factor::Value(comptime) => Self::Value(comptime.value.clone()),
+                _ => Self::Opaque(std::ptr::from_ref(factor.as_ref()).addr()),
+            },
+            Expression::Unary(op, expression, _) => {
+                Self::Unary(*op, Box::new(Self::from_expression(expression)))
+            }
+            Expression::Binary(left, op, right, _) => Self::Binary(
+                Box::new(Self::from_expression(left)),
+                *op,
+                Box::new(Self::from_expression(right)),
+            ),
+            Expression::Ternary(condition, left, right, _) => Self::Ternary(
+                Box::new(Self::from_expression(condition)),
+                Box::new(Self::from_expression(left)),
+                Box::new(Self::from_expression(right)),
+            ),
+            Expression::Concatenation(parts, _) => Self::Concatenation(
+                parts
+                    .iter()
+                    .map(|(part, repeat)| {
+                        (
+                            Self::from_expression(part),
+                            repeat.as_ref().map(Self::from_expression),
+                        )
+                    })
+                    .collect(),
+            ),
+            Expression::ArrayLiteral(items, _) => Self::ArrayLiteral(
+                items
+                    .iter()
+                    .map(|item| match item {
+                        ArrayLiteralItem::Value(value, repeat) => (
+                            repeat.as_ref().map(|repeat| Self::from_expression(repeat)),
+                            Self::from_expression(value),
+                        ),
+                        ArrayLiteralItem::Defaul(value) => (None, Self::from_expression(value)),
+                    })
+                    .collect(),
+            ),
+            Expression::StructConstructor(_, fields, _) => Self::StructConstructor(
+                fields
+                    .iter()
+                    .map(|(name, value)| (*name, Self::from_expression(value)))
+                    .collect(),
+            ),
+        }
+    }
+}
+
+type FlowSemanticId = usize;
+type ContinuationSemanticId = usize;
+
+#[derive(Clone, PartialEq, Eq, Hash)]
+enum FlowSemanticKey {
+    Outcome(ProcedureFlow),
+    Decision {
+        predicate: FlowPredicate,
+        arms: Vec<FlowSemanticId>,
+    },
+}
+
+#[derive(Clone, PartialEq, Eq, Hash)]
+enum ContinuationSemanticKey {
+    Outcome(bool),
+    Decision {
+        predicate: FlowPredicate,
+        arms: Vec<ContinuationSemanticId>,
+    },
+}
+
+#[derive(Clone)]
+struct FlowArm {
+    condition: PathCondition,
+    tree: FlowTree,
+}
+
+#[derive(Clone)]
+enum FlowTreeNode {
+    Outcome(ProcedureFlow),
+    Decision {
+        predicate: FlowPredicate,
+        arms: Vec<FlowArm>,
+    },
+}
+
+struct FlowTreeData {
+    node: FlowTreeNode,
+    semantic: FlowSemanticId,
+    continuation: ContinuationSemanticId,
+    outcomes: u8,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct FlowTree(usize);
+
+#[derive(Default)]
+struct FlowStore {
+    trees: Vec<FlowTreeData>,
+    semantics: Vec<FlowSemanticKey>,
+    semantic_ids: HashMap<FlowSemanticKey, FlowSemanticId>,
+    continuations: Vec<ContinuationSemanticKey>,
+    continuation_ids: HashMap<ContinuationSemanticKey, ContinuationSemanticId>,
+    bind_mapped: HashMap<FlowTree, FlowTree>,
+    bind_work: Vec<(FlowTree, bool)>,
+    #[cfg(test)]
+    bind_visits: usize,
+}
+
+impl FlowStore {
+    const CONTINUE: u8 = 1;
+    const BREAK: u8 = 2;
+    const RETURN: u8 = 4;
+
+    fn intern_semantic(&mut self, key: FlowSemanticKey) -> FlowSemanticId {
+        if let Some(id) = self.semantic_ids.get(&key) {
+            return *id;
+        }
+        let id = self.semantics.len();
+        self.semantics.push(key.clone());
+        self.semantic_ids.insert(key, id);
+        id
+    }
+
+    fn intern_continuation(&mut self, key: ContinuationSemanticKey) -> ContinuationSemanticId {
+        if let Some(id) = self.continuation_ids.get(&key) {
+            return *id;
+        }
+        let id = self.continuations.len();
+        self.continuations.push(key.clone());
+        self.continuation_ids.insert(key, id);
+        id
+    }
+
+    fn push_tree(&mut self, data: FlowTreeData) -> FlowTree {
+        let tree = FlowTree(self.trees.len());
+        self.trees.push(data);
+        tree
+    }
+
+    fn outcome(&mut self, flow: ProcedureFlow) -> FlowTree {
+        let bit = Self::outcome_bit(flow);
+        let semantic = self.intern_semantic(FlowSemanticKey::Outcome(flow));
+        let continuation = self.intern_continuation(ContinuationSemanticKey::Outcome(
+            flow == ProcedureFlow::Continue,
+        ));
+        self.push_tree(FlowTreeData {
+            node: FlowTreeNode::Outcome(flow),
+            semantic,
+            continuation,
+            outcomes: bit,
+        })
+    }
+
+    fn decision(&mut self, predicate: FlowPredicate, arms: Vec<FlowArm>) -> FlowTree {
+        debug_assert!(!arms.is_empty());
+        let outcomes = arms
+            .iter()
+            .fold(0, |outcomes, arm| outcomes | self.data(arm.tree).outcomes);
+        let semantic_arms = arms
+            .iter()
+            .map(|arm| self.data(arm.tree).semantic)
+            .collect::<Vec<_>>();
+        let continuation_arms = arms
+            .iter()
+            .map(|arm| self.data(arm.tree).continuation)
+            .collect::<Vec<_>>();
+        let semantic = if semantic_arms[1..]
+            .iter()
+            .all(|arm| *arm == semantic_arms[0])
+        {
+            semantic_arms[0]
+        } else {
+            self.intern_semantic(FlowSemanticKey::Decision {
+                predicate: predicate.clone(),
+                arms: semantic_arms,
+            })
+        };
+        let continuation = if continuation_arms[1..]
+            .iter()
+            .all(|arm| *arm == continuation_arms[0])
+        {
+            continuation_arms[0]
+        } else {
+            self.intern_continuation(ContinuationSemanticKey::Decision {
+                predicate: predicate.clone(),
+                arms: continuation_arms,
+            })
+        };
+        self.push_tree(FlowTreeData {
+            node: FlowTreeNode::Decision { predicate, arms },
+            semantic,
+            continuation,
+            outcomes,
+        })
+    }
+
+    fn outcome_bit(flow: ProcedureFlow) -> u8 {
+        match flow {
+            ProcedureFlow::Continue => Self::CONTINUE,
+            ProcedureFlow::Break => Self::BREAK,
+            ProcedureFlow::Return => Self::RETURN,
+        }
+    }
+
+    fn data(&self, tree: FlowTree) -> &FlowTreeData {
+        &self.trees[tree.0]
+    }
+
+    fn contains(&self, tree: FlowTree, flow: ProcedureFlow) -> bool {
+        self.data(tree).outcomes & Self::outcome_bit(flow) != 0
+    }
+
+    fn aggregate(&self, tree: FlowTree) -> ProcedureFlow {
+        if self.contains(tree, ProcedureFlow::Continue) {
+            ProcedureFlow::Continue
+        } else if self.contains(tree, ProcedureFlow::Break) {
+            ProcedureFlow::Break
+        } else {
+            ProcedureFlow::Return
+        }
+    }
+
+    /// Substitute `next` for every continuing leaf in `tree`.
+    ///
+    /// `tree` is one source statement's plan. Blocks apply this from right to
+    /// left, so a long sequential block never walks the prefix built so far.
+    fn bind(&mut self, tree: FlowTree, next: FlowTree) -> FlowTree {
+        if !self.contains(tree, ProcedureFlow::Continue) {
+            return tree;
+        }
+        let mut mapped = std::mem::take(&mut self.bind_mapped);
+        mapped.clear();
+        let mut work = std::mem::take(&mut self.bind_work);
+        work.clear();
+        work.push((tree, false));
+        while let Some((current, expanded)) = work.pop() {
+            #[cfg(test)]
+            {
+                self.bind_visits += 1;
+            }
+            if mapped.contains_key(&current) {
+                continue;
+            }
+            match self.data(current).node.clone() {
+                FlowTreeNode::Outcome(ProcedureFlow::Continue) => {
+                    mapped.insert(current, next);
+                }
+                FlowTreeNode::Outcome(_) => {
+                    mapped.insert(current, current);
+                }
+                FlowTreeNode::Decision { predicate, arms } if expanded => {
+                    let arms = arms
+                        .into_iter()
+                        .map(|arm| FlowArm {
+                            condition: arm.condition,
+                            tree: mapped[&arm.tree],
+                        })
+                        .collect();
+                    let bound = self.decision(predicate, arms);
+                    mapped.insert(current, bound);
+                }
+                FlowTreeNode::Decision { arms, .. } => {
+                    work.push((current, true));
+                    for arm in arms.into_iter().rev() {
+                        if !mapped.contains_key(&arm.tree) {
+                            work.push((arm.tree, false));
+                        }
+                    }
+                }
+            }
+        }
+        let bound = mapped[&tree];
+        self.bind_mapped = mapped;
+        self.bind_work = work;
+        bound
+    }
+
+    fn leave_loop(&mut self, tree: FlowTree) -> FlowTree {
+        let mut mapped = HashMap::default();
+        let mut work = vec![(tree, false)];
+        while let Some((current, expanded)) = work.pop() {
+            if mapped.contains_key(&current) {
+                continue;
+            }
+            match self.data(current).node.clone() {
+                FlowTreeNode::Outcome(ProcedureFlow::Return) => {
+                    mapped.insert(current, current);
+                }
+                FlowTreeNode::Outcome(_) => {
+                    let continuing = self.outcome(ProcedureFlow::Continue);
+                    mapped.insert(current, continuing);
+                }
+                FlowTreeNode::Decision { predicate, arms } if expanded => {
+                    let arms = arms
+                        .into_iter()
+                        .map(|arm| FlowArm {
+                            condition: arm.condition,
+                            tree: mapped[&arm.tree],
+                        })
+                        .collect();
+                    let outside = self.decision(predicate, arms);
+                    mapped.insert(current, outside);
+                }
+                FlowTreeNode::Decision { arms, .. } => {
+                    work.push((current, true));
+                    for arm in arms.into_iter().rev() {
+                        if !mapped.contains_key(&arm.tree) {
+                            work.push((arm.tree, false));
+                        }
+                    }
+                }
+            }
+        }
+        mapped[&tree]
+    }
+
+    fn collect_continuation_controls(
+        &self,
+        tree: FlowTree,
+        controls: &mut Vec<(Vec<VersionId>, PathCondition)>,
+    ) {
+        let mut work = vec![(tree, PathCondition::default())];
+        while let Some((current, inherited)) = work.pop() {
+            let FlowTreeNode::Decision { predicate, arms } = &self.data(current).node else {
+                continue;
+            };
+            let decision_matters = arms[1..].iter().any(|arm| {
+                self.data(arm.tree).continuation != self.data(arms[0].tree).continuation
+            });
+            for arm in arms.iter().rev() {
+                let Some(condition) = inherited.conjoin_if_compatible(&arm.condition) else {
+                    continue;
+                };
+                if decision_matters
+                    && self.contains(arm.tree, ProcedureFlow::Continue)
+                    && !predicate.controls.is_empty()
+                {
+                    controls.push((predicate.controls.clone(), condition.clone()));
+                }
+                work.push((arm.tree, condition));
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod flow_store_tests {
+    use super::*;
+
+    #[test]
+    fn sequential_early_exits_are_linear_and_do_not_use_the_native_stack() {
+        const STATEMENTS: usize = 100_000;
+
+        let mut store = FlowStore::default();
+        let continuing = store.outcome(ProcedureFlow::Continue);
+        let returning = store.outcome(ProcedureFlow::Return);
+        let predicate = FlowPredicate {
+            expression: PredicateExpression::Value(crate::ir::ValueVariant::Unknown),
+            controls: Vec::new(),
+        };
+        let mut statements = Vec::with_capacity(STATEMENTS);
+        for _ in 0..STATEMENTS {
+            statements.push(store.decision(
+                predicate.clone(),
+                vec![
+                    FlowArm {
+                        condition: PathCondition::default(),
+                        tree: returning,
+                    },
+                    FlowArm {
+                        condition: PathCondition::default(),
+                        tree: continuing,
+                    },
+                ],
+            ));
+        }
+
+        // A block is composed from its tail. Each bind therefore visits only
+        // that statement's plan, never the already-built sequential prefix.
+        let mut tree = store.outcome(ProcedureFlow::Continue);
+        for statement in statements.into_iter().rev() {
+            tree = store.bind(statement, tree);
+        }
+
+        assert!(store.contains(tree, ProcedureFlow::Continue));
+        assert!(store.contains(tree, ProcedureFlow::Return));
+        assert!(store.trees.len() <= 2 * STATEMENTS + 3);
+        assert!(store.bind_visits <= 4 * STATEMENTS);
+        let mut controls = Vec::new();
+        store.collect_continuation_controls(tree, &mut controls);
+        assert!(controls.is_empty());
+    }
+}
+
+struct FlowResult {
+    flow: ProcedureFlow,
+    continuation_controls: Vec<VersionId>,
+    tree: FlowTree,
+}
+
 struct FunctionFlow {
     return_id: Option<VarId>,
-    checkpoint: Checkpoint,
-    returns: Vec<BranchState<SsaKey>>,
+    revision: StateRevision,
 }
 
 struct LoopFlow {
@@ -499,6 +1166,7 @@ pub(crate) fn reset_function_evaluation_count() {
     FUNCTION_BARRIER_EVALUATIONS.set(0);
     FUNCTION_SUMMARY_GRAPH_NODES.set(0);
     MODULE_CONTEXT_ENTRIES.set(0);
+    EXPRESSION_LAYOUT_VISITS.set(0);
 }
 
 #[cfg(test)]
@@ -534,6 +1202,11 @@ pub(crate) fn reset_module_context_entries() {
 #[cfg(test)]
 pub(crate) fn module_context_entries() -> usize {
     MODULE_CONTEXT_ENTRIES.get()
+}
+
+#[cfg(test)]
+pub(crate) fn expression_layout_visit_count() -> usize {
+    EXPRESSION_LAYOUT_VISITS.get()
 }
 
 pub(super) fn analyze<'a>(
@@ -663,6 +1336,13 @@ pub(super) struct ExpressionAnalysis<'a, 's> {
     inner: Option<ProcedureAnalysis<'a, 's>>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub(super) struct ExpressionRegion {
+    pub(super) array: ArraySpan,
+    pub(super) packed: PackedSpan,
+    pub(super) context_width: usize,
+}
+
 impl<'a, 's> ExpressionAnalysis<'a, 's> {
     pub(super) fn new(
         bit_part: &'a BitPartition,
@@ -681,8 +1361,9 @@ impl<'a, 's> ExpressionAnalysis<'a, 's> {
     }
 
     pub(super) fn eval(&mut self, expression: &Expression) -> Vec<RegionSource> {
-        self.inner().use_expression_namespace(expression);
-        self.inner().eval_expression_sources(expression)
+        let inner = self.inner();
+        inner.prepare_top_expression(expression);
+        inner.eval_expression_sources(expression)
     }
 
     pub(super) fn eval_region(
@@ -692,40 +1373,48 @@ impl<'a, 's> ExpressionAnalysis<'a, 's> {
         packed: PackedSpan,
         context_width: usize,
     ) -> Vec<RegionSource> {
-        self.inner().use_expression_namespace(expression);
-        let mut sources =
-            self.inner()
-                .eval_expr_requested(expression, array, packed, context_width);
-        sources.normalize();
-        let mut mapped = Vec::new();
-        for (version, expression_offset) in sources.sources {
-            let wrapper = self
-                .inner()
-                .ssa
-                .related_definition(vec![(version, expression_offset)]);
-            for (source, relation, condition) in
-                self.inner().ssa.root_source_relations_guarded(wrapper)
-            {
-                if source.call_frame.is_some() {
-                    continue;
-                }
-                let source = source.node;
-                let relation = relation.reversed();
-                let offset = relation.array.zip(relation.packed);
-                mapped.push(RegionSource {
-                    key: source,
-                    offset,
-                    condition,
-                });
-            }
-        }
-        mapped.sort_unstable_by_key(|source| (source.key, source.offset, source.condition.clone()));
-        mapped.dedup_by(|left, right| {
-            left.key == right.key
-                && left.offset == right.offset
-                && left.condition == right.condition
-        });
-        mapped
+        let inner = self.inner();
+        inner.prepare_top_expression(expression);
+        let sources = inner.eval_expr_requested(expression, array, packed, context_width);
+        inner.mapped_region_sources(sources)
+    }
+
+    /// Evaluate an actual once in source order, then project every requested
+    /// region from the variable versions and call results captured at each
+    /// syntactic occurrence. The ordered effects are committed only once.
+    pub(super) fn eval_with_regions(
+        &mut self,
+        expression: &Expression,
+        requests: &[ExpressionRegion],
+    ) -> (
+        Vec<RegionSource>,
+        Vec<(ExpressionRegion, Vec<RegionSource>)>,
+    ) {
+        let inner = self.inner();
+        inner.prepare_top_expression(expression);
+        inner.snapshot_expression(expression, |this| {
+            let mut source_cache = SourceCache::default();
+            let regions = requests
+                .iter()
+                .copied()
+                .map(|request| {
+                    let sources = this.eval_expr_requested(
+                        expression,
+                        request.array,
+                        request.packed,
+                        request.context_width,
+                    );
+                    (
+                        request,
+                        this.mapped_region_sources_cached(&mut source_cache, sources),
+                    )
+                })
+                .collect();
+            // Projected regions usually share the same SSA value DAG. Reuse
+            // their source summaries for the whole-expression result too.
+            let whole = this.eval_expression_sources_cached(expression, &mut source_cache);
+            (whole, regions)
+        })
     }
 
     pub(super) fn dependencies(&mut self) -> Vec<Dependency> {
@@ -759,6 +1448,7 @@ struct ProcedureAnalysis<'a, 's> {
     ctx: Context,
     module_scope_ids: Rc<HashSet<VarId>>,
     ssa: SsaStore<SsaKey>,
+    flow_store: FlowStore,
     written: HashSet<NodeKey>,
     call_caches: Vec<CallCache>,
     call_frames: Vec<usize>,
@@ -767,9 +1457,12 @@ struct ProcedureAnalysis<'a, 's> {
     loop_flows: Vec<LoopFlow>,
     path_condition: PathCondition,
     effects_only: bool,
+    projection_only: bool,
     causal_write_keys: Vec<NodeKey>,
     branch_namespace: usize,
     next_branch: usize,
+    top_expression_branches: HashMap<*const Expression, BranchId>,
+    top_expression_calls: HashMap<*const FunctionCall, usize>,
     status: AnalysisStatus,
     summaries: Option<&'s mut FunctionSummaries<'a>>,
 }
@@ -785,6 +1478,7 @@ impl<'a, 's> ProcedureAnalysis<'a, 's> {
             ctx,
             module_scope_ids,
             ssa: SsaStore::default(),
+            flow_store: FlowStore::default(),
             written: HashSet::default(),
             call_caches: Vec::new(),
             call_frames: Vec::new(),
@@ -793,9 +1487,12 @@ impl<'a, 's> ProcedureAnalysis<'a, 's> {
             loop_flows: Vec::new(),
             path_condition: PathCondition::default(),
             effects_only: false,
+            projection_only: false,
             causal_write_keys: Vec::new(),
             branch_namespace: 0,
             next_branch: 0,
+            top_expression_branches: HashMap::default(),
+            top_expression_calls: HashMap::default(),
             status: AnalysisStatus::Complete,
             summaries: None,
         }
@@ -830,11 +1527,19 @@ impl<'a, 's> ProcedureAnalysis<'a, 's> {
     }
 
     fn eval_expression_sources(&mut self, expression: &Expression) -> Vec<RegionSource> {
+        self.eval_expression_sources_cached(expression, &mut SourceCache::default())
+    }
+
+    fn eval_expression_sources_cached(
+        &mut self,
+        expression: &Expression,
+        cache: &mut SourceCache<SsaKey>,
+    ) -> Vec<RegionSource> {
         let versions = self.eval_reachable_expr(expression);
         let value = self.ssa.definition(versions);
         let mut sources = self
             .ssa
-            .root_source_relations_guarded(value)
+            .root_source_relations_guarded_cached(value, cache)
             .into_iter()
             .filter_map(|(source, _, condition)| {
                 source.call_frame.is_none().then_some(RegionSource {
@@ -848,6 +1553,42 @@ impl<'a, 's> ProcedureAnalysis<'a, 's> {
         sources.sort_unstable_by_key(|source| (source.key, source.condition.clone()));
         sources.dedup_by(|left, right| left.key == right.key && left.condition == right.condition);
         sources
+    }
+
+    fn mapped_region_sources(&mut self, sources: ExpressionSources) -> Vec<RegionSource> {
+        self.mapped_region_sources_cached(&mut SourceCache::default(), sources)
+    }
+
+    fn mapped_region_sources_cached(
+        &mut self,
+        cache: &mut SourceCache<SsaKey>,
+        mut sources: ExpressionSources,
+    ) -> Vec<RegionSource> {
+        sources.normalize();
+        let mut mapped = Vec::new();
+        for (version, expression_offset) in sources.sources {
+            for (source, relation, condition) in self
+                .ssa
+                .root_source_relations_guarded_including_entry_cached(version, cache)
+            {
+                if source.call_frame.is_some() {
+                    continue;
+                }
+                let relation = expression_offset.compose(relation).reversed();
+                mapped.push(RegionSource {
+                    key: source.node,
+                    offset: relation.array.zip(relation.packed),
+                    condition,
+                });
+            }
+        }
+        mapped.sort_unstable_by_key(|source| (source.key, source.offset, source.condition.clone()));
+        mapped.dedup_by(|left, right| {
+            left.key == right.key
+                && left.offset == right.offset
+                && left.condition == right.condition
+        });
+        mapped
     }
 
     fn summarize_function(
@@ -1823,7 +2564,10 @@ impl<'a, 's> ProcedureAnalysis<'a, 's> {
         self.eval_expr(expression);
         let effects = self.ssa.capture_and_rollback(checkpoint);
         self.effects_only = false;
+        let parent_projection_only = self.projection_only;
+        self.projection_only = true;
         let value = snapshot(self);
+        self.projection_only = parent_projection_only;
         self.ssa.merge([&effects]);
         self.effects_only = parent_effects_only;
 
@@ -1848,34 +2592,30 @@ impl<'a, 's> ProcedureAnalysis<'a, 's> {
     ) {
         let caller_condition = self.path_condition.clone();
         let checkpoint = self.ssa.checkpoint();
+        let revision = self.ssa.begin_state_revision(checkpoint);
         self.function_flows.push(FunctionFlow {
             return_id,
-            checkpoint,
-            returns: Vec::new(),
+            revision,
         });
         let flow = self.eval_block(statements, controls);
-        let mut function = self
+        let function = self
             .function_flows
             .pop()
             .expect("function flow was pushed above");
-        let fallthrough = self.ssa.capture_and_rollback(checkpoint);
         if flow.flow != ProcedureFlow::Return {
-            function.returns.push(fallthrough);
+            self.ssa.record_state_revision_exit(function.revision);
         }
-        self.ssa.merge(&function.returns);
+        let exits = self.ssa.finish_state_revision(function.revision);
+        let _ = self.ssa.capture_and_rollback(checkpoint);
+        self.ssa.merge([&exits]);
         self.path_condition = caller_condition;
     }
 
     fn record_return(&mut self) {
-        let Some(function) = self.function_flows.last() else {
+        let Some(revision) = self.function_flows.last().map(|function| function.revision) else {
             return;
         };
-        let state = self.ssa.snapshot_since(function.checkpoint);
-        self.function_flows
-            .last_mut()
-            .expect("checked above")
-            .returns
-            .push(state);
+        self.ssa.record_state_revision_exit(revision);
     }
 
     fn record_break(&mut self) {
@@ -1899,14 +2639,61 @@ impl<'a, 's> ProcedureAnalysis<'a, 's> {
         branch
     }
 
-    fn use_expression_namespace(&mut self, expression: &Expression) {
-        if self.branch_namespace == 0 && self.next_branch == 0 {
-            self.branch_namespace = std::ptr::from_ref(expression).addr();
+    fn flow_result_from_tree(&mut self, tree: FlowTree) -> FlowResult {
+        let mut controls = Vec::new();
+        self.flow_store
+            .collect_continuation_controls(tree, &mut controls);
+        controls.sort_unstable();
+        controls.dedup();
+        let continuation_controls = controls
+            .into_iter()
+            .map(|(sources, condition)| self.ssa.definition_guarded(sources, &condition))
+            .collect();
+        FlowResult {
+            flow: self.flow_store.aggregate(tree),
+            continuation_controls,
+            tree,
         }
+    }
+
+    fn simple_flow_result(&mut self, flow: ProcedureFlow) -> FlowResult {
+        FlowResult {
+            flow,
+            continuation_controls: Vec::new(),
+            tree: self.flow_store.outcome(flow),
+        }
+    }
+
+    fn prepare_top_expression(&mut self, expression: &Expression) {
+        // Instance actuals are immutable IR objects for the complete module
+        // graph build. Their addresses therefore give all region analyses of
+        // one actual a shared namespace while keeping cloned actuals distinct.
+        let namespace = std::ptr::from_ref(expression).addr();
+        let mut layout = ExpressionBranchLayout::default();
+        collect_expression_branch_layout(expression, &mut layout);
+        self.branch_namespace = namespace;
+        self.next_branch = layout.conditionals.len();
+        self.top_expression_branches.clear();
+        self.top_expression_branches.extend(
+            layout
+                .conditionals
+                .into_iter()
+                .enumerate()
+                .map(|(local, expression)| (expression, BranchId::expression(namespace, local, 2))),
+        );
+        self.top_expression_calls = layout
+            .calls
+            .into_iter()
+            .enumerate()
+            .map(|(ordinal, call)| (call, ordinal))
+            .collect();
     }
 
     fn expression_branch_id(&mut self, expression: &Expression) -> BranchId {
         let key = std::ptr::from_ref(expression);
+        if let Some(branch) = self.top_expression_branches.get(&key) {
+            return *branch;
+        }
         if let Some(branch) = self
             .call_caches
             .last()
@@ -1940,25 +2727,40 @@ impl<'a, 's> ProcedureAnalysis<'a, 's> {
     }
 
     fn eval_block(&mut self, statements: &[Statement], controls: &[VersionId]) -> FlowResult {
-        let mut active_controls = controls.to_vec();
-        let mut continuation_controls = Vec::new();
+        let base_controls = controls.to_vec();
+        let mut active_controls = base_controls.clone();
+        let mut continuation_control = None;
+        let mut statement_trees = Vec::with_capacity(statements.len());
         for statement in statements {
             let result = self.eval_statement(statement, &active_controls);
-            if result.flow != ProcedureFlow::Continue {
-                return result;
+            statement_trees.push(result.tree);
+            if !result.continuation_controls.is_empty() {
+                let mut sources = result.continuation_controls;
+                if let Some(previous) = continuation_control {
+                    sources.push(previous);
+                }
+                sources.sort_unstable();
+                sources.dedup();
+                let control = self.ssa.definition(sources);
+                continuation_control = Some(control);
+                active_controls.clone_from(&base_controls);
+                active_controls.push(control);
             }
-            for control in result.continuation_controls {
-                if !active_controls.contains(&control) {
-                    active_controls.push(control);
-                }
-                if !continuation_controls.contains(&control) {
-                    continuation_controls.push(control);
-                }
+            if !self
+                .flow_store
+                .contains(result.tree, ProcedureFlow::Continue)
+            {
+                break;
             }
         }
+        let mut tree = self.flow_store.outcome(ProcedureFlow::Continue);
+        for statement in statement_trees.into_iter().rev() {
+            tree = self.flow_store.bind(statement, tree);
+        }
         FlowResult {
-            flow: ProcedureFlow::Continue,
-            continuation_controls,
+            flow: self.flow_store.aggregate(tree),
+            continuation_controls: continuation_control.into_iter().collect(),
+            tree,
         }
     }
 
@@ -2003,9 +2805,9 @@ impl<'a, 's> ProcedureAnalysis<'a, 's> {
                 self.call_caches.pop();
                 if self.is_return_assignment(&assign.dst) {
                     self.record_return();
-                    FlowResult::new(ProcedureFlow::Return)
+                    self.simple_flow_result(ProcedureFlow::Return)
                 } else {
-                    FlowResult::new(ProcedureFlow::Continue)
+                    self.simple_flow_result(ProcedureFlow::Continue)
                 }
             }
             Statement::If(statement) => self.eval_if(statement, controls),
@@ -2013,22 +2815,22 @@ impl<'a, 's> ProcedureAnalysis<'a, 's> {
             Statement::For(statement) => self.eval_for(statement, controls),
             Statement::FunctionCall(call) => {
                 self.eval_call(call, controls);
-                FlowResult::new(ProcedureFlow::Continue)
+                self.simple_flow_result(ProcedureFlow::Continue)
             }
             Statement::SystemFunctionCall(call) => {
                 self.eval_system_call(call, controls, false);
-                FlowResult::new(ProcedureFlow::Continue)
+                self.simple_flow_result(ProcedureFlow::Continue)
             }
             Statement::Break => {
                 self.record_break();
-                FlowResult::new(ProcedureFlow::Break)
+                self.simple_flow_result(ProcedureFlow::Break)
             }
             Statement::IfReset(_) | Statement::TbMethodCall(_) | Statement::Null => {
-                FlowResult::new(ProcedureFlow::Continue)
+                self.simple_flow_result(ProcedureFlow::Continue)
             }
             Statement::Unsupported(_) => {
                 self.opaque_causal_boundary();
-                FlowResult::new(ProcedureFlow::Continue)
+                self.simple_flow_result(ProcedureFlow::Continue)
             }
         }
     }
@@ -2036,53 +2838,71 @@ impl<'a, 's> ProcedureAnalysis<'a, 's> {
     fn merge_branches(
         &mut self,
         branches: Vec<(FlowResult, BranchState<SsaKey>, PathCondition)>,
-        branch_controls: &[VersionId],
+        predicate: FlowPredicate,
+        parent_condition: &PathCondition,
     ) -> FlowResult {
         let mut continuation = Vec::new();
         let mut continuation_conditions = Vec::new();
         let mut continuation_controls = Vec::new();
-        let mut has_continue = false;
-        let mut has_break = false;
-        let all_continue = branches
-            .iter()
-            .all(|(result, _, _)| result.flow == ProcedureFlow::Continue);
+        let continuation_shape = branches
+            .first()
+            .map(|(result, _, _)| self.flow_store.data(result.tree).continuation);
+        let decision_matters = continuation_shape.is_some_and(|first| {
+            branches[1..]
+                .iter()
+                .any(|(result, _, _)| self.flow_store.data(result.tree).continuation != first)
+        });
+        let mut arms = Vec::with_capacity(branches.len());
         for (result, state, condition) in branches {
-            match result.flow {
-                ProcedureFlow::Continue => {
-                    has_continue = true;
-                    continuation.push(state);
-                    let mut controls = result.continuation_controls;
-                    if !all_continue {
-                        controls.extend_from_slice(branch_controls);
-                    }
-                    if !controls.is_empty() {
-                        continuation_controls
-                            .push(self.ssa.definition_guarded(controls, &condition));
-                    }
-                    continuation_conditions.push(condition);
+            let continues = self
+                .flow_store
+                .contains(result.tree, ProcedureFlow::Continue);
+            if continues {
+                continuation.push(state);
+                let mut controls = result.continuation_controls;
+                if decision_matters {
+                    controls.extend_from_slice(&predicate.controls);
                 }
-                ProcedureFlow::Break => {
-                    has_break = true;
+                controls.sort_unstable();
+                controls.dedup();
+                if !controls.is_empty() {
+                    // `controls` already includes the continuation token from
+                    // the enclosing block. Guard this new token only by the
+                    // choice introduced at this decision; retaining the full
+                    // execution prefix in every sequential token would
+                    // duplicate an N-deep path N times.
+                    let local_condition = condition.relative_to(parent_condition);
+                    continuation_controls
+                        .push(self.ssa.definition_guarded(controls, &local_condition));
                 }
-                ProcedureFlow::Return => {}
+                continuation_conditions.push(condition.clone());
             }
+            arms.push(FlowArm {
+                condition,
+                tree: result.tree,
+            });
         }
+        let tree = self.flow_store.decision(predicate, arms);
         self.ssa.merge(&continuation);
-        if has_continue {
+        if self.flow_store.contains(tree, ProcedureFlow::Continue) {
             self.path_condition = PathCondition::disjoin_all(&continuation_conditions);
             FlowResult {
-                flow: ProcedureFlow::Continue,
+                flow: self.flow_store.aggregate(tree),
                 continuation_controls,
+                tree,
             }
-        } else if has_break {
-            FlowResult::new(ProcedureFlow::Break)
         } else {
-            FlowResult::new(ProcedureFlow::Return)
+            FlowResult {
+                flow: self.flow_store.aggregate(tree),
+                continuation_controls: Vec::new(),
+                tree,
+            }
         }
     }
 
     fn eval_if(&mut self, statement: &IfStatement, controls: &[VersionId]) -> FlowResult {
         let condition = self.eval_expr(&statement.cond);
+        let predicate = FlowPredicate::expression(&statement.cond, &condition);
         let mut nested_controls = controls.to_vec();
         nested_controls.extend_from_slice(&condition);
         match self.constant_truth(&statement.cond) {
@@ -2105,13 +2925,14 @@ impl<'a, 's> ProcedureAnalysis<'a, 's> {
         let false_state = self.ssa.capture_and_rollback(checkpoint);
         let false_condition = self.path_condition.clone();
 
-        self.path_condition = parent_condition;
+        self.path_condition = parent_condition.clone();
         self.merge_branches(
             vec![
                 (true_flow, true_state, true_condition),
                 (false_flow, false_state, false_condition),
             ],
-            &condition,
+            predicate,
+            &parent_condition,
         )
     }
 
@@ -2130,6 +2951,7 @@ impl<'a, 's> ProcedureAnalysis<'a, 's> {
                 }
             }
         }
+        let predicate = FlowPredicate::opaque(std::ptr::from_ref(statement).addr(), &condition);
         let mut nested_controls = controls.to_vec();
         nested_controls.extend_from_slice(&condition);
 
@@ -2183,8 +3005,8 @@ impl<'a, 's> ProcedureAnalysis<'a, 's> {
                 let state = self.ssa.capture_and_rollback(checkpoint);
                 states.push((flow, state, self.path_condition.clone()));
             }
-            self.path_condition = parent_condition;
-            return self.merge_branches(states, &condition);
+            self.path_condition = parent_condition.clone();
+            return self.merge_branches(states, predicate, &parent_condition);
         }
 
         let branch = self.next_branch_id(statement.arms.len() + 1);
@@ -2202,14 +3024,15 @@ impl<'a, 's> ProcedureAnalysis<'a, 's> {
         let flow = self.eval_block(&statement.default, &nested_controls);
         let state = self.ssa.capture_and_rollback(checkpoint);
         states.push((flow, state, self.path_condition.clone()));
-        self.path_condition = parent_condition;
-        self.merge_branches(states, &condition)
+        self.path_condition = parent_condition.clone();
+        self.merge_branches(states, predicate, &parent_condition)
     }
 
     fn eval_for(&mut self, statement: &ForStatement, controls: &[VersionId]) -> FlowResult {
-        let range_controls = self.eval_for_range_controls(&statement.range, controls);
+        let (range_controls, bound_controls) =
+            self.eval_for_range_controls(&statement.range, controls);
         if self.for_range_is_proven_empty(&statement.range) {
-            return FlowResult::new(ProcedureFlow::Continue);
+            return self.simple_flow_result(ProcedureFlow::Continue);
         }
 
         if let Some(iterations) = statement.range.eval_iter(&mut self.ctx) {
@@ -2226,9 +3049,9 @@ impl<'a, 's> ProcedureAnalysis<'a, 's> {
             }
             let may_skip = !self.for_range_is_proven_nonempty(&statement.range);
             self.opaque_kill_keys(keys, may_skip);
-            FlowResult::new(ProcedureFlow::Continue)
+            self.simple_flow_result(ProcedureFlow::Continue)
         } else {
-            self.eval_runtime_for(statement, &range_controls)
+            self.eval_runtime_for(statement, &range_controls, &bound_controls)
         }
     }
 
@@ -2236,15 +3059,21 @@ impl<'a, 's> ProcedureAnalysis<'a, 's> {
         &mut self,
         range: &ForRange,
         controls: &[VersionId],
-    ) -> Vec<VersionId> {
-        let mut range_controls = controls.to_vec();
+    ) -> (Vec<VersionId>, Vec<VersionId>) {
+        let mut bound_controls = Vec::new();
         let (start, end, _) = for_range_bounds(range);
         for bound in [start, end] {
             if let ForBound::Expression(expression) = bound {
-                range_controls.extend(self.eval_expr(expression));
+                bound_controls.extend(self.eval_expr(expression));
             }
         }
-        range_controls
+        bound_controls.sort_unstable();
+        bound_controls.dedup();
+        let mut range_controls = controls.to_vec();
+        range_controls.extend_from_slice(&bound_controls);
+        range_controls.sort_unstable();
+        range_controls.dedup();
+        (range_controls, bound_controls)
     }
 
     fn for_range_is_proven_empty(&mut self, range: &ForRange) -> bool {
@@ -2302,41 +3131,50 @@ impl<'a, 's> ProcedureAnalysis<'a, 's> {
             checkpoint,
             breaks: Vec::new(),
         });
-        let mut flow = ProcedureFlow::Continue;
+        let mut iteration_trees = Vec::with_capacity(iterations.len());
         let mut iteration_controls = range_controls.to_vec();
         for value in iterations {
             self.set_known_iterator_value(statement, value);
             let result = self.eval_block(&statement.body, &iteration_controls);
-            flow = result.flow;
-            if flow != ProcedureFlow::Continue {
-                break;
-            }
+            iteration_trees.push(result.tree);
             for control in result.continuation_controls {
                 if !iteration_controls.contains(&control) {
                     iteration_controls.push(control);
                 }
             }
+            if !self
+                .flow_store
+                .contains(result.tree, ProcedureFlow::Continue)
+            {
+                break;
+            }
+        }
+        let mut tree = self.flow_store.outcome(ProcedureFlow::Continue);
+        for iteration in iteration_trees.into_iter().rev() {
+            tree = self.flow_store.bind(iteration, tree);
         }
         let mut loop_flow = self.loop_flows.pop().expect("loop flow was pushed above");
         let fallthrough = self.ssa.capture_and_rollback(checkpoint);
-        if flow == ProcedureFlow::Continue {
+        if self.flow_store.contains(tree, ProcedureFlow::Continue) {
             loop_flow.breaks.push(FlowState {
                 state: fallthrough,
                 condition: self.path_condition.clone(),
             });
         }
-        if loop_flow.breaks.is_empty() {
+        let tree = self.flow_store.leave_loop(tree);
+        if !self.flow_store.contains(tree, ProcedureFlow::Continue) {
             self.path_condition = parent_condition;
-            return FlowResult::new(ProcedureFlow::Return);
+            return self.flow_result_from_tree(tree);
         }
         self.merge_flow_states(&loop_flow.breaks);
-        FlowResult::new(ProcedureFlow::Continue)
+        self.flow_result_from_tree(tree)
     }
 
     fn eval_runtime_for(
         &mut self,
         statement: &ForStatement,
         range_controls: &[VersionId],
+        bound_controls: &[VersionId],
     ) -> FlowResult {
         // A runtime iterator is not part of a static prefix. Consequently
         // accesses such as x[i], x[i + 1], and x[j] all may address the same
@@ -2353,20 +3191,38 @@ impl<'a, 's> ProcedureAnalysis<'a, 's> {
         let flow = self.eval_block(&statement.body, range_controls);
         let mut loop_flow = self.loop_flows.pop().expect("loop flow was pushed above");
         let body_state = self.ssa.capture_and_rollback(checkpoint);
-        if flow.flow == ProcedureFlow::Continue {
+        if self.flow_store.contains(flow.tree, ProcedureFlow::Continue) {
             loop_flow.breaks.push(FlowState {
                 state: body_state,
                 condition: self.path_condition.clone(),
             });
         }
-        self.path_condition = parent_condition;
+        self.path_condition = parent_condition.clone();
         // Break and fallthrough paths jointly describe one abstract
         // iteration. Close that finite transfer instead of re-evaluating the
         // body or enumerating runtime iterator values.
         let transfer = self.merge_flow_state_bindings(&loop_flow.breaks);
         self.ssa
             .close_repeated_transfer(&transfer, checkpoint, may_execute_zero_times);
-        FlowResult::new(ProcedureFlow::Continue)
+        let mut tree = self.flow_store.leave_loop(flow.tree);
+        if may_execute_zero_times {
+            let branch = self.next_branch_id(2);
+            let zero = self.flow_store.outcome(ProcedureFlow::Continue);
+            tree = self.flow_store.decision(
+                FlowPredicate::opaque(std::ptr::from_ref(statement).addr(), bound_controls),
+                vec![
+                    FlowArm {
+                        condition: parent_condition.with_choice(branch, 0),
+                        tree: zero,
+                    },
+                    FlowArm {
+                        condition: parent_condition.with_choice(branch, 1),
+                        tree,
+                    },
+                ],
+            );
+        }
+        self.flow_result_from_tree(tree)
     }
 
     fn merge_flow_state_bindings(&mut self, states: &[FlowState]) -> BranchState<SsaKey> {
@@ -2389,6 +3245,177 @@ impl<'a, 's> ProcedureAnalysis<'a, 's> {
             context_width,
             &ProjectionContext::default(),
         )
+    }
+
+    fn packed_projection_layout(
+        &mut self,
+        expression: &Expression,
+        parts: &[(Expression, Option<Expression>)],
+    ) -> Option<PackedProjectionLayout> {
+        let key = std::ptr::from_ref(expression);
+        if let Some(layout) = self
+            .call_caches
+            .last()
+            .and_then(Option::as_ref)
+            .and_then(|cache| cache.packed_layouts.get(&key))
+            .cloned()
+        {
+            return Some(layout);
+        }
+
+        let mut output_start = 0usize;
+        let mut fragments = Vec::with_capacity(parts.len());
+        let mut controls = Vec::new();
+        for (part_index, (part, repeat)) in parts.iter().enumerate().rev() {
+            let item_width = part.comptime().r#type.total_width()?;
+            let repeat_count = if let Some(repeat) = repeat {
+                let count = repeat
+                    .eval_value(&mut self.ctx)
+                    .and_then(|value| value.to_usize())?;
+                controls.extend(self.eval_expr_inner(repeat, true));
+                count
+            } else {
+                1
+            };
+            fragments.push(PackedProjectionFragment {
+                part: part_index,
+                output_start,
+                item_width,
+                repeat: repeat_count,
+            });
+            output_start = item_width
+                .checked_mul(repeat_count)?
+                .checked_add(output_start)?;
+        }
+        controls.sort_unstable();
+        controls.dedup();
+        let layout = PackedProjectionLayout {
+            fragments,
+            controls,
+        };
+        if let Some(Some(cache)) = self.call_caches.last_mut() {
+            cache.packed_layouts.insert(key, layout.clone());
+        }
+        Some(layout)
+    }
+
+    fn array_projection_layout(
+        &mut self,
+        expression: &Expression,
+        items: &[ArrayLiteralItem],
+    ) -> Option<ArrayProjectionLayout> {
+        let key = std::ptr::from_ref(expression);
+        if let Some(layout) = self
+            .call_caches
+            .last()
+            .and_then(Option::as_ref)
+            .and_then(|cache| cache.array_layouts.get(&key))
+            .cloned()
+        {
+            return Some(layout);
+        }
+
+        let total = self.expression_array_extent(expression)?;
+        let mut output_start = 0usize;
+        let mut fragments = Vec::with_capacity(items.len());
+        let mut controls = Vec::new();
+        let mut default = None;
+        for (item_index, item) in items.iter().enumerate() {
+            let ArrayLiteralItem::Value(value, repeat) = item else {
+                default = Some(item_index);
+                continue;
+            };
+            let item_length = self.expression_array_extent(value)?;
+            if item_length == 0 {
+                return None;
+            }
+            let repeat_count = if let Some(repeat) = repeat {
+                let count = repeat
+                    .eval_value(&mut self.ctx)
+                    .and_then(|value| value.to_usize())?;
+                controls.extend(self.eval_expr_inner(repeat, true));
+                count
+            } else {
+                1
+            };
+            let output_length = item_length.checked_mul(repeat_count)?;
+            fragments.push(ArrayProjectionFragment {
+                item: item_index,
+                output_start,
+                item_length,
+                repeat: repeat_count,
+                output_length,
+            });
+            output_start = output_start.checked_add(output_length)?;
+        }
+        if let Some(item) = default
+            && output_start < total
+        {
+            let ArrayLiteralItem::Defaul(value) = &items[item] else {
+                unreachable!("default index was collected from a default item")
+            };
+            let item_length = self.expression_array_extent(value)?;
+            if item_length == 0 {
+                return None;
+            }
+            let output_length = total - output_start;
+            fragments.push(ArrayProjectionFragment {
+                item,
+                output_start,
+                item_length,
+                repeat: output_length.div_ceil(item_length),
+                output_length,
+            });
+        }
+        controls.sort_unstable();
+        controls.dedup();
+        let layout = ArrayProjectionLayout {
+            fragments,
+            controls,
+            total,
+        };
+        if let Some(Some(cache)) = self.call_caches.last_mut() {
+            cache.array_layouts.insert(key, layout.clone());
+        }
+        Some(layout)
+    }
+
+    fn struct_projection_layout(
+        &mut self,
+        expression: &Expression,
+        r#type: &crate::ir::Type,
+        fields: &[(veryl_parser::resource_table::StrId, Expression)],
+    ) -> Option<PackedProjectionLayout> {
+        let key = std::ptr::from_ref(expression);
+        if let Some(layout) = self
+            .call_caches
+            .last()
+            .and_then(Option::as_ref)
+            .and_then(|cache| cache.struct_layouts.get(&key))
+            .cloned()
+        {
+            return Some(layout);
+        }
+        let mut output_start = 0usize;
+        let mut fragments = Vec::with_capacity(fields.len());
+        for (field, (name, _)) in fields.iter().enumerate().rev() {
+            let item_width = r#type.get_member_type(*name)?.total_width()?;
+            fragments.push(PackedProjectionFragment {
+                part: field,
+                output_start,
+                item_width,
+                repeat: 1,
+            });
+            output_start = output_start.checked_add(item_width)?;
+        }
+        let layout = PackedProjectionLayout {
+            fragments,
+            controls: Vec::new(),
+        };
+        if let Some(Some(cache)) = self.call_caches.last_mut() {
+            cache.struct_layouts.insert(key, layout.clone());
+        }
+        Some(layout)
     }
 
     fn eval_expr_requested_in(
@@ -2465,13 +3492,33 @@ impl<'a, 's> ProcedureAnalysis<'a, 's> {
         match expression {
             Expression::Term(factor) => match factor.as_ref() {
                 Factor::Variable(id, index, select, comptime) => {
-                    let mut selector_sources = Vec::new();
-                    for expression in index.0.iter().chain(select.0.iter()) {
-                        selector_sources.extend(self.eval_expr(expression));
+                    let frozen = self
+                        .call_caches
+                        .last()
+                        .and_then(Option::as_ref)
+                        .and_then(|cache| {
+                            cache
+                                .variable_reads
+                                .get(&std::ptr::from_ref(factor.as_ref()))
+                        })
+                        .cloned();
+                    if self.projection_only && frozen.is_none() {
+                        self.status = self.status.max(AnalysisStatus::Partial);
+                        return ExpressionSources::default();
                     }
-                    if let Some((_, expression)) = &select.1 {
-                        selector_sources.extend(self.eval_expr(expression));
-                    }
+                    let mut selector_sources = frozen
+                        .as_ref()
+                        .map(|frozen| frozen.selectors.clone())
+                        .unwrap_or_else(|| {
+                            let mut selectors = Vec::new();
+                            for expression in index.0.iter().chain(select.0.iter()) {
+                                selectors.extend(self.eval_expr(expression));
+                            }
+                            if let Some((_, expression)) = &select.1 {
+                                selectors.extend(self.eval_expr(expression));
+                            }
+                            selectors
+                        });
                     let variable = self.ctx.variables.get(id).cloned();
                     let selected = if select.is_const_with_range() {
                         variable.as_ref().and_then(|variable| {
@@ -2529,7 +3576,13 @@ impl<'a, 's> ProcedureAnalysis<'a, 's> {
                                         source_array,
                                         source_span,
                                     ) {
-                                        reads.push(self.read_key(key));
+                                        if let Some(frozen) = &frozen {
+                                            if let Some(version) = frozen.version(key) {
+                                                reads.push(version);
+                                            }
+                                        } else {
+                                            reads.push(self.read_key(key));
+                                        }
                                     }
                                 }
                             }
@@ -2569,12 +3622,17 @@ impl<'a, 's> ProcedureAnalysis<'a, 's> {
                             ExpressionSources::whole(selector_sources)
                         }
                     } else {
-                        selector_sources.extend(self.read_variable(
-                            *id,
-                            index,
-                            select,
-                            comptime.member_select_domain,
-                        ));
+                        if let Some(frozen) = &frozen {
+                            selector_sources
+                                .extend(frozen.versions.iter().map(|(_, version)| *version));
+                        } else {
+                            selector_sources.extend(self.read_variable(
+                                *id,
+                                index,
+                                select,
+                                comptime.member_select_domain,
+                            ));
+                        }
                         ExpressionSources::whole(selector_sources)
                     }
                 }
@@ -2794,30 +3852,27 @@ impl<'a, 's> ProcedureAnalysis<'a, 's> {
                 reads
             }
             Expression::Concatenation(parts, _) => {
-                let mut low = 0usize;
+                let Some(layout) = self.packed_projection_layout(expression, parts) else {
+                    return ExpressionSources::whole(self.eval_expr(expression));
+                };
                 let mut reads = ExpressionSources::default();
-                for (part, repeat) in parts.iter().rev() {
-                    let Some(width) = part.comptime().r#type.total_width() else {
-                        return ExpressionSources::whole(self.eval_expr(expression));
-                    };
-                    let count = if let Some(repeat) = repeat {
-                        let Some(count) = repeat
-                            .eval_value(&mut self.ctx)
-                            .and_then(|value| value.to_usize())
-                        else {
-                            return ExpressionSources::whole(self.eval_expr(expression));
-                        };
-                        reads.extend_whole(self.eval_expr_inner(repeat, false));
-                        count
-                    } else {
-                        1
-                    };
+                reads.extend_whole(layout.controls);
+                let first = layout.fragments.partition_point(|fragment| {
+                    fragment
+                        .output_end()
+                        .is_some_and(|end| end <= requested.start)
+                });
+                for fragment in &layout.fragments[first..] {
+                    if fragment.output_start >= requested.end() {
+                        break;
+                    }
+                    let part = &parts[fragment.part].0;
                     match project_repeated_span(
                         requested.start,
                         requested.length,
-                        low,
-                        width,
-                        count,
+                        fragment.output_start,
+                        fragment.item_width,
+                        fragment.repeat,
                     ) {
                         RepeatedProjection::Empty => {}
                         RepeatedProjection::Exact { first, second } => {
@@ -2845,19 +3900,21 @@ impl<'a, 's> ProcedureAnalysis<'a, 's> {
                             }
                         }
                         RepeatedProjection::Periodic => {
-                            let Some(local) = PackedSpan::whole(width) else {
+                            let Some(local) = PackedSpan::whole(fragment.item_width) else {
                                 reads.extend_whole(self.eval_expr(part));
                                 continue;
                             };
                             let part =
                                 self.eval_expr_bits_in(part, requested_array, local, projection);
-                            if let Some(output_length) = width.checked_mul(count) {
+                            if let Some(output_length) =
+                                fragment.item_width.checked_mul(fragment.repeat)
+                            {
                                 let part = self.regular_packed_repeat(
                                     part,
                                     requested_array,
-                                    low,
+                                    fragment.output_start,
                                     output_length,
-                                    width,
+                                    fragment.item_width,
                                 );
                                 reads.extend(part);
                             } else {
@@ -2867,13 +3924,6 @@ impl<'a, 's> ProcedureAnalysis<'a, 's> {
                             }
                         }
                     }
-                    let Some(part_width) = width.checked_mul(count) else {
-                        return ExpressionSources::whole(self.eval_expr(expression));
-                    };
-                    let Some(next) = low.checked_add(part_width) else {
-                        return ExpressionSources::whole(self.eval_expr(expression));
-                    };
-                    low = next;
                 }
                 reads
             }
@@ -2881,6 +3931,89 @@ impl<'a, 's> ProcedureAnalysis<'a, 's> {
                 let Some(requested_end) = requested_array.end() else {
                     return ExpressionSources::whole(self.eval_expr(expression));
                 };
+                if let Some(layout) = self.array_projection_layout(expression, items)
+                    && requested_end <= layout.total
+                {
+                    let mut reads = ExpressionSources::default();
+                    reads.extend_whole(layout.controls);
+                    let first = layout.fragments.partition_point(|fragment| {
+                        fragment
+                            .output_end()
+                            .is_some_and(|end| end <= requested_array.start)
+                    });
+                    for fragment in &layout.fragments[first..] {
+                        if fragment.output_start >= requested_end {
+                            break;
+                        }
+                        let value = match &items[fragment.item] {
+                            ArrayLiteralItem::Value(value, _) | ArrayLiteralItem::Defaul(value) => {
+                                value
+                            }
+                        };
+                        match project_repeated_span(
+                            requested_array.start,
+                            requested_array.length,
+                            fragment.output_start,
+                            fragment.item_length,
+                            fragment.repeat,
+                        ) {
+                            RepeatedProjection::Empty => {}
+                            RepeatedProjection::Exact { first, second } => {
+                                for projected in [Some(first), second].into_iter().flatten() {
+                                    let mut item = self.eval_expr_requested_in(
+                                        value,
+                                        ArraySpan {
+                                            start: projected.local_start,
+                                            length: projected.length,
+                                        },
+                                        requested,
+                                        value
+                                            .comptime()
+                                            .r#type
+                                            .total_width()
+                                            .unwrap_or(requested.length),
+                                        projection,
+                                    );
+                                    if let Ok(output_start) =
+                                        isize::try_from(projected.output_start)
+                                    {
+                                        item.translate(PositionRelation {
+                                            array: Some(output_start),
+                                            packed: Some(0),
+                                        });
+                                    } else {
+                                        item.widen_all();
+                                    }
+                                    reads.extend(item);
+                                }
+                            }
+                            RepeatedProjection::Periodic => {
+                                let item = self.eval_expr_requested_in(
+                                    value,
+                                    ArraySpan {
+                                        start: 0,
+                                        length: fragment.item_length,
+                                    },
+                                    requested,
+                                    value
+                                        .comptime()
+                                        .r#type
+                                        .total_width()
+                                        .unwrap_or(requested.length),
+                                    projection,
+                                );
+                                reads.extend(self.regular_array_repeat(
+                                    item,
+                                    requested,
+                                    fragment.output_start,
+                                    fragment.output_length,
+                                    fragment.item_length,
+                                ));
+                            }
+                        }
+                    }
+                    return reads;
+                }
                 let total = self
                     .expression_array_extent(expression)
                     .unwrap_or(1)
@@ -3062,6 +4195,48 @@ impl<'a, 's> ProcedureAnalysis<'a, 's> {
                 reads
             }
             Expression::StructConstructor(r#type, fields, _) => {
+                if let Some(layout) = self.struct_projection_layout(expression, r#type, fields) {
+                    let mut reads = ExpressionSources::default();
+                    let first = layout.fragments.partition_point(|fragment| {
+                        fragment
+                            .output_end()
+                            .is_some_and(|end| end <= requested.start)
+                    });
+                    for fragment in &layout.fragments[first..] {
+                        if fragment.output_start >= requested.end() {
+                            break;
+                        }
+                        let Some(window) =
+                            PackedSpan::new(fragment.output_start, fragment.item_width)
+                        else {
+                            continue;
+                        };
+                        let Some(local) = requested
+                            .intersection(window)
+                            .and_then(|span| span.translated(fragment.output_start, 0))
+                        else {
+                            continue;
+                        };
+                        let value = &fields[fragment.part].1;
+                        let mut field = self.eval_expr_requested_in(
+                            value,
+                            requested_array,
+                            local,
+                            fragment.item_width,
+                            projection,
+                        );
+                        if let Ok(output_start) = isize::try_from(fragment.output_start) {
+                            field.translate(PositionRelation {
+                                array: Some(0),
+                                packed: Some(output_start),
+                            });
+                        } else {
+                            field.widen_all();
+                        }
+                        reads.extend(field);
+                    }
+                    return reads;
+                }
                 let mut low = 0usize;
                 let mut reads = ExpressionSources::default();
                 for (name, value) in fields.iter().rev() {
@@ -3279,13 +4454,47 @@ impl<'a, 's> ProcedureAnalysis<'a, 's> {
     fn eval_factor(&mut self, factor: &Factor, reads: &mut Vec<VersionId>) {
         match factor {
             Factor::Variable(id, index, select, comptime) => {
+                if let Some(frozen) = self
+                    .call_caches
+                    .last()
+                    .and_then(Option::as_ref)
+                    .and_then(|cache| cache.variable_reads.get(&std::ptr::from_ref(factor)))
+                    .cloned()
+                {
+                    reads.extend(frozen.selectors);
+                    reads.extend(frozen.versions.into_iter().map(|(_, version)| version));
+                    return;
+                }
+                if self.projection_only {
+                    self.status = self.status.max(AnalysisStatus::Partial);
+                    return;
+                }
+                let mut selectors = Vec::new();
                 for expression in index.0.iter().chain(select.0.iter()) {
-                    reads.extend(self.eval_expr(expression));
+                    selectors.extend(self.eval_expr(expression));
                 }
                 if let Some((_, expression)) = &select.1 {
-                    reads.extend(self.eval_expr(expression));
+                    selectors.extend(self.eval_expr(expression));
                 }
-                reads.extend(self.read_variable(*id, index, select, comptime.member_select_domain));
+                selectors.sort_unstable();
+                selectors.dedup();
+                reads.extend(selectors.iter().copied());
+
+                let versions = self
+                    .read_keys(*id, index, select, comptime.member_select_domain)
+                    .into_iter()
+                    .map(|key| (key, self.read_key(key)))
+                    .collect::<Vec<_>>();
+                reads.extend(versions.iter().map(|(_, version)| *version));
+                if let Some(Some(cache)) = self.call_caches.last_mut() {
+                    cache.variable_reads.insert(
+                        std::ptr::from_ref(factor),
+                        FrozenVariableRead {
+                            selectors,
+                            versions,
+                        },
+                    );
+                }
             }
             Factor::FunctionCall(call) => reads.extend(self.eval_call(call, &[])),
             Factor::SystemFunctionCall(call) => {
@@ -3328,6 +4537,15 @@ impl<'a, 's> ProcedureAnalysis<'a, 's> {
             #[cfg(test)]
             FUNCTION_RESULT_VERSIONS.set(FUNCTION_RESULT_VERSIONS.get() + result.len());
             return result;
+        }
+
+        // Region projection is a pure query over the ordered evaluation
+        // trace. Every reachable caller-side invocation was cached by that
+        // evaluation; a miss therefore cannot be repaired by executing a call
+        // here without duplicating or inventing procedural effects.
+        if self.projection_only {
+            self.status = self.status.max(AnalysisStatus::Partial);
+            return Vec::new();
         }
 
         // The enclosing expression may need only this call's effects, but the
@@ -3535,7 +4753,7 @@ impl<'a, 's> ProcedureAnalysis<'a, 's> {
                 actual_bindings.insert(key, sources.sources);
             }
         }
-        let branch_map = self.instantiate_summary_branches(summary);
+        let branch_map = self.instantiate_summary_branches(call, summary);
         let branch_remapper = SsaStore::<SsaKey>::branch_remapper(branch_map);
         let mut bindings = HashMap::default();
         for node in &summary.graph.nodes {
@@ -3651,14 +4869,33 @@ impl<'a, 's> ProcedureAnalysis<'a, 's> {
 
     fn instantiate_summary_branches(
         &mut self,
+        call: &FunctionCall,
         summary: &FunctionSummary,
     ) -> HashMap<BranchId, BranchId> {
         let branches =
             PathCondition::collect_branches(summary.graph.edges.iter().map(|edge| &edge.condition));
-        branches
-            .into_iter()
-            .map(|branch| (branch, self.next_branch_id(branch.arms())))
-            .collect()
+        if let Some(&call) = self.top_expression_calls.get(&std::ptr::from_ref(call)) {
+            branches
+                .into_iter()
+                .enumerate()
+                .map(|(local, branch)| {
+                    (
+                        branch,
+                        BranchId::expression_call(
+                            self.branch_namespace,
+                            call,
+                            local,
+                            branch.arms(),
+                        ),
+                    )
+                })
+                .collect()
+        } else {
+            branches
+                .into_iter()
+                .map(|branch| (branch, self.next_branch_id(branch.arms())))
+                .collect()
+        }
     }
 
     fn keys_for_id(&self, id: VarId) -> Vec<NodeKey> {
@@ -3911,6 +5148,21 @@ impl<'a, 's> ProcedureAnalysis<'a, 's> {
         controls: &[VersionId],
         _value_position: bool,
     ) -> Vec<VersionId> {
+        if self.projection_only {
+            return match &call.kind {
+                SystemFunctionKind::Onehot(input)
+                | SystemFunctionKind::Signed(input)
+                | SystemFunctionKind::Unsigned(input) => self.eval_expr(&input.0),
+                SystemFunctionKind::Bits(_)
+                | SystemFunctionKind::Size(_)
+                | SystemFunctionKind::Clog2(_)
+                | SystemFunctionKind::Readmemh(_, _)
+                | SystemFunctionKind::Display(_)
+                | SystemFunctionKind::Write(_)
+                | SystemFunctionKind::Assert { .. }
+                | SystemFunctionKind::Finish => Vec::new(),
+            };
+        }
         match &call.kind {
             SystemFunctionKind::Bits(_)
             | SystemFunctionKind::Size(_)

@@ -26,6 +26,11 @@ pub(crate) use procedure::{
     function_summary_graph_node_count, module_context_entries, reset_function_evaluation_count,
     reset_module_context_entries,
 };
+#[cfg(test)]
+pub(crate) use ssa::{
+    flow_scaling_counters, reset_flow_scaling_counters, reset_source_summary_state_visits,
+    source_summary_state_visits,
+};
 
 use graph::{
     DependencyGraph, GraphDependency, GraphNode, add_dependency_edge, add_region_dependency,

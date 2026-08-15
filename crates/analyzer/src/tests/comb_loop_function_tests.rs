@@ -1,5 +1,114 @@
 use super::*;
 
+fn ordered_function_actual_code(actual: &str) -> String {
+    format!(
+        r#"
+        module Identity (i: input logic, o: output logic) {{
+            assign o = i;
+        }}
+        module Top (independent: input logic, o: output logic) {{
+            var x       : logic;
+            var feedback: logic;
+            function set_x (value: input logic) -> logic {{
+                x = value;
+                return 0;
+            }}
+            function middle (value: input logic<3>) -> logic {{
+                return value[1];
+            }}
+            inst identity: Identity (
+                i: middle({actual}),
+                o: feedback,
+            );
+            assign o = feedback;
+        }}
+        "#
+    )
+}
+
+#[test]
+fn function_actual_projection_reads_the_version_at_each_syntax_occurrence() {
+    assert_comb_loop(
+        "a middle actual read sees the write that precedes that occurrence",
+        &ordered_function_actual_code("{set_x(feedback), x, set_x(independent)}"),
+        true,
+    );
+}
+
+#[test]
+fn following_function_actual_effect_does_not_retroactively_taint_a_read() {
+    assert_comb_loop(
+        "a write after a middle actual read cannot alter the captured value",
+        &ordered_function_actual_code("{set_x(independent), x, set_x(feedback)}"),
+        false,
+    );
+}
+
+#[test]
+fn sequential_early_return_paths_remain_persistent() {
+    const STATEMENTS: usize = 512;
+    let statements = (0..STATEMENTS)
+        .map(|index| format!("if conditions[{index}] {{ return 0; }}\n"))
+        .collect::<String>();
+    let code = format!(
+        r#"
+        module Top (conditions: input logic<{STATEMENTS}>, o: output logic) {{
+            function update () -> logic {{
+                {statements}
+                return 0;
+            }}
+            assign o = update();
+        }}
+        "#
+    );
+    crate::comb_loop_detect::reset_flow_scaling_counters();
+    let errors = analyze(&code);
+    assert!(errors.is_empty(), "{errors:#?}");
+    let (materialized_constraints, snapshot_keys, revision_events, revision_inputs) =
+        crate::comb_loop_detect::flow_scaling_counters();
+    assert_eq!(materialized_constraints, 0);
+    assert_eq!(snapshot_keys, 0);
+    assert!(revision_events <= 4 * STATEMENTS + 4, "{revision_events}");
+    assert!(revision_inputs <= STATEMENTS + 2, "{revision_inputs}");
+}
+
+#[test]
+fn cumulative_unique_writes_and_early_returns_are_aggregated_linearly() {
+    const STATEMENTS: usize = 512;
+    let declarations = (0..STATEMENTS)
+        .map(|index| format!("var value_{index}: logic;\n"))
+        .collect::<String>();
+    let statements = (0..STATEMENTS)
+        .map(|index| format!("value_{index} = 0;\nif conditions[{index}] {{ return 0; }}\n"))
+        .collect::<String>();
+    let code = format!(
+        r#"
+        module Top (conditions: input logic<{STATEMENTS}>, o: output logic) {{
+            function update () -> logic {{
+                {declarations}
+                {statements}
+                return 0;
+            }}
+            assign o = update();
+        }}
+        "#
+    );
+    crate::comb_loop_detect::reset_flow_scaling_counters();
+    crate::comb_loop_detect::reset_source_summary_state_visits();
+    let errors = analyze(&code);
+    assert!(errors.is_empty(), "{errors:#?}");
+    let (materialized_constraints, snapshot_keys, revision_events, revision_inputs) =
+        crate::comb_loop_detect::flow_scaling_counters();
+    assert_eq!(materialized_constraints, 0);
+    assert_eq!(snapshot_keys, 0);
+    assert!(revision_events <= 6 * STATEMENTS + 4, "{revision_events}");
+    assert!(revision_inputs <= 4 * STATEMENTS + 2, "{revision_inputs}");
+    assert!(
+        crate::comb_loop_detect::source_summary_state_visits() <= 4 * STATEMENTS,
+        "function-local state must not expand the externally visible summary"
+    );
+}
+
 #[test]
 fn comb_loop_false_negative_early_return_controls_a_later_captured_write() {
     // update(stop) leaves value at zero on the return path and writes one on
@@ -61,6 +170,170 @@ fn comb_loop_condition_with_two_continuing_function_arms_does_not_control_later_
             assign condition = value;
             always_comb {
                 o = update(condition);
+            }
+        }
+        "#,
+        false,
+    );
+}
+
+#[test]
+fn comb_loop_nested_early_return_controls_a_later_captured_write() {
+    assert_comb_loop(
+        "an outer condition controls whether a nested early return reaches a later write",
+        r#"
+        module Top (
+            b: input  logic,
+            o: output logic,
+        ) {
+            var a    : logic;
+            var value: logic;
+            var dummy: logic;
+            function update (ca: input logic, cb: input logic) -> logic {
+                value = 0;
+                if ca {
+                    if cb {
+                        return 0;
+                    }
+                }
+                value = 1;
+                return 0;
+            }
+            assign a = value;
+            always_comb {
+                dummy = update(a, b);
+                o = value | dummy;
+            }
+        }
+        "#,
+        true,
+    );
+}
+
+#[test]
+fn comb_loop_nested_complementary_returns_preserve_outer_control() {
+    assert_comb_loop(
+        "complementary nested exits must not make the outer condition disappear",
+        r#"
+        module Top (
+            b: input  logic,
+            o: output logic,
+        ) {
+            var a    : logic;
+            var value: logic;
+            var dummy: logic;
+            function update (ca: input logic, cb: input logic) -> logic {
+                value = 0;
+                if ca {
+                    if cb {
+                        return 0;
+                    }
+                } else {
+                    if !cb {
+                        return 0;
+                    }
+                }
+                value = 1;
+                return 0;
+            }
+            assign a = value;
+            always_comb {
+                dummy = update(a, b);
+                o = value | dummy;
+            }
+        }
+        "#,
+        true,
+    );
+}
+
+#[test]
+fn comb_loop_identical_nested_returns_do_not_create_outer_control() {
+    assert_comb_loop(
+        "identical nested exits in both arms do not depend on the outer condition",
+        r#"
+        module Top (
+            b: input  logic,
+            o: output logic,
+        ) {
+            var a    : logic;
+            var value: logic;
+            var dummy: logic;
+            function update (ca: input logic, cb: input logic) -> logic {
+                value = 0;
+                if ca {
+                    if cb {
+                        return 0;
+                    }
+                } else {
+                    if cb {
+                        return 0;
+                    }
+                }
+                value = 1;
+                return 0;
+            }
+            assign a = value;
+            always_comb {
+                dummy = update(a, b);
+                o = value | dummy;
+            }
+        }
+        "#,
+        false,
+    );
+}
+
+#[test]
+fn comb_loop_runtime_for_return_controls_a_later_captured_write() {
+    assert_comb_loop(
+        "a runtime loop bound controls whether an early return reaches a later write",
+        r#"
+        module Top (o: output logic) {
+            var n    : u32;
+            var value: logic;
+            var dummy: logic;
+            function update () -> logic {
+                value = 0;
+                for _index in 0..n {
+                    return 0;
+                }
+                value = 1;
+                return 0;
+            }
+            assign n = value as u32;
+            always_comb {
+                dummy = update();
+                o = value | dummy;
+            }
+        }
+        "#,
+        true,
+    );
+}
+
+#[test]
+fn comb_loop_break_and_fallthrough_do_not_control_after_loop_write() {
+    assert_comb_loop(
+        "break and body fallthrough reach the same statement after the loop",
+        r#"
+        module Top (o: output logic) {
+            var select: logic;
+            var value : logic;
+            var dummy : logic;
+            function update (condition: input logic) -> logic {
+                for _index in 0..1 {
+                    if condition {
+                        break;
+                    }
+                }
+                value = 1;
+                return 0;
+            }
+            assign select = value;
+            always_comb {
+                dummy = update(select);
+                o = value | dummy;
             }
         }
         "#,
