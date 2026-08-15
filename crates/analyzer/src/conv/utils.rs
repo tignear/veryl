@@ -3486,10 +3486,7 @@ fn resolve_array_value(
             }
             // Constant-indexed sub-array reference, e.g. `XS[0]` selecting a row
             // of a 2-D source into a 1-D parameter.
-            if !index.is_const() {
-                return None;
-            }
-            let idx = index.eval_value(context)?;
+            let idx = index.numeric_const_value()?;
             let var = context.variables.get(id)?;
             let shape = &var.r#type.array;
             // calc_range/calc_index don't bounds-check, so an out-of-range index
@@ -4142,13 +4139,10 @@ pub fn function_call(
     let path: VarPathSelect = Conv::conv(context, path)?;
     let (mut base_path, select, _) = path.into();
     let receiver_index = select.to_index();
-    // `VarIndex::eval_value` retains its legacy X/Z-to-zero behavior. Do not
-    // let a runtime receiver become the static summary-cache key for index 0:
-    // summaries of different call sites would then reuse the first selector.
-    let index = receiver_index
-        .is_const()
-        .then(|| receiver_index.eval_value(context))
-        .flatten();
+    // `VarIndex::eval_value` retains its legacy X/Z-to-zero behavior. Only a
+    // fully numeric constant receiver is a valid static summary-cache key:
+    // X/Z and runtime receivers must remain call-site-specific.
+    let index = receiver_index.numeric_const_value();
 
     // remove function name
     base_path.pop();

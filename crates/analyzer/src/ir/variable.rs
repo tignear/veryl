@@ -530,6 +530,17 @@ impl VarIndex {
         ret
     }
 
+    /// Return a static array coordinate only when every component is a fully
+    /// known numeric constant. In particular, an X/Z constant is not element
+    /// zero and must stay on the conservative dynamic path.
+    pub(crate) fn numeric_const_value(&self) -> Option<Vec<usize>> {
+        self.is_const().then_some(())?;
+        self.0
+            .iter()
+            .map(|expression| expression.comptime().get_value().ok()?.to_usize())
+            .collect()
+    }
+
     pub fn eval_value(&self, context: &mut Context) -> Option<Vec<usize>> {
         let mut ret = vec![];
         for x in &self.0 {
@@ -1585,6 +1596,18 @@ mod tests {
         assert!(variable.get_value(&[0, 2]).is_none());
         assert!(variable.get_value(&[2, 0]).is_none());
         assert!(!variable.set_value(&[2, 0], Value::new(1, 1, false), None));
+    }
+
+    #[test]
+    fn x_index_is_not_a_numeric_static_coordinate() {
+        let token = TokenRange::default();
+        let index = VarIndex(vec![Expression::create_value(
+            Value::new_x(2, false),
+            token,
+        )]);
+
+        assert!(index.is_const());
+        assert_eq!(index.numeric_const_value(), None);
     }
 
     #[test]

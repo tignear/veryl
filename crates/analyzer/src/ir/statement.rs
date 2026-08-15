@@ -911,13 +911,10 @@ fn compute_assign_target(
     // would make a same-block self-read look comb-safe and let `ff_opt` demote
     // a real register. Keep it dynamic instead.
     let target_const = dst.index.is_const() && dst.select.is_const();
-    let arr_idx = if target_const {
-        dst.index
-            .eval_value(context)
-            .and_then(|v| var_info.r#type.array.calc_index(&v))
-    } else {
-        None
-    };
+    let arr_idx = target_const
+        .then(|| dst.index.numeric_const_value())
+        .flatten()
+        .and_then(|v| var_info.r#type.array.calc_index(&v));
     let mask = PackedMask::from_range(dst.select.conservative_packed_range(
         context,
         &var_info.r#type,

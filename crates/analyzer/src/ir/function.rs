@@ -172,11 +172,7 @@ impl Function {
             }
             return self.functions.first().cloned();
         }
-        let concrete = index
-            .0
-            .iter()
-            .map(|expression| expression.comptime().get_value().ok()?.to_usize())
-            .collect::<Option<Vec<_>>>();
+        let concrete = index.numeric_const_value();
         if concrete
             .as_deref()
             .is_some_and(|index| !self.contains_receiver_index(index))
@@ -469,14 +465,8 @@ impl FunctionCall {
                 receiver_valid = false;
             }
         }
-        self.index = (receiver_valid && self.receiver_index.is_const())
-            .then(|| {
-                self.receiver_index
-                    .0
-                    .iter()
-                    .map(|expression| expression.comptime().get_value().ok()?.to_usize())
-                    .collect()
-            })
+        self.index = receiver_valid
+            .then(|| self.receiver_index.numeric_const_value())
             .flatten();
         for x in self.inputs.values_mut() {
             x.set_index_with_receiver(index, receiver_prefixes);
