@@ -2,9 +2,10 @@ use crate::analyzer_error::{AnalyzerError, ExceedLimitKind};
 use crate::conv::conv_profiler::{ConvProfile, ConvProfileGuard};
 use crate::conv::instance::{InstanceHistory, InstanceHistoryError};
 use crate::ir::{
-    Component, Comptime, Declaration, Expression, FfClock, FfReset, FuncPath, Function, Interface,
-    IrResult, ShapeRef, Signature, Type, VarId, VarIndex, VarKind, VarPath, VarSelect, Variable,
-    VariableInfo,
+    ArrayLiteralItem, AssignDestination, CasePattern, Component, Comptime, Declaration, Expression,
+    Factor, FfClock, FfReset, ForBound, ForRange, FuncPath, Function, FunctionCall, Interface,
+    IrResult, ShapeRef, Signature, Statement, SystemFunctionCall, SystemFunctionKind, TbMethod,
+    Type, VarId, VarIndex, VarKind, VarPath, VarSelect, Variable, VariableInfo,
 };
 use crate::namespace::Namespace;
 use crate::scope;
@@ -123,6 +124,18 @@ pub struct Context {
     /// Sparse rollback state used by analyses that reuse this otherwise-large
     /// context across independent procedures. Empty during normal conversion.
     analysis_transactions: Vec<AnalysisTransaction>,
+    /// Incrementally maintained root-segment index for local `var_paths`.
+    receiver_path_roots: HashMap<StrId, HashSet<VarPath>>,
+    /// Receiver-relative namespaces cached by receiver path and stripped
+    /// array-rank. Invalidated whenever a local path value can change.
+    receiver_path_cache: HashMap<ReceiverPathCacheKey, Arc<ReceiverVarPaths>>,
+    /// Read-only receiver namespace borrowed by one external method
+    /// conversion. Local declarations in `var_paths` shadow it.
+    receiver_var_paths: Option<Arc<ReceiverVarPaths>>,
+    /// Paths explicitly removed from the shared namespace. This preserves the
+    /// old copied-map behavior: removing a local receiver entry must not reveal
+    /// the immutable backing entry again.
+    hidden_receiver_paths: HashSet<VarPath>,
     hierarchy: Vec<StrId>,
     hierarchical_variables: Vec<Vec<VarPath>>,
     hierarchical_functions: Vec<Vec<FuncPath>>,
@@ -149,7 +162,405 @@ struct AnalysisTransaction {
     errors: Vec<AnalyzerError>,
 }
 
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct ReceiverPathCacheKey {
+    base: VarPath,
+    removed_array_dims: usize,
+}
+
+/// Immutable receiver namespace shared by independently converted methods.
+/// Paths are relative to the method's receiver, exactly as the old copied
+/// `var_paths` entries were.
+struct ReceiverVarPaths {
+    paths: HashMap<VarPath, (VarId, Comptime)>,
+    roots: HashMap<StrId, Vec<VarPath>>,
+    variables: Arc<HashSet<VarId>>,
+}
+
+fn collect_receiver_index_variables(index: &VarIndex, variables: &mut HashSet<VarId>) {
+    for expression in &index.0 {
+        collect_receiver_expression_variables(expression, variables);
+    }
+}
+
+fn collect_receiver_select_variables(select: &VarSelect, variables: &mut HashSet<VarId>) {
+    for expression in &select.0 {
+        collect_receiver_expression_variables(expression, variables);
+    }
+    if let Some((_, expression)) = &select.1 {
+        collect_receiver_expression_variables(expression, variables);
+    }
+}
+
+fn collect_receiver_destination_variables(
+    destination: &AssignDestination,
+    variables: &mut HashSet<VarId>,
+) {
+    variables.insert(destination.id);
+    collect_receiver_index_variables(&destination.index, variables);
+    collect_receiver_select_variables(&destination.select, variables);
+}
+
+fn collect_receiver_function_call_variables(call: &FunctionCall, variables: &mut HashSet<VarId>) {
+    collect_receiver_index_variables(&call.receiver_index, variables);
+    for expression in call.inputs.values() {
+        collect_receiver_expression_variables(expression, variables);
+    }
+    for destinations in call.outputs.values() {
+        for destination in destinations {
+            collect_receiver_destination_variables(destination, variables);
+        }
+    }
+}
+
+fn collect_receiver_system_call_variables(
+    call: &SystemFunctionCall,
+    variables: &mut HashSet<VarId>,
+) {
+    let mut input = |expression: &Expression| {
+        collect_receiver_expression_variables(expression, variables);
+    };
+    match &call.kind {
+        SystemFunctionKind::Bits(value)
+        | SystemFunctionKind::Size(value)
+        | SystemFunctionKind::Clog2(value)
+        | SystemFunctionKind::Onehot(value)
+        | SystemFunctionKind::Signed(value)
+        | SystemFunctionKind::Unsigned(value) => input(&value.0),
+        SystemFunctionKind::Readmemh(value, output) => {
+            input(&value.0);
+            for destination in &output.0 {
+                collect_receiver_destination_variables(destination, variables);
+            }
+        }
+        SystemFunctionKind::Display(values) | SystemFunctionKind::Write(values) => {
+            for value in values {
+                input(&value.0);
+            }
+        }
+        SystemFunctionKind::Assert { cond, args, .. } => {
+            input(&cond.0);
+            for value in args {
+                input(&value.0);
+            }
+        }
+        SystemFunctionKind::Finish => {}
+    }
+}
+
+fn collect_receiver_expression_variables(expression: &Expression, variables: &mut HashSet<VarId>) {
+    match expression {
+        Expression::Term(factor) => match factor.as_ref() {
+            Factor::Variable(id, index, select, _) => {
+                variables.insert(*id);
+                collect_receiver_index_variables(index, variables);
+                collect_receiver_select_variables(select, variables);
+            }
+            Factor::HierVariable(reference) => {
+                collect_receiver_index_variables(&reference.index, variables);
+                collect_receiver_select_variables(&reference.select, variables);
+            }
+            Factor::SystemFunctionCall(call) => {
+                collect_receiver_system_call_variables(call, variables);
+            }
+            Factor::FunctionCall(call) => {
+                collect_receiver_function_call_variables(call, variables);
+            }
+            Factor::Value(_) | Factor::Anonymous(_) | Factor::Unknown(_) => {}
+        },
+        Expression::Unary(_, value, _) => {
+            collect_receiver_expression_variables(value, variables);
+        }
+        Expression::Binary(left, _, right, _) => {
+            collect_receiver_expression_variables(left, variables);
+            collect_receiver_expression_variables(right, variables);
+        }
+        Expression::Ternary(cond, left, right, _) => {
+            collect_receiver_expression_variables(cond, variables);
+            collect_receiver_expression_variables(left, variables);
+            collect_receiver_expression_variables(right, variables);
+        }
+        Expression::Concatenation(values, _) => {
+            for (value, repeat) in values {
+                collect_receiver_expression_variables(value, variables);
+                if let Some(repeat) = repeat {
+                    collect_receiver_expression_variables(repeat, variables);
+                }
+            }
+        }
+        Expression::ArrayLiteral(values, _) => {
+            for value in values {
+                match value {
+                    ArrayLiteralItem::Value(value, repeat) => {
+                        collect_receiver_expression_variables(value, variables);
+                        if let Some(repeat) = repeat {
+                            collect_receiver_expression_variables(repeat, variables);
+                        }
+                    }
+                    ArrayLiteralItem::Defaul(value) => {
+                        collect_receiver_expression_variables(value, variables);
+                    }
+                }
+            }
+        }
+        Expression::StructConstructor(_, members, _) => {
+            for (_, value) in members {
+                collect_receiver_expression_variables(value, variables);
+            }
+        }
+    }
+}
+
+fn collect_receiver_for_bound_variables(bound: &ForBound, variables: &mut HashSet<VarId>) {
+    if let ForBound::Expression(expression) = bound {
+        collect_receiver_expression_variables(expression, variables);
+    }
+}
+
+fn collect_receiver_statement_variables(statement: &Statement, variables: &mut HashSet<VarId>) {
+    match statement {
+        Statement::Assign(assign) => {
+            for destination in &assign.dst {
+                collect_receiver_destination_variables(destination, variables);
+            }
+            collect_receiver_expression_variables(&assign.expr, variables);
+        }
+        Statement::If(statement) => {
+            collect_receiver_expression_variables(&statement.cond, variables);
+            for statement in statement
+                .true_side
+                .iter()
+                .chain(statement.false_side.iter())
+            {
+                collect_receiver_statement_variables(statement, variables);
+            }
+        }
+        Statement::IfReset(statement) => {
+            for statement in statement
+                .true_side
+                .iter()
+                .chain(statement.false_side.iter())
+            {
+                collect_receiver_statement_variables(statement, variables);
+            }
+        }
+        Statement::Case(statement) => {
+            collect_receiver_expression_variables(&statement.case_target, variables);
+            for arm in &statement.arms {
+                for pattern in &arm.patterns {
+                    match pattern {
+                        CasePattern::Eq(expression) => {
+                            collect_receiver_expression_variables(expression, variables);
+                        }
+                        CasePattern::Range { lo, hi, .. } => {
+                            collect_receiver_expression_variables(lo, variables);
+                            collect_receiver_expression_variables(hi, variables);
+                        }
+                    }
+                }
+                for statement in &arm.body {
+                    collect_receiver_statement_variables(statement, variables);
+                }
+            }
+            for statement in &statement.default {
+                collect_receiver_statement_variables(statement, variables);
+            }
+        }
+        Statement::For(statement) => {
+            let (start, end) = match &statement.range {
+                ForRange::Forward { start, end, .. }
+                | ForRange::Reverse { start, end, .. }
+                | ForRange::Stepped { start, end, .. } => (start, end),
+            };
+            collect_receiver_for_bound_variables(start, variables);
+            collect_receiver_for_bound_variables(end, variables);
+            for statement in &statement.body {
+                collect_receiver_statement_variables(statement, variables);
+            }
+        }
+        Statement::SystemFunctionCall(call) => {
+            collect_receiver_system_call_variables(call, variables);
+        }
+        Statement::FunctionCall(call) => {
+            collect_receiver_function_call_variables(call, variables);
+        }
+        Statement::TbMethodCall(call) => {
+            if let Some(destination) = &call.ret {
+                collect_receiver_destination_variables(destination, variables);
+            }
+            match &call.method {
+                TbMethod::ClockNext { count, period } => {
+                    if let Some(count) = count {
+                        collect_receiver_expression_variables(count, variables);
+                    }
+                    if let Some(period) = period {
+                        collect_receiver_expression_variables(period, variables);
+                    }
+                }
+                TbMethod::ResetAssert { duration, .. } => {
+                    if let Some(duration) = duration {
+                        collect_receiver_expression_variables(duration, variables);
+                    }
+                }
+                TbMethod::FileOpen { name, .. } => {
+                    collect_receiver_expression_variables(&name.0, variables);
+                }
+                TbMethod::FileWrite { args } | TbMethod::Component { args, .. } => {
+                    for argument in args {
+                        collect_receiver_expression_variables(&argument.0, variables);
+                    }
+                }
+                TbMethod::RandomSeed { value } => {
+                    collect_receiver_expression_variables(value, variables);
+                }
+                TbMethod::RandomGetRange { min, max, .. } => {
+                    collect_receiver_expression_variables(min, variables);
+                    collect_receiver_expression_variables(max, variables);
+                }
+                TbMethod::FileClose
+                | TbMethod::FileFlush
+                | TbMethod::RandomGet { .. }
+                | TbMethod::RandomGetSeed => {}
+            }
+        }
+        Statement::Break | Statement::Unsupported(_) | Statement::Null => {}
+    }
+}
+
+fn receiver_referenced_variables(function: &Function) -> HashSet<VarId> {
+    let mut variables = HashSet::default();
+    for body in &function.functions {
+        for statement in &body.statements {
+            collect_receiver_statement_variables(statement, &mut variables);
+        }
+    }
+    variables
+}
+
 impl Context {
+    #[cfg(test)]
+    pub(crate) fn reset_receiver_path_prefix_comparisons() {
+        VarPath::reset_prefix_comparisons();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn receiver_path_prefix_comparisons() -> usize {
+        VarPath::prefix_comparisons()
+    }
+
+    fn index_local_var_path(&mut self, path: &VarPath) {
+        if let Some(root) = path.0.first() {
+            self.receiver_path_roots
+                .entry(*root)
+                .or_default()
+                .insert(path.clone());
+        }
+        self.receiver_path_cache.clear();
+    }
+
+    fn unindex_local_var_path(&mut self, path: &VarPath) {
+        if let Some(root) = path.0.first()
+            && let Some(paths) = self.receiver_path_roots.get_mut(root)
+        {
+            paths.remove(path);
+            if paths.is_empty() {
+                self.receiver_path_roots.remove(root);
+            }
+        }
+        self.receiver_path_cache.clear();
+    }
+
+    fn receiver_paths_for(&mut self, base: &VarPath, array: &ShapeRef) -> Arc<ReceiverVarPaths> {
+        let key = ReceiverPathCacheKey {
+            base: base.clone(),
+            removed_array_dims: array.dims(),
+        };
+        if let Some(paths) = self.receiver_path_cache.get(&key) {
+            return Arc::clone(paths);
+        }
+        // Repair the index if a downstream user populated the historically
+        // public `var_paths` map directly. Internal conversion uses the
+        // insertion helpers and normally never takes this fallback.
+        if let Some(root) = base.0.first()
+            && !self.receiver_path_roots.contains_key(root)
+        {
+            let paths = self
+                .var_paths
+                .keys()
+                .filter(|path| path.0.first() == Some(root))
+                .cloned()
+                .collect::<HashSet<_>>();
+            if !paths.is_empty() {
+                self.receiver_path_roots.insert(*root, paths);
+            }
+        }
+
+        let mut relative_paths = HashMap::default();
+        let mut relative_variables = HashSet::default();
+        let mut insert = |path: &VarPath, id: VarId, comptime: &Comptime| {
+            if !path.starts_with(&base.0) {
+                return;
+            }
+            let mut relative = path.clone();
+            relative.remove_prelude(&base.0);
+            if relative.0.is_empty() || relative_paths.contains_key(&relative) {
+                return;
+            }
+            let mut comptime = comptime.clone();
+            for _ in 0..array.dims() {
+                comptime.r#type.array.remove(0);
+            }
+            relative_paths.insert(relative, (id, comptime));
+            relative_variables.insert(id);
+        };
+
+        // Local paths have normal lexical priority over the shared receiver
+        // namespace, so visit them first and retain the first relative key.
+        if base.0.is_empty() {
+            for (path, (id, comptime)) in &self.var_paths {
+                insert(path, *id, comptime);
+            }
+        } else if let Some(paths) = self.receiver_path_roots.get(&base.first()) {
+            for path in paths {
+                if let Some((id, comptime)) = self.var_paths.get(path) {
+                    insert(path, *id, comptime);
+                }
+            }
+        }
+
+        if let Some(shared) = &self.receiver_var_paths {
+            if base.0.is_empty() {
+                for (path, (id, comptime)) in &shared.paths {
+                    if !self.hidden_receiver_paths.contains(path) {
+                        insert(path, *id, comptime);
+                    }
+                }
+            } else if let Some(paths) = shared.roots.get(&base.first()) {
+                for path in paths {
+                    if !self.hidden_receiver_paths.contains(path)
+                        && let Some((id, comptime)) = shared.paths.get(path)
+                    {
+                        insert(path, *id, comptime);
+                    }
+                }
+            }
+        }
+
+        let mut roots: HashMap<_, Vec<_>> = HashMap::default();
+        for path in relative_paths.keys() {
+            if let Some(root) = path.0.first() {
+                roots.entry(*root).or_default().push(path.clone());
+            }
+        }
+        let paths = Arc::new(ReceiverVarPaths {
+            paths: relative_paths,
+            roots,
+            variables: Arc::new(relative_variables),
+        });
+        self.receiver_path_cache.insert(key, Arc::clone(&paths));
+        paths
+    }
+
     pub(crate) fn begin_analysis_transaction(&mut self) {
         self.analysis_transactions.push(AnalysisTransaction {
             variables: HashMap::default(),
@@ -307,6 +718,8 @@ impl Context {
             x.push(path.clone());
         }
 
+        self.hidden_receiver_paths.remove(&path);
+        self.index_local_var_path(&path);
         let shadowed = self.var_paths.insert(path.clone(), (id, value));
 
         // store variable shadowed by inner-scope variable
@@ -437,13 +850,12 @@ impl Context {
         context: &mut Context,
         base: &VarPath,
         array: &ShapeRef,
-        relative_variables: &HashSet<VarId>,
+        relative_variables: &Arc<HashSet<VarId>>,
         root_function: Option<VarId>,
     ) {
         // Receiver-relative storage is identified when paths are imported from
         // the receiver namespace. Affiliation cannot distinguish a modport
         // formal member from an ordinary scalar function formal.
-        let receiver_variables = relative_variables.clone();
         // Only the requested receiver method and nested receiver methods whose
         // storage is below that receiver acquire this receiver axis. A global
         // receiver or a modport-array formal may be converted in the same
@@ -453,10 +865,11 @@ impl Context {
             .values()
             .filter(|function| {
                 function.receiver_relative
-                    && function
-                        .receiver_variables
-                        .iter()
-                        .any(|id| relative_variables.contains(id))
+                    && (Arc::ptr_eq(&function.receiver_variables, relative_variables)
+                        || function
+                            .receiver_variables
+                            .iter()
+                            .any(|id| relative_variables.contains(id)))
             })
             .map(|function| function.id)
             .collect::<HashSet<_>>();
@@ -465,7 +878,7 @@ impl Context {
         }
         for (id, mut variable) in context.variables.drain() {
             variable.path.add_prelude(&base.0);
-            if receiver_variables.contains(&id) {
+            if relative_variables.contains(&id) {
                 variable.prepend_array_with_limit(array, self.config.evaluate_array_limit);
             }
             self.variables.insert(id, variable);
@@ -480,16 +893,37 @@ impl Context {
 
         for (id, mut function) in context.functions.drain() {
             if receiver_functions.contains(&id) {
-                let function_receiver_variables = if Some(id) == root_function {
-                    receiver_variables.clone()
+                if function.receiver_references.is_none() {
+                    function.receiver_references =
+                        Some(Arc::new(receiver_referenced_variables(&function)));
+                }
+                let function_receiver_variables = if Some(id) == root_function
+                    || Arc::ptr_eq(&function.receiver_variables, relative_variables)
+                {
+                    Arc::clone(relative_variables)
                 } else {
-                    function
-                        .receiver_variables
-                        .intersection(relative_variables)
-                        .copied()
-                        .collect()
+                    Arc::new(
+                        function
+                            .receiver_variables
+                            .intersection(relative_variables)
+                            .copied()
+                            .collect(),
+                    )
                 };
-                function.prepend_receiver(array, &function_receiver_variables, &receiver_functions);
+                let function_receiver_prefixes = function
+                    .receiver_references
+                    .as_ref()
+                    .into_iter()
+                    .flat_map(|variables| variables.iter())
+                    .filter(|id| relative_variables.contains(id))
+                    .copied()
+                    .collect();
+                function.prepend_receiver(
+                    array,
+                    &function_receiver_variables,
+                    &function_receiver_prefixes,
+                    &receiver_functions,
+                );
             }
 
             if !function.path.path.starts_with(&base.0) {
@@ -500,16 +934,6 @@ impl Context {
     }
 
     pub fn extract_var_paths(&mut self, context: &Context, base: &VarPath, array: &ShapeRef) {
-        self.extract_var_paths_with_receiver(context, base, array);
-    }
-
-    pub(crate) fn extract_var_paths_with_receiver(
-        &mut self,
-        context: &Context,
-        base: &VarPath,
-        array: &ShapeRef,
-    ) -> HashSet<VarId> {
-        let mut relative_variables = HashSet::default();
         for (path, (id, comptime)) in &context.var_paths {
             if path.starts_with(&base.0) {
                 let mut path = path.clone();
@@ -519,12 +943,25 @@ impl Context {
                     for _ in 0..array.dims() {
                         comptime.r#type.array.remove(0);
                     }
-                    self.var_paths.insert(path, (*id, comptime));
-                    relative_variables.insert(*id);
+                    self.insert_var_path_with_id(path, *id, comptime);
                 }
             }
         }
-        relative_variables
+    }
+
+    pub(crate) fn extract_var_paths_with_receiver(
+        &mut self,
+        context: &mut Context,
+        base: &VarPath,
+        array: &ShapeRef,
+    ) -> Arc<HashSet<VarId>> {
+        #[cfg(test)]
+        let _prefix_comparison_guard = VarPath::count_prefix_comparisons();
+        let paths = context.receiver_paths_for(base, array);
+        let variables = Arc::clone(&paths.variables);
+        self.receiver_var_paths = Some(paths);
+        self.hidden_receiver_paths.clear();
+        variables
     }
 
     pub fn extract_interface_member(
@@ -613,12 +1050,12 @@ impl Context {
 
     pub fn get_default_clock(&self) -> Option<(FfClock, SymbolId)> {
         if let Some(x) = &self.default_clock {
-            if let Some((id, comptime)) = &self.var_paths.get(&x.0) {
+            if let Some((id, comptime)) = self.find_path(&x.0) {
                 let ret = FfClock {
-                    id: *id,
+                    id,
                     index: VarIndex::default(),
                     select: VarSelect::default(),
-                    comptime: comptime.clone(),
+                    comptime,
                 };
                 Some((ret, x.1))
             } else {
@@ -631,12 +1068,12 @@ impl Context {
 
     pub fn get_default_reset(&self) -> Option<(FfReset, SymbolId)> {
         if let Some(x) = &self.default_reset {
-            if let Some((id, comptime)) = &self.var_paths.get(&x.0) {
+            if let Some((id, comptime)) = self.find_path(&x.0) {
                 let ret = FfReset {
-                    id: *id,
+                    id,
                     index: VarIndex::default(),
                     select: VarSelect::default(),
-                    comptime: comptime.clone(),
+                    comptime,
                 };
                 Some((ret, x.1))
             } else {
@@ -758,9 +1195,11 @@ impl Context {
                 if let Some(y) = self.shadowed_variables.get_mut(&x)
                     && let Some(y) = y.pop()
                 {
+                    self.index_local_var_path(&x);
                     self.var_paths.insert(x, y);
                 } else {
                     self.var_paths.remove(&x);
+                    self.unindex_local_var_path(&x);
                 }
             }
         }
@@ -835,7 +1274,38 @@ impl Context {
     }
 
     pub fn find_path(&self, path: &VarPath) -> Option<(VarId, Comptime)> {
-        self.var_paths.get(path).cloned()
+        self.var_paths.get(path).cloned().or_else(|| {
+            (!self.hidden_receiver_paths.contains(path))
+                .then(|| {
+                    self.receiver_var_paths
+                        .as_ref()
+                        .and_then(|paths| paths.paths.get(path))
+                        .cloned()
+                })
+                .flatten()
+        })
+    }
+
+    /// Mutable path access materializes a shared receiver entry in the local
+    /// overlay first, then invalidates derived receiver namespace caches.
+    pub(crate) fn var_path_mut(&mut self, path: &VarPath) -> Option<&mut (VarId, Comptime)> {
+        if !self.var_paths.contains_key(path) {
+            let value = (!self.hidden_receiver_paths.contains(path))
+                .then(|| {
+                    self.receiver_var_paths
+                        .as_ref()
+                        .and_then(|paths| paths.paths.get(path))
+                        .cloned()
+                })
+                .flatten();
+            if let Some(value) = value {
+                self.index_local_var_path(path);
+                self.var_paths.insert(path.clone(), value);
+            }
+        } else {
+            self.receiver_path_cache.clear();
+        }
+        self.var_paths.get_mut(path)
     }
 
     pub fn get_variable(&self, id: &VarId) -> Option<Variable> {
@@ -843,10 +1313,22 @@ impl Context {
     }
 
     pub fn remove_path(&mut self, path: &VarPath) {
-        self.var_paths.remove(path);
+        if self.var_paths.remove(path).is_some() {
+            self.unindex_local_var_path(path);
+        }
+        if self
+            .receiver_var_paths
+            .as_ref()
+            .is_some_and(|paths| paths.paths.contains_key(path))
+        {
+            self.hidden_receiver_paths.insert(path.clone());
+            self.receiver_path_cache.clear();
+        }
     }
 
     pub fn drain_var_paths(&mut self) -> HashMap<VarPath, (VarId, Comptime)> {
+        self.receiver_path_roots.clear();
+        self.receiver_path_cache.clear();
         self.var_paths.drain().collect()
     }
 

@@ -578,7 +578,7 @@ pub fn check_assign_clock_domain(
         };
         if let Some(id) = inferred {
             dst.comptime.clock_domain = ClockDomain::Inferred(id);
-            if let Some((_, path_comptime)) = context.var_paths.get_mut(&dst.path) {
+            if let Some((_, path_comptime)) = context.var_path_mut(&dst.path) {
                 path_comptime.clock_domain = ClockDomain::Inferred(id);
             }
         }
@@ -1159,7 +1159,7 @@ pub fn eval_type(
     let mut is_positive = false;
 
     let kind = if let Some(x) = path.to_var_path()
-        && let Some(x) = context.var_paths.get(&x)
+        && let Some(x) = context.find_path(&x)
     {
         match &x.1.value {
             ValueVariant::Type(x) => {
@@ -4070,9 +4070,7 @@ fn get_function(context: &mut Context, path: &FuncPath, token: TokenRange) -> Ir
                 if let Some((var_id, comptime)) = context.find_path(path)
                     && let Some(var) = context.variables.get(&var_id)
                 {
-                    local_context
-                        .var_paths
-                        .insert(path.clone(), (var_id, comptime));
+                    local_context.insert_var_path_with_id(path.clone(), var_id, comptime);
                     local_context.variables.insert(var_id, var.clone());
                 }
             }
@@ -4081,7 +4079,8 @@ fn get_function(context: &mut Context, path: &FuncPath, token: TokenRange) -> Ir
             let root_function = local_context.func_paths.get(path).copied();
 
             for path in &generic_arg_paths {
-                if let Some((var_id, _)) = local_context.var_paths.remove(path) {
+                if let Some((var_id, _)) = local_context.find_path(path) {
+                    local_context.remove_path(path);
                     local_context.variables.remove(&var_id);
                 }
             }
