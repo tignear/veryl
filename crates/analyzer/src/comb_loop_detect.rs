@@ -79,7 +79,7 @@ use crate::ir::VarId;
 use crate::ir::{
     AssignDestination, Component, Declaration, Expression, Factor, FunctionCall,
     InstActualFragment, InstDeclaration, InstInterfaceBinding, Ir, MemberSelectDomain, Module, Op,
-    Signature, Statement, SystemFunctionCall, SystemFunctionKind, VarSelect, Variable,
+    Signature, Statement, SystemFunctionCall, SystemFunctionKind, VarSelect, VarSelectOp, Variable,
 };
 use crate::symbol::{Affiliation, Direction};
 use daggy::petgraph::graph::NodeIndex;
@@ -1396,7 +1396,7 @@ impl<'a> ModuleGraphBuilder<'a> {
                                 regular_transfer: node.regular_transfer,
                                 diagnostic: None,
                             }),
-                            offset: Some((0, 0)),
+                            offset: BitDependency::identity(),
                             condition: PathCondition::default(),
                         }],
                     },
@@ -1519,7 +1519,7 @@ fn map_instance_source_region(
         || parent_sources
             .nodes
             .iter()
-            .any(|source| source.offset.is_some())
+            .any(|source| source.offset.has_position())
         || inst
             .inputs
             .iter()
@@ -1545,7 +1545,8 @@ struct InstanceRegionMapping {
 #[derive(Clone)]
 struct MappedNode {
     key: NodeKey,
-    offset: Option<(isize, isize)>,
+    offset: BitDependency,
+    child_domain: Option<SummaryRegion>,
     condition: PathCondition,
 }
 
@@ -1555,7 +1556,7 @@ struct ResolvedInstanceRegionMapping {
 
 struct ResolvedMappedNode {
     node: NodeIndex,
-    offset: Option<(isize, isize)>,
+    offset: BitDependency,
     condition: PathCondition,
 }
 
@@ -1676,9 +1677,8 @@ fn child_source_region_for_destination(
     destination: &MappedNode,
     bit_part: &BitPartition,
 ) -> RegionProjection {
-    let Some((destination_array_offset, destination_packed_offset)) = destination.offset else {
-        return RegionProjection::Unknown;
-    };
+    let destination_array_offset = destination.offset.array;
+    let destination_packed_offset = destination.offset.packed;
     let Some(parent_packed) = bit_part
         .ranges_of((destination.key.0, destination.key.1))
         .get(destination.key.2)
@@ -1686,20 +1686,30 @@ fn child_source_region_for_destination(
     else {
         return RegionProjection::Unknown;
     };
-    let Some(destination_array_offset) = destination_array_offset.checked_neg() else {
+    let child_destination_array = if let Some(offset) = destination_array_offset {
+        let Some(offset) = offset.checked_neg() else {
+            return RegionProjection::Unknown;
+        };
+        let Some(span) = translate_array_span(destination.key.1, offset) else {
+            return RegionProjection::Unknown;
+        };
+        span
+    } else if let Some(domain) = destination.child_domain {
+        domain.array
+    } else {
         return RegionProjection::Unknown;
     };
-    let Some(destination_packed_offset) = destination_packed_offset.checked_neg() else {
-        return RegionProjection::Unknown;
-    };
-    let Some(child_destination_array) =
-        translate_array_span(destination.key.1, destination_array_offset)
-    else {
-        return RegionProjection::Unknown;
-    };
-    let Some(child_destination_packed) =
-        translate_packed_span(parent_packed, destination_packed_offset)
-    else {
+    let child_destination_packed = if let Some(offset) = destination_packed_offset {
+        let Some(offset) = offset.checked_neg() else {
+            return RegionProjection::Unknown;
+        };
+        let Some(span) = translate_packed_span(parent_packed, offset) else {
+            return RegionProjection::Unknown;
+        };
+        span
+    } else if let Some(domain) = destination.child_domain {
+        domain.packed
+    } else {
         return RegionProjection::Unknown;
     };
     let Some(child_destination_array) =
@@ -1827,7 +1837,8 @@ fn instance_region_mapping(
             .flatten()
             .map(|source| MappedNode {
                 key: source.key,
-                offset: None,
+                offset: BitDependency::WHOLE,
+                child_domain: None,
                 condition: source.condition.clone(),
             })
             .collect(),
@@ -1878,6 +1889,7 @@ struct ActualFragment {
     child_packed: PackedSpan,
     parent_array: ArraySpan,
     parent_packed: PackedSpan,
+    offset: BitDependency,
 }
 
 #[derive(Clone, Copy)]
@@ -1885,7 +1897,31 @@ struct TranslatedFragmentAccess {
     parent: VarId,
     array: ArraySpan,
     packed: PackedSpan,
-    offset: (isize, isize),
+    offset: BitDependency,
+    child_domain: SummaryRegion,
+}
+
+fn destination_packed_width(destination: &AssignDestination, ctx: &mut Context) -> Option<usize> {
+    if let Some((op, width)) = &destination.select.1
+        && matches!(
+            op,
+            VarSelectOp::PlusColon | VarSelectOp::MinusColon | VarSelectOp::Step
+        )
+    {
+        let width = width.eval_value(ctx)?.to_usize()?;
+        let dimension = destination.select.dimension();
+        let shape = destination.comptime.r#type.width();
+        if dimension == 0 || shape.dims() < dimension || width == 0 {
+            return None;
+        }
+        return shape.as_slice()[dimension..]
+            .iter()
+            .try_fold(width, |total, inner| total.checked_mul((*inner)?));
+    }
+    destination
+        .select
+        .eval_comptime(ctx, &destination.comptime.r#type, false)?
+        .total()
 }
 
 fn actual_fragments(
@@ -1899,6 +1935,8 @@ fn actual_fragments(
     let accesses = actual
         .iter()
         .map(|destination| {
+            let array_length = destination.comptime.r#type.array.total()?;
+            let packed_width = destination_packed_width(destination, ctx)?;
             let spans = var_reads(
                 destination.id,
                 &destination.index,
@@ -1909,43 +1947,63 @@ fn actual_fragments(
             let [(parent_array, parent_packed)] = spans.as_slice() else {
                 return None;
             };
-            Some((destination.id, *parent_array, *parent_packed))
+            Some((
+                destination.id,
+                *parent_array,
+                *parent_packed,
+                array_length,
+                packed_width,
+            ))
         })
         .collect::<Option<Vec<_>>>()?;
-    let array_length = accesses.iter().try_fold(0usize, |total, (_, array, _)| {
-        total.checked_add(array.length)
-    })?;
+    let array_length = accesses
+        .iter()
+        .try_fold(0usize, |total, (_, _, _, length, _)| {
+            total.checked_add(*length)
+        })?;
     if array_length == child_array_length
         && accesses
             .iter()
-            .all(|(_, _, packed)| packed.length == child_packed_width)
+            .all(|(_, _, _, _, width)| *width == child_packed_width)
     {
         let mut child_start = 0usize;
         return accesses
             .into_iter()
-            .map(|(parent, parent_array, parent_packed)| {
+            .map(|(parent, parent_array, parent_packed, array_length, _)| {
                 let child_array = ArraySpan {
                     start: child_start,
-                    length: parent_array.length,
+                    length: array_length,
                 };
-                child_start = child_start.checked_add(parent_array.length)?;
+                child_start = child_start.checked_add(array_length)?;
                 Some(ActualFragment {
                     parent,
                     child_array,
                     child_packed,
                     parent_array,
                     parent_packed,
+                    offset: BitDependency {
+                        array: if parent_array.length == array_length {
+                            Some(signed_difference(parent_array.start, child_array.start)?)
+                        } else {
+                            None
+                        },
+                        packed: Some(signed_difference(parent_packed.start, child_packed.start)?),
+                    },
                 })
             })
             .collect();
     }
 
-    let packed_width = accesses.iter().try_fold(0usize, |total, (_, _, packed)| {
-        total.checked_add(packed.length)
-    })?;
+    let packed_width = accesses
+        .iter()
+        .try_fold(0usize, |total, (_, _, _, _, width)| {
+            total.checked_add(*width)
+        })?;
     if child_array_length != 1
         || packed_width != child_packed_width
-        || accesses.iter().any(|(_, array, _)| array.length != 1)
+        || accesses
+            .iter()
+            .any(|(_, _, _, array_length, _)| *array_length != 1)
     {
         return None;
     }
@@ -1953,17 +2011,30 @@ fn actual_fragments(
     let mut child_start = child_packed_width;
     accesses
         .into_iter()
-        .map(|(parent, parent_array, parent_packed)| {
-            child_start = child_start.checked_sub(parent_packed.length)?;
+        .map(|(parent, parent_array, parent_packed, _, packed_width)| {
+            child_start = child_start.checked_sub(packed_width)?;
+            let child_packed = PackedSpan::new(child_start, packed_width)?;
             Some(ActualFragment {
                 parent,
                 child_array: ArraySpan {
                     start: 0,
                     length: 1,
                 },
-                child_packed: PackedSpan::new(child_start, parent_packed.length)?,
+                child_packed,
                 parent_array,
                 parent_packed,
+                offset: BitDependency {
+                    array: if parent_array.length == 1 {
+                        Some(signed_difference(parent_array.start, 0)?)
+                    } else {
+                        None
+                    },
+                    packed: if parent_packed.length == packed_width {
+                        Some(signed_difference(parent_packed.start, child_packed.start)?)
+                    } else {
+                        None
+                    },
+                },
             })
         })
         .collect()
@@ -1992,6 +2063,10 @@ fn contiguous_actual_fragment(
             length: actual.parent_array_length,
         },
         parent_packed: PackedSpan::new(actual.parent_packed_start, actual.parent_packed_length)?,
+        offset: BitDependency {
+            array: Some(signed_difference(actual.parent_array_start, 0)?),
+            packed: Some(signed_difference(actual.parent_packed_start, 0)?),
+        },
     })
 }
 
@@ -2007,18 +2082,27 @@ fn translate_actual_fragments(
             Some((fragment, array, packed))
         })
         .map(|(fragment, child_array, child_packed)| {
-            let array =
-                child_array.translated(fragment.child_array.start, fragment.parent_array.start)?;
-            let packed = child_packed
-                .translated(fragment.child_packed.start, fragment.parent_packed.start)?;
+            let array = if fragment.offset.array.is_some() {
+                child_array.translated(fragment.child_array.start, fragment.parent_array.start)?
+            } else {
+                fragment.parent_array
+            };
+            let packed = if fragment.offset.packed.is_some() {
+                child_packed
+                    .translated(fragment.child_packed.start, fragment.parent_packed.start)?
+            } else {
+                fragment.parent_packed
+            };
             Some(TranslatedFragmentAccess {
                 parent: fragment.parent,
                 array,
                 packed,
-                offset: (
-                    signed_difference(fragment.parent_array.start, fragment.child_array.start)?,
-                    signed_difference(fragment.parent_packed.start, fragment.child_packed.start)?,
-                ),
+                offset: fragment.offset,
+                child_domain: SummaryRegion {
+                    id: region.id,
+                    array: child_array,
+                    packed: child_packed,
+                },
             })
         })
         .collect()
@@ -2065,7 +2149,8 @@ fn map_translated_fragment_accesses(
                 .into_iter()
                 .map(|key| MappedNode {
                     key,
-                    offset: Some(access.offset),
+                    offset: access.offset,
+                    child_domain: Some(access.child_domain),
                     condition: PathCondition::default(),
                 }),
         );
@@ -2140,7 +2225,11 @@ fn map_summary_region(
             .into_iter()
             .map(|key| MappedNode {
                 key,
-                offset,
+                offset: offset.map_or(BitDependency::WHOLE, |(array, packed)| BitDependency {
+                    array: Some(array),
+                    packed: Some(packed),
+                }),
+                child_domain: None,
                 condition: PathCondition::default(),
             })
             .collect(),
@@ -2223,27 +2312,27 @@ fn add_resolved_dependency_edges(
             else {
                 continue;
             };
-            let kind = if let (
-                Some((source_array, source_packed)),
-                Some((destination_array, destination_packed)),
-            ) = (source.offset, destination.offset)
-            {
-                BitDependency {
-                    array: dependency.array.map(|array| {
-                        array
-                            .checked_add(destination_array)
-                            .and_then(|offset| offset.checked_sub(source_array))
+            let kind = BitDependency {
+                array: dependency
+                    .array
+                    .zip(source.offset.array)
+                    .zip(destination.offset.array)
+                    .map(|((dependency, source), destination)| {
+                        dependency
+                            .checked_add(destination)
+                            .and_then(|offset| offset.checked_sub(source))
                             .expect("mapped array dependency offset must fit in isize")
                     }),
-                    packed: dependency.packed.map(|packed| {
-                        packed
-                            .checked_add(destination_packed)
-                            .and_then(|offset| offset.checked_sub(source_packed))
+                packed: dependency
+                    .packed
+                    .zip(source.offset.packed)
+                    .zip(destination.offset.packed)
+                    .map(|((dependency, source), destination)| {
+                        dependency
+                            .checked_add(destination)
+                            .and_then(|offset| offset.checked_sub(source))
                             .expect("mapped packed dependency offset must fit in isize")
                     }),
-                }
-            } else {
-                BitDependency::WHOLE
             };
             if graph[source.node].diagnostic.is_some()
                 && graph[destination.node].diagnostic.is_some()
@@ -2333,7 +2422,14 @@ fn analyze_instance_actual_regions<'a>(
                         .into_iter()
                         .map(|source| MappedNode {
                             key: source.key,
-                            offset: source.offset,
+                            offset: source.offset.map_or(
+                                BitDependency::WHOLE,
+                                |(array, packed)| BitDependency {
+                                    array: Some(array),
+                                    packed: Some(packed),
+                                },
+                            ),
+                            child_domain: None,
                             condition: source.condition,
                         })
                         .collect(),

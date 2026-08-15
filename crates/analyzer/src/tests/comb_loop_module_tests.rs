@@ -838,6 +838,293 @@ fn comb_loop_dynamic_instance_output_summary_keeps_static_prefixes_disjoint() {
     );
 }
 
+fn dynamic_output_concat_high_fragment_code(feedback_bit: usize, bus_index: usize) -> String {
+    format!(
+        r#"
+        module Identity2 (
+            i: input  logic<2>,
+            o: output logic<2>,
+        ) {{
+            assign o = i;
+        }}
+        module Top (
+            selector: input  logic,
+            o       : output logic,
+        ) {{
+            var source: logic<2>;
+            var bus   : logic [2];
+            var low   : logic;
+            inst child: Identity2 (
+                i: source,
+                o: {{bus[selector], low}},
+            );
+            assign source[{feedback_bit}] = bus[{bus_index}];
+            assign source[{}] = 0;
+            assign o = low;
+        }}
+        "#,
+        1 - feedback_bit
+    )
+}
+
+#[test]
+fn comb_loop_dynamic_output_concat_confines_a_whole_summary_to_its_high_fragment() {
+    assert_comb_loop(
+        "a dynamic high fragment cannot inherit the low child bit",
+        &dynamic_output_concat_high_fragment_code(0, 0),
+        false,
+    );
+}
+
+#[test]
+fn comb_loop_dynamic_output_concat_detects_feedback_through_its_high_fragment() {
+    assert_comb_loop(
+        "a dynamic high fragment retains its corresponding child bit",
+        &dynamic_output_concat_high_fragment_code(1, 0),
+        true,
+    );
+}
+
+#[test]
+fn comb_loop_dynamic_output_concat_considers_a_distant_fragment_candidate() {
+    assert_comb_loop(
+        "a dynamic fragment includes every candidate below its static prefix",
+        &dynamic_output_concat_high_fragment_code(1, 1),
+        true,
+    );
+}
+
+fn dynamic_packed_output_concat_code(feedback_bit: usize, candidate: usize) -> String {
+    format!(
+        r#"
+        module Identity2 (i: input logic<2>, o: output logic<2>) {{
+            assign o = i;
+        }}
+        module Top (selector: input logic<2>, o: output logic) {{
+            var source: logic<2>;
+            var bus   : logic<4> [2];
+            var low   : logic;
+            inst child: Identity2 (
+                i: source,
+                o: {{bus[1][selector+:1], low}},
+            );
+            assign bus[0] = 0;
+            assign source[{feedback_bit}] = bus[1][{candidate}];
+            assign source[{}] = 0;
+            assign o = low;
+        }}
+        "#,
+        1 - feedback_bit
+    )
+}
+
+#[test]
+fn comb_loop_dynamic_packed_output_concat_confines_the_child_fragment() {
+    let code = dynamic_packed_output_concat_code(0, 3);
+    assert!(comb_loop_analysis_is_complete(&code));
+    assert_comb_loop(
+        "a dynamic packed fragment cannot inherit the low child bit",
+        &code,
+        false,
+    );
+}
+
+#[test]
+fn comb_loop_dynamic_packed_output_concat_retains_a_distant_candidate() {
+    let code = dynamic_packed_output_concat_code(1, 3);
+    assert!(comb_loop_analysis_is_complete(&code));
+    assert_comb_loop(
+        "a dynamic packed fragment retains a distant candidate",
+        &code,
+        true,
+    );
+}
+
+fn multidimensional_packed_output_concat_code(feedback_bit: usize) -> String {
+    let remaining = (0..5)
+        .filter(|bit| *bit != feedback_bit)
+        .map(|bit| format!("assign source[{bit}] = 0;"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!(
+        r#"
+        module Identity5 (i: input logic<5>, o: output logic<5>) {{ assign o = i; }}
+        module Top (selector: input logic, o: output logic) {{
+            var source: logic<5>;
+            var bus   : logic<2, 4>;
+            var low   : logic;
+            inst child: Identity5 (
+                i: source,
+                o: {{bus[selector+:1], low}},
+            );
+            assign source[{feedback_bit}] = bus[1][3];
+            {remaining}
+            assign o = low;
+        }}
+        "#
+    )
+}
+
+#[test]
+fn comb_loop_multidimensional_packed_output_concat_uses_the_selected_shape() {
+    assert_comb_loop(
+        "a selected outer packed coordinate retains its inner width",
+        &multidimensional_packed_output_concat_code(4),
+        true,
+    );
+}
+
+fn multidimensional_unpacked_output_concat_code(selector_source: &str) -> String {
+    format!(
+        r#"
+        module Identity2 (i: input logic<2>, o: output logic<2>) {{ assign o = i; }}
+        module Top (selector: input logic, o: output logic) {{
+            var source: logic<2>;
+            var bus   : logic [2, 2];
+            var low   : logic;
+            inst child: Identity2 (i: source, o: {{bus[1][selector], low}});
+            assign source[1] = {selector_source};
+            assign source[0] = 0;
+            assign o = low;
+        }}
+        "#
+    )
+}
+
+#[test]
+fn comb_loop_multidimensional_unpacked_output_concat_keeps_static_prefixes_disjoint() {
+    assert_comb_loop(
+        "a dynamic concat fragment cannot escape its static unpacked prefix",
+        &multidimensional_unpacked_output_concat_code("bus[0][1]"),
+        false,
+    );
+}
+
+#[test]
+fn comb_loop_multidimensional_unpacked_output_concat_retains_its_static_prefix() {
+    assert_comb_loop(
+        "a dynamic concat fragment retains candidates below its static unpacked prefix",
+        &multidimensional_unpacked_output_concat_code("bus[1][1]"),
+        true,
+    );
+}
+
+#[test]
+fn comb_loop_multidimensional_packed_output_concat_excludes_the_sibling_fragment() {
+    assert_comb_loop(
+        "a multidimensional packed fragment excludes its scalar sibling",
+        &multidimensional_packed_output_concat_code(0),
+        false,
+    );
+}
+
+fn dynamic_output_concat_two_summary_code(feedback_bit: usize) -> String {
+    format!(
+        r#"
+        module Identity2 (i: input logic<2>, o: output logic<2>) {{
+            assign o = i;
+        }}
+        module Middle (
+            selector: input  logic,
+            i       : input  logic<2>,
+            o       : output logic,
+        ) {{
+            var bus: logic [2];
+            var low: logic;
+            inst child: Identity2 (i: i, o: {{bus[selector], low}});
+            assign o = bus[0];
+        }}
+        module Top (selector: input logic, o: output logic) {{
+            var source  : logic<2>;
+            var feedback: logic;
+            inst middle: Middle (selector: selector, i: source, o: feedback);
+            assign source[{feedback_bit}] = feedback;
+            assign source[{}] = 0;
+            assign o = feedback;
+        }}
+        "#,
+        1 - feedback_bit
+    )
+}
+
+#[test]
+fn comb_loop_dynamic_output_concat_domain_survives_two_summaries() {
+    assert_comb_loop(
+        "a dynamic fragment keeps its child domain through two summaries",
+        &dynamic_output_concat_two_summary_code(1),
+        true,
+    );
+}
+
+#[test]
+fn comb_loop_dynamic_output_concat_disjoint_domain_survives_two_summaries() {
+    assert_comb_loop(
+        "a disjoint child bit stays disjoint through two summaries",
+        &dynamic_output_concat_two_summary_code(0),
+        false,
+    );
+}
+
+fn dynamic_output_concat_low_fragment_code(feedback_bit: usize) -> String {
+    format!(
+        r#"
+        module Identity2 (i: input logic<2>, o: output logic<2>) {{ assign o = i; }}
+        module Top (selector: input logic, o: output logic) {{
+            var source: logic<2>;
+            var bus   : logic [2];
+            var high  : logic;
+            inst child: Identity2 (i: source, o: {{high, bus[selector]}});
+            assign source[{feedback_bit}] = bus[1];
+            assign source[{}] = 0;
+            assign o = high;
+        }}
+        "#,
+        1 - feedback_bit
+    )
+}
+
+#[test]
+fn comb_loop_dynamic_output_concat_confines_a_whole_summary_to_its_low_fragment() {
+    assert_comb_loop(
+        "a dynamic low fragment cannot inherit the high child bit",
+        &dynamic_output_concat_low_fragment_code(1),
+        false,
+    );
+}
+
+#[test]
+fn comb_loop_dynamic_output_concat_detects_feedback_through_its_low_fragment() {
+    assert_comb_loop(
+        "a dynamic low fragment retains its corresponding child bit",
+        &dynamic_output_concat_low_fragment_code(0),
+        true,
+    );
+}
+
+#[test]
+fn comb_loop_large_dynamic_output_concat_stays_sparse() {
+    let code = r#"
+        module Identity2 (i: input logic<2>, o: output logic<2>) {
+            assign o = i;
+        }
+        module Top (index: input u32, o: output logic) {
+            var source: logic<2>;
+            var bus   : logic [1000000];
+            var low   : logic;
+            inst child: Identity2 (i: source, o: {bus[index], low});
+            assign source[1] = bus[999999];
+            assign source[0] = 0;
+            assign o = low;
+        }
+    "#;
+    assert!(comb_loop_analysis_is_complete(code));
+    assert_comb_loop(
+        "a large dynamic concat maps only sparse touched partitions",
+        code,
+        true,
+    );
+}
+
 fn packed_concat_conditional_actual_code(first: &str, second: &str) -> String {
     format!(
         r#"
