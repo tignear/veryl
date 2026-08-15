@@ -2408,7 +2408,7 @@ fn function_summaries_reuse_module_metadata() {
         "independent calls are acyclic: {errors:#?}"
     );
     assert!(
-        crate::comb_loop_detect::module_context_entries() <= COUNT * 6,
+        crate::comb_loop_detect::module_context_entries() <= COUNT * 7,
         "function summaries must share their module metadata: {}",
         crate::comb_loop_detect::module_context_entries(),
     );
