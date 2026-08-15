@@ -12,7 +12,7 @@ use crate::ir::{Module, VarId};
 use crate::{AnalyzerError, HashMap, HashSet};
 use daggy::petgraph::Direction;
 use daggy::petgraph::Graph;
-use daggy::petgraph::algo::tarjan_scc;
+use daggy::petgraph::algo::kosaraju_scc;
 use daggy::petgraph::graph::{EdgeIndex, NodeIndex};
 use daggy::petgraph::visit::EdgeRef;
 #[cfg(test)]
@@ -220,7 +220,7 @@ pub(super) fn check_graph(
         unconstrained_subgraph_is_acyclic(graph),
         "unconstrained dependency nodes must be introduced as a DAG"
     );
-    let sccs = tarjan_scc(&graph.graph);
+    let sccs = strongly_connected_components(&graph.graph);
     let mut reported: HashSet<Vec<NodeKey>> = HashSet::default();
     for scc in sccs {
         if !has_compatible_cycle(graph, &scc) {
@@ -242,6 +242,13 @@ pub(super) fn check_graph(
             errors.push(error);
         }
     }
+}
+
+fn strongly_connected_components<N, E>(graph: &Graph<N, E>) -> Vec<Vec<NodeIndex>> {
+    // Petgraph's Tarjan implementation uses recursive DFS. A long dependency
+    // chain can therefore exhaust the native stack even when the RTL syntax
+    // itself is shallow. Kosaraju uses explicit worklists for both passes.
+    kosaraju_scc(graph)
 }
 
 fn unconstrained_subgraph_is_acyclic(graph: &DependencyGraph) -> bool {
@@ -364,6 +371,9 @@ fn has_compatible_cycle(graph: &DependencyGraph, scc: &[NodeIndex]) -> bool {
     for start in starts {
         let returnable = nodes_that_may_reach_start(graph, &remaining, start);
         let initial = PositionRelationSet::identity(&graph[start].domains);
+        // `PathCondition` mutates only append-only memoization; an existing
+        // condition's Hash/Eq identity remains stable in this set.
+        #[allow(clippy::mutable_key_type)]
         let mut cycles = HashSet::default();
         let mut stack: Vec<(
             NodeIndex,
@@ -628,41 +638,33 @@ fn dependency_offsets_fit_acyclic_orthant(
         }
     }
 
-    let array = orthant_potentials(nodes, &edges, |offset| offset.0);
-    let packed = orthant_potentials(nodes, &edges, |offset| offset.1);
-    for (array_sign, array_potential) in &array {
-        for (packed_sign, packed_potential) in &packed {
-            let mut zero = Graph::<(), ()>::new();
-            let mapped = nodes
-                .iter()
-                .map(|&node| (node, zero.add_node(())))
-                .collect::<HashMap<_, _>>();
-            let mut representable = true;
-            for &(source, destination, offset) in &edges {
-                let Some(array) = reduced_offset(
-                    offset.0,
-                    *array_sign,
-                    array_potential[&source],
-                    array_potential[&destination],
-                ) else {
-                    representable = false;
-                    break;
-                };
-                let Some(packed) = reduced_offset(
-                    offset.1,
-                    *packed_sign,
-                    packed_potential[&source],
-                    packed_potential[&destination],
-                ) else {
-                    representable = false;
-                    break;
-                };
-                debug_assert!(array >= 0 && packed >= 0);
-                if array == 0 && packed == 0 {
-                    zero.add_edge(mapped[&source], mapped[&destination], ());
-                }
-            }
-            if representable && !daggy::petgraph::algo::is_cyclic_directed(&zero) {
+    let signs = [1, -1];
+    let mut array_potentials = [None, None];
+    let mut packed_potentials = [None, None];
+    for array_index in 0..signs.len() {
+        for packed_index in 0..signs.len() {
+            let array_sign = signs[array_index];
+            let packed_sign = signs[packed_index];
+            let array_potential = array_potentials[array_index].get_or_insert_with(|| {
+                orthant_potential(nodes, &edges, |offset| offset.0, array_sign)
+            });
+            let Some(array_potential) = array_potential else {
+                continue;
+            };
+            let packed_potential = packed_potentials[packed_index].get_or_insert_with(|| {
+                orthant_potential(nodes, &edges, |offset| offset.1, packed_sign)
+            });
+            let Some(packed_potential) = packed_potential else {
+                continue;
+            };
+            if reduced_zero_subgraph_is_acyclic(
+                nodes,
+                &edges,
+                array_sign,
+                array_potential,
+                packed_sign,
+                packed_potential,
+            ) {
                 return true;
             }
         }
@@ -670,38 +672,72 @@ fn dependency_offsets_fit_acyclic_orthant(
     false
 }
 
-fn orthant_potentials(
+fn orthant_potential(
     nodes: &HashSet<NodeIndex>,
     edges: &[(NodeIndex, NodeIndex, (isize, isize))],
     axis: impl Fn((isize, isize)) -> isize,
-) -> Vec<(isize, HashMap<NodeIndex, isize>)> {
-    [1, -1]
-        .into_iter()
-        .filter_map(|sign| {
-            let mut potential = nodes
-                .iter()
-                .map(|&node| (node, 0isize))
-                .collect::<HashMap<_, _>>();
-            for iteration in 0..nodes.len() {
-                let mut changed = false;
-                for &(source, destination, offset) in edges {
-                    let weight = signed_offset(axis(offset), sign)?;
-                    let candidate = potential[&source].checked_add(weight)?;
-                    if candidate < potential[&destination] {
-                        if iteration + 1 == nodes.len() {
-                            return None;
-                        }
-                        potential.insert(destination, candidate);
-                        changed = true;
-                    }
+    sign: isize,
+) -> Option<HashMap<NodeIndex, isize>> {
+    let mut potential = nodes
+        .iter()
+        .map(|&node| (node, 0isize))
+        .collect::<HashMap<_, _>>();
+    for iteration in 0..nodes.len() {
+        let mut changed = false;
+        for &(source, destination, offset) in edges {
+            let weight = signed_offset(axis(offset), sign)?;
+            let candidate = potential[&source].checked_add(weight)?;
+            if candidate < potential[&destination] {
+                if iteration + 1 == nodes.len() {
+                    return None;
                 }
-                if !changed {
-                    return Some((sign, potential));
-                }
+                potential.insert(destination, candidate);
+                changed = true;
             }
-            Some((sign, potential))
-        })
-        .collect()
+        }
+        if !changed {
+            return Some(potential);
+        }
+    }
+    Some(potential)
+}
+
+fn reduced_zero_subgraph_is_acyclic(
+    nodes: &HashSet<NodeIndex>,
+    edges: &[(NodeIndex, NodeIndex, (isize, isize))],
+    array_sign: isize,
+    array_potential: &HashMap<NodeIndex, isize>,
+    packed_sign: isize,
+    packed_potential: &HashMap<NodeIndex, isize>,
+) -> bool {
+    let mut zero = Graph::<(), ()>::new();
+    let mapped = nodes
+        .iter()
+        .map(|&node| (node, zero.add_node(())))
+        .collect::<HashMap<_, _>>();
+    for &(source, destination, offset) in edges {
+        let Some(array) = reduced_offset(
+            offset.0,
+            array_sign,
+            array_potential[&source],
+            array_potential[&destination],
+        ) else {
+            return false;
+        };
+        let Some(packed) = reduced_offset(
+            offset.1,
+            packed_sign,
+            packed_potential[&source],
+            packed_potential[&destination],
+        ) else {
+            return false;
+        };
+        debug_assert!(array >= 0 && packed >= 0);
+        if array == 0 && packed == 0 {
+            zero.add_edge(mapped[&source], mapped[&destination], ());
+        }
+    }
+    !daggy::petgraph::algo::is_cyclic_directed(&zero)
 }
 
 fn reduced_offset(
@@ -990,6 +1026,23 @@ mod tests {
             regular_transfer: false,
             diagnostic: Some((id, region, 0)),
         }
+    }
+
+    #[test]
+    fn scc_walk_does_not_use_the_native_stack() {
+        const COUNT: usize = 100_000;
+
+        let mut graph = Graph::<(), ()>::new();
+        let mut previous = None;
+        for _ in 0..COUNT {
+            let current = graph.add_node(());
+            if let Some(previous) = previous {
+                graph.add_edge(previous, current, ());
+            }
+            previous = Some(current);
+        }
+
+        assert_eq!(strongly_connected_components(&graph).len(), COUNT);
     }
 
     #[test]
@@ -1655,6 +1708,36 @@ mod tests {
     }
 
     #[test]
+    fn orthant_rejection_skips_an_unused_opposite_sign() {
+        const COUNT: usize = 10_000;
+
+        let region = ArraySpan {
+            start: 0,
+            length: 1,
+        };
+        let mut graph = DependencyGraph::new();
+        let nodes = (0..COUNT)
+            .map(|index| graph.add_node(test_node(index as u32, region)))
+            .collect::<Vec<_>>();
+        for index in 0..COUNT {
+            graph.add_edge(
+                nodes[index],
+                nodes[(index + 1) % COUNT],
+                GraphDependency::unconditional(BitDependency {
+                    array: Some(0),
+                    packed: Some(1),
+                }),
+            );
+        }
+
+        // The positive packed orthant has no reduced-zero edge, so it proves
+        // acyclicity immediately. Solving the unused negative orthant would
+        // instead run Bellman-Ford around a negative cycle COUNT times.
+        let nodes = nodes.into_iter().collect();
+        assert!(dependency_offsets_fit_acyclic_orthant(&graph, &nodes));
+    }
+
+    #[test]
     fn an_internal_regular_repeat_cannot_walk_past_a_singleton_return_guard() {
         let array = ArraySpan {
             start: 0,
@@ -1985,7 +2068,7 @@ mod tests {
             ),
         ]
         .into_iter()
-        .collect();
+        .collect::<Vec<_>>();
 
         assert!(compatible_cycle_displacements_cancel(&cycles));
     }
@@ -2010,7 +2093,7 @@ mod tests {
             ),
         ]
         .into_iter()
-        .collect();
+        .collect::<Vec<_>>();
 
         assert!(!compatible_cycle_displacements_cancel(&cycles));
     }
@@ -2042,7 +2125,7 @@ mod tests {
             ),
         ]
         .into_iter()
-        .collect();
+        .collect::<Vec<_>>();
 
         assert!(compatible_cycle_displacements_cancel(&cycles));
     }
@@ -2132,7 +2215,7 @@ mod tests {
                 }
             }
 
-            let coarse = tarjan_scc(&graph.graph)
+            let coarse = kosaraju_scc(&graph.graph)
                 .iter()
                 .any(|scc| has_compatible_cycle(&graph, scc));
             let mut exact = false;
@@ -2276,7 +2359,7 @@ mod tests {
                 }
             }
 
-            let symbolic = tarjan_scc(&graph.graph)
+            let symbolic = kosaraju_scc(&graph.graph)
                 .iter()
                 .any(|scc| has_compatible_cycle(&graph, scc));
             let mut concrete = false;
@@ -2338,6 +2421,211 @@ mod tests {
             assert_eq!(
                 symbolic, concrete,
                 "case {case}, shape [{array_width}, {packed_width}], domains {domain_specs:?}, edges {edge_specs:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn positional_cycle_detection_matches_multidomain_regular_expansion() {
+        use daggy::petgraph::algo::is_cyclic_directed;
+
+        let mut state = 0x1319_8a2e_u32;
+        let mut random = || {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            state
+        };
+        for case in 0..20_000 {
+            let node_count = 2 + random() as usize % 3;
+            let array_width = 2 + random() as usize % 3;
+            let packed_width = 2 + random() as usize % 3;
+            let position_count = array_width * packed_width;
+            let array = ArraySpan {
+                start: 0,
+                length: array_width,
+            };
+            let forced_regular = random() as usize % node_count;
+            let mut graph = DependencyGraph::new();
+            let mut domain_specs = Vec::new();
+            let mut regular_nodes = Vec::new();
+            let nodes = (0..node_count)
+                .map(|id| {
+                    // Start with two distinct singleton rectangles so every
+                    // node exercises a genuine union of position domains.
+                    let first = random() as usize % position_count;
+                    let second =
+                        (first + 1 + random() as usize % (position_count - 1)) % position_count;
+                    let mut specs = vec![
+                        (first / packed_width, 1, first % packed_width, 1),
+                        (second / packed_width, 1, second % packed_width, 1),
+                    ];
+                    if random() % 2 == 0 {
+                        let array_start = random() as usize % array_width;
+                        let packed_start = random() as usize % packed_width;
+                        specs.push((
+                            array_start,
+                            1 + random() as usize % (array_width - array_start),
+                            packed_start,
+                            1 + random() as usize % (packed_width - packed_start),
+                        ));
+                    }
+                    specs.sort_unstable();
+                    specs.dedup();
+                    let domains = specs
+                        .iter()
+                        .map(
+                            |&(array_start, array_length, packed_start, packed_length)| {
+                                PositionDomain {
+                                    array_start,
+                                    array_length,
+                                    packed_start,
+                                    packed_length,
+                                }
+                            },
+                        )
+                        .collect();
+                    domain_specs.push(specs);
+                    let regular = id == forced_regular || random() % 4 == 0;
+                    regular_nodes.push(regular);
+                    let id = VarId::from_raw(id as u32);
+                    graph.add_node(GraphNode {
+                        region: SummaryRegion {
+                            id,
+                            array,
+                            packed: PackedSpan::new(0, packed_width).unwrap(),
+                        },
+                        domains,
+                        regular_transfer: regular,
+                        diagnostic: Some((id, array, 0)),
+                    })
+                })
+                .collect::<Vec<_>>();
+
+            let mut edge_specs = Vec::new();
+            for node in 0..node_count {
+                if !regular_nodes[node] {
+                    continue;
+                }
+                let step = if random() % 2 == 0 { 1 } else { -1 };
+                let dependency = if random() % 2 == 0 {
+                    BitDependency {
+                        array: Some(step),
+                        packed: Some(0),
+                    }
+                } else {
+                    BitDependency {
+                        array: Some(0),
+                        packed: Some(step),
+                    }
+                };
+                edge_specs.push((node, node, dependency, None));
+                add_dependency_edge(
+                    &mut graph,
+                    nodes[node],
+                    nodes[node],
+                    GraphDependency {
+                        kind: dependency,
+                        condition: PathCondition::default(),
+                        carrier: true,
+                    },
+                );
+            }
+
+            let edge_count = 1 + random() as usize % (node_count * node_count * 2);
+            let branch = BranchId::new(case + 200_001, 0, 2);
+            for _ in 0..edge_count {
+                let source = random() as usize % node_count;
+                let destination = random() as usize % node_count;
+                // Keep the explicit carrier as the regular node's only
+                // self-edge; arbitrary self-edges must never inherit carrier
+                // provenance merely from their shape.
+                if source == destination && regular_nodes[source] {
+                    continue;
+                }
+                let raw_array = random();
+                let raw_packed = random();
+                let dependency = BitDependency {
+                    array: (raw_array % 3 != 0).then_some(raw_array as isize % 5 - 2),
+                    packed: (raw_packed % 3 != 0).then_some(raw_packed as isize % 5 - 2),
+                };
+                let arm = match random() % 3 {
+                    0 => None,
+                    arm => Some(arm as usize - 1),
+                };
+                edge_specs.push((source, destination, dependency, arm));
+                add_dependency_edge(
+                    &mut graph,
+                    nodes[source],
+                    nodes[destination],
+                    GraphDependency {
+                        kind: dependency,
+                        condition: arm.map_or_else(PathCondition::default, |arm| {
+                            PathCondition::default().with_choice(branch, arm)
+                        }),
+                        carrier: false,
+                    },
+                );
+            }
+
+            let symbolic = kosaraju_scc(&graph.graph)
+                .iter()
+                .any(|scc| has_compatible_cycle(&graph, scc));
+            let mut concrete = false;
+            for selected_arm in 0..2 {
+                let mut expanded = Graph::<(), ()>::new();
+                let expanded_nodes = (0..node_count)
+                    .map(|_| {
+                        (0..position_count)
+                            .map(|_| expanded.add_node(()))
+                            .collect::<Vec<_>>()
+                    })
+                    .collect::<Vec<_>>();
+                let position_allowed = |node: usize, array: usize, packed: usize| {
+                    domain_specs[node].iter().any(
+                        |&(array_start, array_length, packed_start, packed_length)| {
+                            (array_start..array_start + array_length).contains(&array)
+                                && (packed_start..packed_start + packed_length).contains(&packed)
+                        },
+                    )
+                };
+                for (source, destination, dependency, arm) in &edge_specs {
+                    if arm.is_some_and(|arm| arm != selected_arm) {
+                        continue;
+                    }
+                    for source_array in 0..array_width {
+                        for source_packed in 0..packed_width {
+                            if !position_allowed(*source, source_array, source_packed) {
+                                continue;
+                            }
+                            let destination_arrays =
+                                mapped_positions(source_array, dependency.array, array_width);
+                            let destination_packeds =
+                                mapped_positions(source_packed, dependency.packed, packed_width);
+                            for destination_array in &destination_arrays {
+                                for destination_packed in &destination_packeds {
+                                    if !position_allowed(
+                                        *destination,
+                                        *destination_array,
+                                        *destination_packed,
+                                    ) {
+                                        continue;
+                                    }
+                                    expanded.add_edge(
+                                        expanded_nodes[*source]
+                                            [source_array * packed_width + source_packed],
+                                        expanded_nodes[*destination]
+                                            [destination_array * packed_width + destination_packed],
+                                        (),
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+                concrete |= is_cyclic_directed(&expanded);
+            }
+            assert_eq!(
+                symbolic, concrete,
+                "case {case}, shape [{array_width}, {packed_width}], domains {domain_specs:?}, regular {regular_nodes:?}, edges {edge_specs:?}"
             );
         }
     }

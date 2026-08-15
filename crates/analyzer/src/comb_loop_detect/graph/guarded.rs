@@ -36,8 +36,14 @@ use crate::comb_loop_detect::model::BitDependency;
 use crate::comb_loop_detect::ssa::PathCondition;
 use crate::{HashMap, HashSet};
 use daggy::petgraph::Graph;
-use daggy::petgraph::algo::tarjan_scc;
+use daggy::petgraph::algo::kosaraju_scc;
 use std::collections::VecDeque;
+
+// `PathCondition` uses interior mutability only for append-only memoization;
+// the branch set represented by an existing value never changes. Its Hash/Eq
+// identity is therefore stable while it is stored in these cycle sets.
+#[allow(clippy::mutable_key_type)]
+type GuardedCycleSet = HashSet<GuardedCycle>;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(super) struct GuardedCycle {
@@ -48,7 +54,8 @@ pub(super) struct GuardedCycle {
     pub(super) carrier: bool,
 }
 
-pub(super) fn guarded_cycle_displacements_cancel(cycles: &HashSet<GuardedCycle>) -> bool {
+#[allow(clippy::mutable_key_type)]
+pub(super) fn guarded_cycle_displacements_cancel(cycles: &GuardedCycleSet) -> bool {
     let translations = cycles
         .iter()
         .filter_map(|cycle| {
@@ -88,7 +95,8 @@ pub(super) fn guarded_cycle_displacements_cancel(cycles: &HashSet<GuardedCycle>)
     guarded_relations_close(cycles)
 }
 
-fn guarded_relations_close(cycles: &HashSet<GuardedCycle>) -> bool {
+#[allow(clippy::mutable_key_type)]
+fn guarded_relations_close(cycles: &GuardedCycleSet) -> bool {
     let cycles = cycles.iter().collect::<Vec<_>>();
     let mut reached: Vec<(PositionRelationSet, PathCondition)> = Vec::new();
     let mut queue = VecDeque::new();
@@ -379,7 +387,7 @@ fn guarded_transition_components_that_can_cancel(
         }
     }
 
-    tarjan_scc(&transitions)
+    kosaraju_scc(&transitions)
         .into_iter()
         .filter_map(|component| {
             let cycles = component
@@ -389,7 +397,7 @@ fn guarded_transition_components_that_can_cancel(
             let displacements = cycles
                 .iter()
                 .map(|cycle| (cycle.dependency, cycle.condition.clone()))
-                .collect();
+                .collect::<Vec<_>>();
             compatible_cycle_displacements_cancel(&displacements).then_some(cycles)
         })
         .collect()
@@ -700,7 +708,7 @@ fn axis_contains(outer: Option<(isize, isize)>, inner: Option<(isize, isize)>) -
 }
 
 pub(super) fn compatible_cycle_displacements_cancel(
-    cycles: &HashSet<(BitDependency, PathCondition)>,
+    cycles: &[(BitDependency, PathCondition)],
 ) -> bool {
     // A closed walk is a non-negative combination of its coarse cycles. In
     // two positional dimensions, a zero displacement needs at most three
