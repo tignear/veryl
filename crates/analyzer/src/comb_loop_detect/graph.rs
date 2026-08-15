@@ -21,6 +21,16 @@ use guarded::{GuardedCycle, guarded_cycle_displacements_cancel};
 use relation::PositionRelationSet;
 use std::ops::{Deref, DerefMut};
 
+#[cfg(test)]
+thread_local! {
+    static ZERO_DEPENDENCY_SEARCH_EDGE_VISITS: std::cell::Cell<usize> = const {
+        std::cell::Cell::new(0)
+    };
+    static FEASIBLE_POSITION_PAIR_PROBES: std::cell::Cell<usize> = const {
+        std::cell::Cell::new(0)
+    };
+}
+
 #[derive(Clone, Debug)]
 pub(super) struct GraphDependency {
     pub(super) kind: BitDependency,
@@ -346,6 +356,16 @@ fn has_compatible_cycle(graph: &DependencyGraph, scc: &[NodeIndex]) -> bool {
     }
 
     let nodes: HashSet<_> = scc.iter().copied().collect();
+    // A directed simple-cycle SCC has exactly one possible cyclic word. Walk
+    // it once, instead of launching the same guarded first-return search from
+    // every anchor. This is exact: incompatible guards reject the only word,
+    // while a compatible word closes iff its composed position relation
+    // intersects identity. Repeating one non-identity exact translation can
+    // never cancel itself, and a WHOLE relation already exposes identity on
+    // the first traversal.
+    if let Some(result) = simple_cycle_is_compatible(graph, scc, &nodes) {
+        return result;
+    }
     if has_zero_dependency_cycle(graph, scc, &nodes) {
         return true;
     }
@@ -501,6 +521,59 @@ fn has_compatible_cycle(graph: &DependencyGraph, scc: &[NodeIndex]) -> bool {
         remaining.remove(&start);
     }
     false
+}
+
+fn simple_cycle_is_compatible(
+    graph: &DependencyGraph,
+    scc: &[NodeIndex],
+    nodes: &HashSet<NodeIndex>,
+) -> Option<bool> {
+    let &start = scc.first()?;
+    let mut next = HashMap::default();
+    let mut indegree = nodes
+        .iter()
+        .map(|&node| (node, 0usize))
+        .collect::<HashMap<_, _>>();
+    for &source in nodes {
+        let mut internal = graph
+            .edges(source)
+            .filter(|edge| nodes.contains(&edge.target()));
+        let edge = internal.next()?;
+        if internal.next().is_some() {
+            return None;
+        }
+        let destination = edge.target();
+        *indegree
+            .get_mut(&destination)
+            .expect("a simple-cycle destination belongs to the SCC") += 1;
+        next.insert(source, (destination, edge.id()));
+    }
+    if indegree.values().any(|&count| count != 1) {
+        return None;
+    }
+
+    let mut node = start;
+    let mut condition = PathCondition::default();
+    let mut relation = PositionRelationSet::identity(&graph[start].domains);
+    for step in 0..scc.len() {
+        let &(destination, edge) = next.get(&node)?;
+        if (step + 1 == scc.len()) != (destination == start) {
+            return None;
+        }
+        let dependency = graph
+            .edge_weight(edge)
+            .expect("a simple-cycle edge must remain present");
+        let Some(next_condition) = condition.conjoin_if_compatible(&dependency.condition) else {
+            return Some(false);
+        };
+        relation = relation.then_dependency(dependency.kind, &graph[destination].domains);
+        if relation.is_empty() {
+            return Some(false);
+        }
+        condition = next_condition;
+        node = destination;
+    }
+    Some(relation.intersects_identity())
 }
 
 fn has_commuting_translation_successor(graph: &DependencyGraph, anchor: NodeIndex) -> bool {
@@ -825,6 +898,13 @@ fn has_zero_dependency_cycle(
     scc: &[NodeIndex],
     nodes: &HashSet<NodeIndex>,
 ) -> bool {
+    // Any compatible identity cycle is also a cycle in the graph obtained by
+    // forgetting guards and position domains.  Reject an acyclic identity
+    // subgraph once, rather than walking the same long identity chain from
+    // every possible anchor.
+    if identity_subgraph_is_acyclic(graph, nodes) {
+        return false;
+    }
     for &start in scc {
         let initial = initial_feasible_positions(&graph[start]);
         let mut stack = vec![(start, PathCondition::default(), initial)];
@@ -832,6 +912,9 @@ fn has_zero_dependency_cycle(
             HashMap::default();
         while let Some((node, condition, feasible)) = stack.pop() {
             for edge in graph.edges(node) {
+                #[cfg(test)]
+                ZERO_DEPENDENCY_SEARCH_EDGE_VISITS
+                    .set(ZERO_DEPENDENCY_SEARCH_EDGE_VISITS.get() + 1);
                 if !dependency_is_identity(edge.weight().kind) {
                     continue;
                 }
@@ -872,6 +955,45 @@ fn has_zero_dependency_cycle(
     false
 }
 
+fn identity_subgraph_is_acyclic(graph: &DependencyGraph, nodes: &HashSet<NodeIndex>) -> bool {
+    let mut indegree = nodes
+        .iter()
+        .map(|&node| (node, 0usize))
+        .collect::<HashMap<_, _>>();
+    for &source in nodes {
+        for edge in graph.edges(source) {
+            let destination = edge.target();
+            if nodes.contains(&destination) && dependency_is_identity(edge.weight().kind) {
+                *indegree
+                    .get_mut(&destination)
+                    .expect("identity destination is in the selected subgraph") += 1;
+            }
+        }
+    }
+    let mut ready = indegree
+        .iter()
+        .filter_map(|(&node, &count)| (count == 0).then_some(node))
+        .collect::<Vec<_>>();
+    let mut removed = 0;
+    while let Some(source) = ready.pop() {
+        removed += 1;
+        for edge in graph.edges(source) {
+            let destination = edge.target();
+            if !nodes.contains(&destination) || !dependency_is_identity(edge.weight().kind) {
+                continue;
+            }
+            let count = indegree
+                .get_mut(&destination)
+                .expect("identity destination is in the selected subgraph");
+            *count -= 1;
+            if *count == 0 {
+                ready.push(destination);
+            }
+        }
+    }
+    removed == nodes.len()
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 struct FeasiblePosition {
     array: Option<(isize, isize)>,
@@ -899,12 +1021,21 @@ fn restrict_feasible_positions(
     if domains.is_empty() {
         return current.to_vec();
     }
+    let allowed = domains
+        .iter()
+        .filter_map(|&domain| feasible_from_domain(domain, dependency))
+        .collect::<Vec<_>>();
+    // This is the dominant self-edge case for partitioned nodes.  Avoid the
+    // Cartesian intersection when the dependency preserves exactly the same
+    // already-normalized domain list.
+    if current == allowed {
+        return current.to_vec();
+    }
     let mut result = Vec::new();
     for &current in current {
-        for &domain in domains {
-            let Some(allowed) = feasible_from_domain(domain, dependency) else {
-                continue;
-            };
+        for &allowed in &allowed {
+            #[cfg(test)]
+            FEASIBLE_POSITION_PAIR_PROBES.set(FEASIBLE_POSITION_PAIR_PROBES.get() + 1);
             let Some(array) = intersect_axis(current.array, allowed.array) else {
                 continue;
             };
@@ -1123,6 +1254,106 @@ mod tests {
         graph.add_edge(b, a, identity);
 
         assert!(has_compatible_cycle(&graph, &[a, b]));
+    }
+
+    #[test]
+    fn contradictory_guarded_simple_cycle_is_checked_once() {
+        const COUNT: usize = 4_096;
+        let region = ArraySpan {
+            start: 0,
+            length: 1,
+        };
+        let mut graph = DependencyGraph::new();
+        let nodes = (0..COUNT)
+            .map(|id| graph.add_node(test_node(id as u32, region)))
+            .collect::<Vec<_>>();
+        let branch = BranchId::new(7, 0, 2);
+        for source in 0..COUNT {
+            let condition = if source == 0 {
+                PathCondition::default().with_choice(branch, 0)
+            } else if source == COUNT / 2 {
+                PathCondition::default().with_choice(branch, 1)
+            } else {
+                PathCondition::default()
+            };
+            graph.add_edge(
+                nodes[source],
+                nodes[(source + 1) % COUNT],
+                GraphDependency {
+                    kind: BitDependency::identity(),
+                    condition,
+                    carrier: false,
+                },
+            );
+        }
+        ZERO_DEPENDENCY_SEARCH_EDGE_VISITS.set(0);
+
+        assert!(!has_compatible_cycle(&graph, &nodes));
+        assert_eq!(
+            ZERO_DEPENDENCY_SEARCH_EDGE_VISITS.get(),
+            0,
+            "a directed simple cycle must be composed once, not searched from every anchor",
+        );
+    }
+
+    #[test]
+    fn identity_cycle_search_rejects_an_acyclic_chain_once() {
+        const COUNT: usize = 4_096;
+        let region = ArraySpan {
+            start: 0,
+            length: 1,
+        };
+        let mut graph = DependencyGraph::new();
+        let nodes = (0..COUNT)
+            .map(|id| graph.add_node(test_node(id as u32, region)))
+            .collect::<Vec<_>>();
+        for pair in nodes.windows(2) {
+            graph.add_edge(
+                pair[0],
+                pair[1],
+                GraphDependency::unconditional(BitDependency::identity()),
+            );
+        }
+        graph.add_edge(
+            nodes[COUNT - 1],
+            nodes[0],
+            GraphDependency::unconditional(BitDependency {
+                array: Some(1),
+                packed: Some(0),
+            }),
+        );
+        let members = nodes.iter().copied().collect::<HashSet<_>>();
+        ZERO_DEPENDENCY_SEARCH_EDGE_VISITS.set(0);
+
+        assert!(!has_zero_dependency_cycle(&graph, &nodes, &members));
+        assert!(
+            ZERO_DEPENDENCY_SEARCH_EDGE_VISITS.get() <= COUNT,
+            "an acyclic identity subgraph must not be searched from every anchor",
+        );
+    }
+
+    #[test]
+    fn identity_domain_restriction_does_not_cross_product_equal_partitions() {
+        const COUNT: usize = 4_096;
+        let domains = (0..COUNT)
+            .map(|start| PositionDomain {
+                array_start: start,
+                array_length: 1,
+                packed_start: start,
+                packed_length: 1,
+            })
+            .collect::<Vec<_>>();
+        let current = domains
+            .iter()
+            .filter_map(|&domain| feasible_from_domain(domain, BitDependency::identity()))
+            .collect::<Vec<_>>();
+        FEASIBLE_POSITION_PAIR_PROBES.set(0);
+
+        assert_eq!(
+            restrict_feasible_positions(&current, BitDependency::identity(), &domains),
+            current,
+        );
+        assert_eq!(FEASIBLE_POSITION_PAIR_PROBES.get(), 0);
     }
 
     #[test]
