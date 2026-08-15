@@ -411,6 +411,67 @@ fn filtered_actual_keys(
         .collect()
 }
 
+struct InstanceEndpointIndex {
+    inputs: HashMap<VarId, usize>,
+    outputs: HashMap<VarId, usize>,
+    interface_bindings: HashMap<VarId, usize>,
+    input_array_filters: HashMap<VarId, StaticArrayFilters>,
+    output_array_filters: HashMap<VarId, StaticArrayFilters>,
+}
+
+impl InstanceEndpointIndex {
+    fn new(inst: &InstDeclaration, _child: &Module, ctx: &mut Context) -> Self {
+        let input_array_filters = inst
+            .inputs
+            .iter()
+            .filter_map(|input| {
+                let Expression::Term(factor) = input.single()? else {
+                    return None;
+                };
+                let Factor::Variable(parent, index, _, _) = factor.as_ref() else {
+                    return None;
+                };
+                Some((input.id, StaticArrayFilters::new(*parent, index, ctx)))
+            })
+            .collect();
+        let output_array_filters = inst
+            .outputs
+            .iter()
+            .filter_map(|output| {
+                let [destination] = output.dst.as_slice() else {
+                    return None;
+                };
+                Some((
+                    output.id,
+                    StaticArrayFilters::new(destination.id, &destination.index, ctx),
+                ))
+            })
+            .collect();
+        Self {
+            inputs: inst
+                .inputs
+                .iter()
+                .enumerate()
+                .map(|(index, input)| (input.id, index))
+                .collect(),
+            outputs: inst
+                .outputs
+                .iter()
+                .enumerate()
+                .map(|(index, output)| (output.id, index))
+                .collect(),
+            interface_bindings: inst
+                .interface_bindings
+                .iter()
+                .enumerate()
+                .map(|(index, binding)| (binding.child, index))
+                .collect(),
+            input_array_filters,
+            output_array_filters,
+        }
+    }
+}
+
 fn collect_instance_summary_spans(
     module: &Module,
     summaries: &HashMap<Signature, ModuleCombSummary>,
@@ -424,6 +485,7 @@ fn collect_instance_summary_spans(
         let Some(summary) = summaries.get(&child.signature) else {
             continue;
         };
+        let endpoints = InstanceEndpointIndex::new(inst, child, ctx);
         for node in &summary.nodes {
             let direction = match node.kind {
                 SummaryNodeKind::Input | SummaryNodeKind::Interface => Direction::Input,
@@ -431,7 +493,7 @@ fn collect_instance_summary_spans(
                 SummaryNodeKind::Internal => continue,
             };
             for (parent, array, packed) in
-                summary_parent_accesses(inst, child, node.region, direction, ctx)
+                summary_parent_accesses(inst, &endpoints, child, node.region, direction, ctx)
             {
                 accesses.entry((parent, array)).or_default().push(packed);
             }
@@ -441,6 +503,7 @@ fn collect_instance_summary_spans(
 
 fn summary_parent_accesses(
     inst: &InstDeclaration,
+    endpoints: &InstanceEndpointIndex,
     child: &Module,
     region: SummaryRegion,
     direction: Direction,
@@ -453,10 +516,10 @@ fn summary_parent_accesses(
     else {
         return Vec::new();
     };
-    if let Some(binding) = inst
+    if let Some(binding) = endpoints
         .interface_bindings
-        .iter()
-        .find(|binding| binding.child == region.id)
+        .get(&region.id)
+        .map(|&index| &inst.interface_bindings[index])
         && let Some(accesses) = translated_interface_binding_accesses(region, variable, binding)
     {
         return accesses
@@ -465,7 +528,10 @@ fn summary_parent_accesses(
             .collect();
     }
     if direction == Direction::Output
-        && let Some(output) = inst.outputs.iter().find(|output| output.id == region.id)
+        && let Some(output) = endpoints
+            .outputs
+            .get(&region.id)
+            .map(|&index| &inst.outputs[index])
     {
         let accesses = if let Some(actual) = &output.range_dst {
             translated_coerced_contiguous_actual_accesses(region, variable, actual)
@@ -480,7 +546,10 @@ fn summary_parent_accesses(
         }
     }
     if direction == Direction::Input
-        && let Some(input) = inst.inputs.iter().find(|input| input.id == region.id)
+        && let Some(input) = endpoints
+            .inputs
+            .get(&region.id)
+            .map(|&index| &inst.inputs[index])
         && let Some(actual) = &input.range_src
         && let Some(accesses) = translated_coerced_input_contiguous_actual_accesses(
             region,
@@ -494,8 +563,8 @@ fn summary_parent_accesses(
             .map(|access| (access.parent, access.array, access.packed))
             .collect();
     }
-    if let Some((parent, index, select, member_select_domain)) =
-        instance_port_region_actual(inst, region.id, direction)
+    if let Some((parent, index, select, member_select_domain, _)) =
+        instance_port_region_actual(inst, endpoints, region.id, direction)
     {
         return translated_summary_access(
             region,
@@ -1350,8 +1419,11 @@ impl<'a> ModuleGraphBuilder<'a> {
         let procedure_context = &mut self.procedure_context;
         let function_summaries = &mut self.function_summaries;
         let mut complete = true;
-        let input_requests = instance_input_region_requests(inst, child, summary, bit_part, ctx);
+        let endpoints = InstanceEndpointIndex::new(inst, child, ctx);
+        let (input_requests, positioned_inputs) =
+            instance_input_region_requests(inst, &endpoints, child, summary, bit_part, ctx);
         let mut input_reads: HashMap<VarId, Vec<procedure::RegionSource>> = HashMap::default();
+        let mut input_read_keys: HashMap<VarId, HashSet<NodeKey>> = HashMap::default();
         let mut input_region_mappings: HashMap<SummaryRegion, InstanceRegionMapping> =
             HashMap::default();
         for inp in &inst.inputs {
@@ -1441,6 +1513,7 @@ impl<'a> ModuleGraphBuilder<'a> {
                     && left.condition == right.condition
             });
             if !reads.is_empty() {
+                input_read_keys.insert(inp.id, reads.iter().map(|source| source.key).collect());
                 input_reads.insert(inp.id, reads);
             }
         }
@@ -1532,16 +1605,17 @@ impl<'a> ModuleGraphBuilder<'a> {
         for (index, node) in summary.nodes.iter().enumerate() {
             let (mapping, endpoint_mapping) = match node.kind {
                 SummaryNodeKind::Input => {
-                    let preserve_position = summary
-                        .edges
-                        .iter()
-                        .any(|edge| edge.source == index && edge.kind.has_position());
+                    #[cfg(test)]
+                    INSTANCE_REQUEST_EDGE_PROBES.set(INSTANCE_REQUEST_EDGE_PROBES.get() + 1);
+                    let preserve_position = positioned_inputs.contains(&index);
                     let mapping = map_instance_source_region(
                         inst,
+                        &endpoints,
                         child,
                         node.region,
                         preserve_position,
                         input_reads.get(&node.region.id).map(Vec::as_slice),
+                        input_read_keys.get(&node.region.id),
                         &input_region_mappings,
                         bit_part,
                         ctx,
@@ -1558,6 +1632,7 @@ impl<'a> ModuleGraphBuilder<'a> {
                 SummaryNodeKind::Output => {
                     let mapping = instance_region_mapping(
                         inst,
+                        &endpoints,
                         child,
                         node.region,
                         Direction::Output,
@@ -1577,6 +1652,7 @@ impl<'a> ModuleGraphBuilder<'a> {
                 SummaryNodeKind::Interface => {
                     let mapping = instance_region_mapping(
                         inst,
+                        &endpoints,
                         child,
                         node.region,
                         Direction::Input,
@@ -1632,12 +1708,14 @@ impl<'a> ModuleGraphBuilder<'a> {
                         RegionProjection::Exact(source_region) => {
                             let sources = map_instance_source_region(
                                 inst,
+                                &endpoints,
                                 child,
                                 source_region,
                                 true,
                                 input_reads
                                     .get(&summary.nodes[edge.source].region.id)
                                     .map(Vec::as_slice),
+                                input_read_keys.get(&summary.nodes[edge.source].region.id),
                                 &input_region_mappings,
                                 bit_part,
                                 ctx,
@@ -1711,16 +1789,19 @@ impl<'a> ModuleGraphBuilder<'a> {
 #[allow(clippy::too_many_arguments)]
 fn map_instance_source_region(
     inst: &InstDeclaration,
+    endpoints: &InstanceEndpointIndex,
     child: &Module,
     region: SummaryRegion,
     preserve_position: bool,
     allowed: Option<&[procedure::RegionSource]>,
+    allowed_keys: Option<&HashSet<NodeKey>>,
     evaluated: &HashMap<SummaryRegion, InstanceRegionMapping>,
     bit_part: &BitPartition,
     ctx: &mut Context,
 ) -> InstanceRegionMapping {
     let parent_sources = instance_region_mapping(
         inst,
+        endpoints,
         child,
         region,
         Direction::Input,
@@ -1733,10 +1814,10 @@ fn map_instance_source_region(
             .nodes
             .iter()
             .any(|source| source.offset.has_position())
-        || inst
+        || endpoints
             .inputs
-            .iter()
-            .find(|input| input.id == region.id)
+            .get(&region.id)
+            .and_then(|&index| inst.inputs.get(index))
             .is_some_and(|input| input.range_src.is_some())
     {
         return parent_sources;
@@ -1744,9 +1825,9 @@ fn map_instance_source_region(
     let Some(mut mapping) = evaluated.get(&region).cloned() else {
         return parent_sources;
     };
-    mapping.nodes.retain(|source| {
-        allowed.is_some_and(|allowed| allowed.iter().any(|item| item.key == source.key))
-    });
+    mapping
+        .nodes
+        .retain(|source| allowed_keys.is_some_and(|allowed| allowed.contains(&source.key)));
     mapping
 }
 
@@ -1802,11 +1883,12 @@ enum RegionProjection {
 
 fn instance_input_region_requests(
     inst: &InstDeclaration,
+    endpoints: &InstanceEndpointIndex,
     child: &Module,
     summary: &ModuleCombSummary,
     bit_part: &BitPartition,
     ctx: &mut Context,
-) -> HashMap<VarId, Vec<SummaryRegion>> {
+) -> (HashMap<VarId, Vec<SummaryRegion>>, HashSet<usize>) {
     let mut requests: HashMap<VarId, Vec<SummaryRegion>> = HashMap::default();
     let mut positioned_inputs = HashSet::default();
     for edge in &summary.edges {
@@ -1816,7 +1898,7 @@ fn instance_input_region_requests(
             positioned_inputs.insert(edge.source);
         }
     }
-    for index in positioned_inputs {
+    for &index in &positioned_inputs {
         let Some(node) = summary.nodes.get(index) else {
             continue;
         };
@@ -1837,6 +1919,7 @@ fn instance_input_region_requests(
         .map(|node| match node.kind {
             SummaryNodeKind::Output => Some(instance_region_mapping(
                 inst,
+                endpoints,
                 child,
                 node.region,
                 Direction::Output,
@@ -1846,6 +1929,7 @@ fn instance_input_region_requests(
             )),
             SummaryNodeKind::Interface => Some(instance_region_mapping(
                 inst,
+                endpoints,
                 child,
                 node.region,
                 Direction::Input,
@@ -1885,7 +1969,7 @@ fn instance_input_region_requests(
         regions.sort_unstable();
         regions.dedup();
     }
-    requests
+    (requests, positioned_inputs)
 }
 
 fn child_source_region_for_destination(
@@ -1984,6 +2068,7 @@ fn translate_packed_span(span: PackedSpan, offset: isize) -> Option<PackedSpan> 
 #[allow(clippy::too_many_arguments)]
 fn instance_region_mapping(
     inst: &InstDeclaration,
+    endpoints: &InstanceEndpointIndex,
     child: &Module,
     region: SummaryRegion,
     direction: Direction,
@@ -1997,9 +2082,10 @@ fn instance_region_mapping(
         .or_else(|| child.interface_members.get(&region.id));
     if let (Some(variable), Some(binding)) = (
         variable,
-        inst.interface_bindings
-            .iter()
-            .find(|binding| binding.child == region.id),
+        endpoints
+            .interface_bindings
+            .get(&region.id)
+            .map(|&index| &inst.interface_bindings[index]),
     ) && let Some(mapping) =
         map_summary_region_to_interface_binding(region, variable, binding, bit_part)
     {
@@ -2009,7 +2095,10 @@ fn instance_region_mapping(
     if direction == Direction::Output
         && let (Some(variable), Some(output)) = (
             variable,
-            inst.outputs.iter().find(|output| output.id == region.id),
+            endpoints
+                .outputs
+                .get(&region.id)
+                .map(|&index| &inst.outputs[index]),
         )
     {
         let mapping = if let Some(actual) = &output.range_dst {
@@ -2025,7 +2114,10 @@ fn instance_region_mapping(
     if direction == Direction::Input
         && let (Some(variable), Some(input)) = (
             variable,
-            inst.inputs.iter().find(|input| input.id == region.id),
+            endpoints
+                .inputs
+                .get(&region.id)
+                .map(|&index| &inst.inputs[index]),
         )
         && let Some(actual) = &input.range_src
         && let Some(mapping) = map_summary_region_to_coerced_input_contiguous_actual(
@@ -2040,10 +2132,9 @@ fn instance_region_mapping(
     }
 
     if let Some(variable) = variable
-        && let Some((parent, index, select, member_select_domain)) =
-            instance_port_region_actual(inst, region.id, direction)
+        && let Some((parent, index, select, member_select_domain, array_filters)) =
+            instance_port_region_actual(inst, endpoints, region.id, direction)
     {
-        let array_filters = StaticArrayFilters::new(parent, index, ctx);
         return map_summary_region(
             region,
             variable,
@@ -2051,7 +2142,7 @@ fn instance_region_mapping(
             index,
             select,
             member_select_domain,
-            &array_filters,
+            array_filters,
             bit_part,
             ctx,
         );
@@ -2071,29 +2162,37 @@ fn instance_region_mapping(
     }
 }
 
-fn instance_port_region_actual(
-    inst: &InstDeclaration,
+fn instance_port_region_actual<'a>(
+    inst: &'a InstDeclaration,
+    endpoints: &'a InstanceEndpointIndex,
     child: VarId,
     direction: Direction,
 ) -> Option<(
     VarId,
-    &crate::ir::VarIndex,
-    &VarSelect,
+    &'a crate::ir::VarIndex,
+    &'a VarSelect,
     Option<MemberSelectDomain>,
+    &'a StaticArrayFilters,
 )> {
     match direction {
         Direction::Input => {
-            let input = inst.inputs.iter().find(|input| input.id == child)?;
+            let input = &inst.inputs[*endpoints.inputs.get(&child)?];
             let Expression::Term(factor) = input.single()? else {
                 return None;
             };
             let Factor::Variable(parent, index, select, comptime) = factor.as_ref() else {
                 return None;
             };
-            Some((*parent, index, select, comptime.member_select_domain))
+            Some((
+                *parent,
+                index,
+                select,
+                comptime.member_select_domain,
+                endpoints.input_array_filters.get(&child)?,
+            ))
         }
         Direction::Output => {
-            let output = inst.outputs.iter().find(|output| output.id == child)?;
+            let output = &inst.outputs[*endpoints.outputs.get(&child)?];
             let [destination] = output.dst.as_slice() else {
                 return None;
             };
@@ -2102,6 +2201,7 @@ fn instance_port_region_actual(
                 &destination.index,
                 &destination.select,
                 destination.comptime.member_select_domain,
+                endpoints.output_array_filters.get(&child)?,
             ))
         }
         Direction::Inout | Direction::Interface | Direction::Modport | Direction::Import => None,
