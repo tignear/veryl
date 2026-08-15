@@ -1,13 +1,85 @@
 //! IR-independent statement-ordered SSA state.
 
 use crate::{HashMap, HashSet};
+use std::cell::{OnceCell, RefCell};
 use std::collections::VecDeque;
-use std::hash::Hash;
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::rc::Rc;
+
+#[cfg(test)]
+thread_local! {
+    static PATH_CONSTRAINT_MATERIALIZATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static SNAPSHOT_KEY_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static REVISION_EVENT_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static REVISION_CANDIDATE_INPUTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static SOURCE_SUMMARY_STATE_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn reset_source_summary_state_visits() {
+    SOURCE_SUMMARY_STATE_VISITS.set(0);
+}
+
+#[cfg(test)]
+pub(crate) fn source_summary_state_visits() -> usize {
+    SOURCE_SUMMARY_STATE_VISITS.get()
+}
+
+#[cfg(test)]
+pub(crate) fn reset_flow_scaling_counters() {
+    PATH_CONSTRAINT_MATERIALIZATIONS.set(0);
+    SNAPSHOT_KEY_VISITS.set(0);
+    REVISION_EVENT_VISITS.set(0);
+    REVISION_CANDIDATE_INPUTS.set(0);
+}
+
+#[cfg(test)]
+pub(crate) fn flow_scaling_counters() -> (usize, usize, usize, usize) {
+    (
+        PATH_CONSTRAINT_MATERIALIZATIONS.get(),
+        SNAPSHOT_KEY_VISITS.get(),
+        REVISION_EVENT_VISITS.get(),
+        REVISION_CANDIDATE_INPUTS.get(),
+    )
+}
 
 pub(super) type VersionId = usize;
 
 type SourceMap<K> = HashMap<(K, PositionRelation), PathCondition>;
+
+pub(super) struct BranchRemapper {
+    mapping: HashMap<BranchId, BranchId>,
+    cache: RefCell<HashMap<ConditionNodeKey, PathCondition>>,
+    // Cache keys use the arena address, while this map keeps every referenced
+    // arena alive for the lifetime of the cache. This prevents address reuse
+    // without putting an interior-mutable `Rc<RefCell<_>>` in a hash key.
+    source_arenas: RefCell<HashMap<usize, Rc<RefCell<PathConditionArena>>>>,
+}
+
+impl BranchRemapper {
+    pub(super) fn new(mapping: HashMap<BranchId, BranchId>) -> Self {
+        Self {
+            mapping,
+            cache: RefCell::new(HashMap::default()),
+            source_arenas: RefCell::new(HashMap::default()),
+        }
+    }
+
+    pub(super) fn remap(&self, condition: &PathCondition) -> PathCondition {
+        let arena = Rc::as_ptr(&condition.arena) as usize;
+        self.source_arenas
+            .borrow_mut()
+            .entry(arena)
+            .or_insert_with(|| condition.arena.clone());
+        condition.remapped_cached(&self.mapping, arena, &mut self.cache.borrow_mut())
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct ConditionNodeKey {
+    arena: usize,
+    node: usize,
+}
 
 pub(super) struct SourceCache<K> {
     summaries: HashMap<(VersionId, bool), Rc<SourceMap<K>>>,
@@ -47,7 +119,7 @@ enum Version<K> {
         graph: Rc<DependencyDag<K>>,
         root: Option<usize>,
         bindings: Rc<HashMap<K, Vec<(VersionId, PositionRelation)>>>,
-        branches: Rc<HashMap<BranchId, BranchId>>,
+        branches: Rc<BranchRemapper>,
     },
     Projected {
         source: VersionId,
@@ -67,15 +139,43 @@ enum Version<K> {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub(super) struct BranchId {
-    procedure: usize,
+    namespace: BranchNamespace,
     local: usize,
     arms: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+enum BranchNamespace {
+    Procedure(usize),
+    Expression(usize),
+    ExpressionCall { root: usize, call: usize },
 }
 
 impl BranchId {
     pub(super) const fn new(procedure: usize, local: usize, arms: usize) -> Self {
         Self {
-            procedure,
+            namespace: BranchNamespace::Procedure(procedure),
+            local,
+            arms,
+        }
+    }
+
+    pub(super) const fn expression(root: usize, local: usize, arms: usize) -> Self {
+        Self {
+            namespace: BranchNamespace::Expression(root),
+            local,
+            arms,
+        }
+    }
+
+    pub(super) const fn expression_call(
+        root: usize,
+        call: usize,
+        local: usize,
+        arms: usize,
+    ) -> Self {
+        Self {
+            namespace: BranchNamespace::ExpressionCall { root, call },
             local,
             arms,
         }
@@ -165,14 +265,306 @@ impl ArmSet {
 /// retained. Choices of the same branch remain exact, which is sufficient to
 /// reject cycles assembled from mutually exclusive arms without enumerating
 /// every combination of independent conditions.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Clone)]
 pub(super) struct PathCondition {
-    constraints: Rc<Vec<BranchConstraint>>,
+    arena: Rc<RefCell<PathConditionArena>>,
+    node: usize,
+}
+
+#[derive(Default)]
+struct PathConditionArena {
+    nodes: Vec<PathConditionNode>,
+}
+
+struct PathConditionNode {
+    kind: PathConditionNodeKind,
+    length: usize,
+    base_length: usize,
+    fingerprint: u64,
+    jumps: Vec<usize>,
+    materialized: OnceCell<Rc<Vec<BranchConstraint>>>,
+}
+
+enum PathConditionNodeKind {
+    Empty,
+    Append {
+        parent: usize,
+        constraint: BranchConstraint,
+    },
+    Materialized,
+}
+
+impl Default for PathCondition {
+    fn default() -> Self {
+        let mut arena = PathConditionArena::default();
+        arena.nodes.push(PathConditionNode {
+            kind: PathConditionNodeKind::Empty,
+            length: 0,
+            base_length: 0,
+            fingerprint: 0,
+            jumps: Vec::new(),
+            materialized: OnceCell::from(Rc::new(Vec::new())),
+        });
+        Self {
+            arena: Rc::new(RefCell::new(arena)),
+            node: 0,
+        }
+    }
+}
+
+impl std::fmt::Debug for PathCondition {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PathCondition")
+            .field("constraints", &self.constraints())
+            .finish()
+    }
+}
+
+impl PartialEq for PathCondition {
+    fn eq(&self, other: &Self) -> bool {
+        if Rc::ptr_eq(&self.arena, &other.arena) && self.node == other.node {
+            return true;
+        }
+        let (left_length, left_fingerprint) = self.metadata();
+        let (right_length, right_fingerprint) = other.metadata();
+        left_length == right_length
+            && left_fingerprint == right_fingerprint
+            && self.constraints() == other.constraints()
+    }
+}
+
+impl Eq for PathCondition {}
+
+impl Hash for PathCondition {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.metadata().hash(state);
+    }
+}
+
+impl PartialOrd for PathCondition {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for PathCondition {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        if Rc::ptr_eq(&self.arena, &other.arena) && self.node == other.node {
+            return std::cmp::Ordering::Equal;
+        }
+        self.metadata()
+            .cmp(&other.metadata())
+            .then_with(|| self.constraints().cmp(&other.constraints()))
+    }
 }
 
 impl PathCondition {
+    fn metadata(&self) -> (usize, u64) {
+        let arena = self.arena.borrow();
+        let node = &arena.nodes[self.node];
+        (node.length, node.fingerprint)
+    }
+
+    fn fingerprint(constraints: &[BranchConstraint]) -> u64 {
+        constraints.iter().fold(0, |fingerprint, constraint| {
+            let mut hasher = DefaultHasher::new();
+            constraint.hash(&mut hasher);
+            fingerprint.rotate_left(7) ^ hasher.finish()
+        })
+    }
+
+    fn from_constraints(constraints: Vec<BranchConstraint>) -> Self {
+        if constraints.is_empty() {
+            return Self::default();
+        }
+        let fingerprint = Self::fingerprint(&constraints);
+        let length = constraints.len();
+        let materialized = OnceCell::from(Rc::new(constraints));
+        let node = PathConditionNode {
+            kind: PathConditionNodeKind::Materialized,
+            length,
+            base_length: length,
+            fingerprint,
+            jumps: Vec::new(),
+            materialized,
+        };
+        let mut arena = PathConditionArena::default();
+        arena.nodes.push(node);
+        Self {
+            arena: Rc::new(RefCell::new(arena)),
+            node: 0,
+        }
+    }
+
+    fn constraints(&self) -> Rc<Vec<BranchConstraint>> {
+        if let Some(constraints) = self.arena.borrow().nodes[self.node].materialized.get() {
+            return constraints.clone();
+        }
+
+        let mut suffix = Vec::new();
+        let base = {
+            let arena = self.arena.borrow();
+            let mut current = self.node;
+            loop {
+                let node = &arena.nodes[current];
+                if let Some(constraints) = node.materialized.get() {
+                    break constraints.clone();
+                }
+                match &node.kind {
+                    PathConditionNodeKind::Append { parent, constraint } => {
+                        suffix.push(constraint.clone());
+                        current = *parent;
+                    }
+                    PathConditionNodeKind::Empty | PathConditionNodeKind::Materialized => {
+                        break Rc::new(Vec::new());
+                    }
+                }
+            }
+        };
+        let mut constraints = Vec::with_capacity(base.len() + suffix.len());
+        constraints.extend(base.iter().cloned());
+        constraints.extend(suffix.into_iter().rev());
+        let constraints = Rc::new(constraints);
+        #[cfg(test)]
+        PATH_CONSTRAINT_MATERIALIZATIONS
+            .set(PATH_CONSTRAINT_MATERIALIZATIONS.get() + constraints.len());
+        let arena = self.arena.borrow();
+        let _ = arena.nodes[self.node].materialized.set(constraints.clone());
+        constraints
+    }
+
+    fn immediate_append(&self) -> Option<(usize, BranchConstraint)> {
+        let arena = self.arena.borrow();
+        match &arena.nodes[self.node].kind {
+            PathConditionNodeKind::Append { parent, constraint } => {
+                Some((*parent, constraint.clone()))
+            }
+            PathConditionNodeKind::Empty | PathConditionNodeKind::Materialized => None,
+        }
+    }
+
+    fn single_constraint(&self) -> Option<BranchConstraint> {
+        if self.metadata().0 != 1 {
+            return None;
+        }
+        if let Some((_, constraint)) = self.immediate_append() {
+            return Some(constraint);
+        }
+        self.arena.borrow().nodes[self.node]
+            .materialized
+            .get()
+            .and_then(|constraints| constraints.first().cloned())
+    }
+
+    fn appended_node_at_length(&self, target: usize) -> Option<usize> {
+        let arena = self.arena.borrow();
+        let root = &arena.nodes[self.node];
+        if target <= root.base_length || target > root.length {
+            return None;
+        }
+        let mut current = self.node;
+        while arena.nodes[current].length > target {
+            let difference = arena.nodes[current].length - target;
+            let jump = (usize::BITS - 1 - difference.leading_zeros()) as usize;
+            current = *arena.nodes[current].jumps.get(jump)?;
+        }
+        (arena.nodes[current].length == target).then_some(current)
+    }
+
+    fn constraint_for(&self, branch: BranchId) -> Option<BranchConstraint> {
+        let (length, _) = self.metadata();
+        let base_length = self.arena.borrow().nodes[self.node].base_length;
+        let mut low = base_length + 1;
+        let mut high = length + 1;
+        while low < high {
+            let middle = low + (high - low) / 2;
+            let node = self.appended_node_at_length(middle)?;
+            let arena = self.arena.borrow();
+            let PathConditionNodeKind::Append { constraint, .. } = &arena.nodes[node].kind else {
+                return None;
+            };
+            match constraint.branch.cmp(&branch) {
+                std::cmp::Ordering::Less => low = middle + 1,
+                std::cmp::Ordering::Greater => high = middle,
+                std::cmp::Ordering::Equal => return Some(constraint.clone()),
+            }
+        }
+
+        let arena = self.arena.borrow();
+        let mut base = self.node;
+        while let PathConditionNodeKind::Append { parent, .. } = &arena.nodes[base].kind {
+            base = *parent;
+        }
+        arena.nodes[base]
+            .materialized
+            .get()
+            .and_then(|constraints| {
+                constraints
+                    .binary_search_by_key(&branch, |constraint| constraint.branch)
+                    .ok()
+                    .map(|index| constraints[index].clone())
+            })
+    }
+
+    fn ancestor_node(&self, descendant: &Self) -> Option<bool> {
+        if !Rc::ptr_eq(&self.arena, &descendant.arena) {
+            return None;
+        }
+        let (ancestor_length, _) = self.metadata();
+        let (mut descendant_length, _) = descendant.metadata();
+        if ancestor_length > descendant_length {
+            return Some(false);
+        }
+        let arena = self.arena.borrow();
+        let mut current = descendant.node;
+        while descendant_length > ancestor_length {
+            let PathConditionNodeKind::Append { parent, .. } = &arena.nodes[current].kind else {
+                return Some(false);
+            };
+            current = *parent;
+            descendant_length -= 1;
+        }
+        Some(current == self.node)
+    }
+
+    /// Keep only choices introduced after `ancestor`. The fast path walks the
+    /// persistent suffix and is proportional to the newly introduced nesting,
+    /// not to the complete enclosing procedural path.
+    pub(super) fn relative_to(&self, ancestor: &Self) -> Self {
+        if Rc::ptr_eq(&self.arena, &ancestor.arena) && ancestor.ancestor_node(self) == Some(true) {
+            let mut suffix = Vec::new();
+            let arena = self.arena.borrow();
+            let mut current = self.node;
+            while current != ancestor.node {
+                let PathConditionNodeKind::Append { parent, constraint } =
+                    &arena.nodes[current].kind
+                else {
+                    break;
+                };
+                suffix.push(constraint.clone());
+                current = *parent;
+            }
+            suffix.reverse();
+            return Self::from_constraints(suffix);
+        }
+
+        let constraints = self.constraints();
+        let ancestor = ancestor.constraints();
+        let mut relative = Vec::new();
+        for constraint in constraints.iter() {
+            let same = ancestor
+                .binary_search_by_key(&constraint.branch, |entry| entry.branch)
+                .is_ok_and(|index| ancestor[index] == *constraint);
+            if !same {
+                relative.push(constraint.clone());
+            }
+        }
+        Self::from_constraints(relative)
+    }
+
     pub(super) fn is_unconditional(&self) -> bool {
-        self.constraints.is_empty()
+        self.metadata().0 == 0
     }
 
     pub(super) fn with_choice(&self, branch: BranchId, arm: usize) -> Self {
@@ -181,18 +573,68 @@ impl PathCondition {
 
     pub(super) fn with_choice_range(&self, branch: BranchId, start: usize, end: usize) -> Self {
         debug_assert!(start < end && end <= branch.arms);
-        let mut constraints = self.constraints.as_ref().clone();
         let constraint = BranchConstraint {
             branch,
             allowed: ArmSet::range(start, end),
         };
+        let append = {
+            let arena = self.arena.borrow();
+            let node = &arena.nodes[self.node];
+            if node.length == 0 {
+                true
+            } else {
+                match &node.kind {
+                    PathConditionNodeKind::Append {
+                        constraint: last, ..
+                    } => last.branch < branch,
+                    PathConditionNodeKind::Materialized => node
+                        .materialized
+                        .get()
+                        .and_then(|constraints| constraints.last())
+                        .is_some_and(|last| last.branch < branch),
+                    PathConditionNodeKind::Empty => true,
+                }
+            }
+        };
+        if append {
+            let (length, fingerprint) = self.metadata();
+            let mut hasher = DefaultHasher::new();
+            constraint.hash(&mut hasher);
+            let mut arena = self.arena.borrow_mut();
+            let mut jumps = vec![self.node];
+            let mut power = 1;
+            while let Some(&previous) = jumps.get(power - 1) {
+                let Some(&ancestor) = arena.nodes[previous].jumps.get(power - 1) else {
+                    break;
+                };
+                jumps.push(ancestor);
+                power += 1;
+            }
+            let node = PathConditionNode {
+                kind: PathConditionNodeKind::Append {
+                    parent: self.node,
+                    constraint,
+                },
+                length: length + 1,
+                base_length: arena.nodes[self.node].base_length,
+                fingerprint: fingerprint.rotate_left(7) ^ hasher.finish(),
+                jumps,
+                materialized: OnceCell::new(),
+            };
+            let node_id = arena.nodes.len();
+            arena.nodes.push(node);
+            return Self {
+                arena: self.arena.clone(),
+                node: node_id,
+            };
+        }
+
+        let mut constraints = self.constraints().as_ref().clone();
         match constraints.binary_search_by_key(&branch, |constraint| constraint.branch) {
             Ok(index) => constraints[index] = constraint,
             Err(index) => constraints.insert(index, constraint),
         }
-        Self {
-            constraints: Rc::new(constraints),
-        }
+        Self::from_constraints(constraints)
     }
 
     /// Joins alternative paths into the least Cartesian condition that covers
@@ -210,9 +652,56 @@ impl PathCondition {
     }
 
     pub(super) fn conjoin_if_compatible(&self, other: &Self) -> Option<Self> {
-        let mut constraints = Vec::with_capacity(self.constraints.len() + other.constraints.len());
-        let mut left = self.constraints.iter().peekable();
-        let mut right = other.constraints.iter().peekable();
+        if self.is_unconditional() {
+            return Some(other.clone());
+        }
+        if other.is_unconditional() {
+            return Some(self.clone());
+        }
+        if self.ancestor_node(other) == Some(true) {
+            return Some(other.clone());
+        }
+        if other.ancestor_node(self) == Some(true) {
+            return Some(self.clone());
+        }
+        if let Some(constraint) = self.single_constraint()
+            && let Some(existing) = other.constraint_for(constraint.branch)
+        {
+            let allowed = existing.allowed.intersection(&constraint.allowed);
+            if allowed.is_empty() {
+                return None;
+            }
+            if existing.allowed.is_subset_of(&constraint.allowed) {
+                return Some(other.clone());
+            }
+        }
+        if let Some(constraint) = other.single_constraint()
+            && let Some(existing) = self.constraint_for(constraint.branch)
+        {
+            let allowed = existing.allowed.intersection(&constraint.allowed);
+            if allowed.is_empty() {
+                return None;
+            }
+            if existing.allowed.is_subset_of(&constraint.allowed) {
+                return Some(self.clone());
+            }
+        }
+        if Rc::ptr_eq(&self.arena, &other.arena)
+            && let (Some((left_parent, left)), Some((right_parent, right))) =
+                (self.immediate_append(), other.immediate_append())
+            && left_parent == right_parent
+            && left.branch == right.branch
+        {
+            let allowed = left.allowed.intersection(&right.allowed);
+            if allowed.is_empty() {
+                return None;
+            }
+        }
+        let left_constraints = self.constraints();
+        let right_constraints = other.constraints();
+        let mut constraints = Vec::with_capacity(left_constraints.len() + right_constraints.len());
+        let mut left = left_constraints.iter().peekable();
+        let mut right = right_constraints.iter().peekable();
         loop {
             match (left.peek(), right.peek()) {
                 (Some(a), Some(b)) if a.branch == b.branch => {
@@ -246,64 +735,194 @@ impl PathCondition {
                 (None, None) => break,
             }
         }
-        Some(Self {
-            constraints: Rc::new(constraints),
-        })
+        Some(Self::from_constraints(constraints))
     }
 
     /// Returns true when every branch valuation admitted by `other` is also
     /// admitted by `self`.
     pub(super) fn covers(&self, other: &Self) -> bool {
-        self.constraints.iter().all(|constraint| {
+        if self.is_unconditional() || self.ancestor_node(other) == Some(true) {
+            return true;
+        }
+        let constraints = self.constraints();
+        let other = other.constraints();
+        constraints.iter().all(|constraint| {
             other
-                .constraints
                 .binary_search_by_key(&constraint.branch, |other| other.branch)
                 .ok()
-                .is_some_and(|index| {
-                    other.constraints[index]
-                        .allowed
-                        .is_subset_of(&constraint.allowed)
-                })
+                .is_some_and(|index| other[index].allowed.is_subset_of(&constraint.allowed))
         })
     }
 
-    pub(super) fn branches(&self) -> impl Iterator<Item = BranchId> {
-        self.constraints
-            .iter()
-            .map(|constraint| constraint.branch)
-            .collect::<Vec<_>>()
-            .into_iter()
+    /// Collect branch identities from persistent paths without materializing
+    /// every prefix. Nodes shared by multiple conditions are visited once.
+    pub(super) fn collect_branches<'a>(
+        conditions: impl IntoIterator<Item = &'a Self>,
+    ) -> Vec<BranchId> {
+        let mut branches = HashSet::default();
+        let mut visited = HashSet::default();
+        for condition in conditions {
+            let mut current = condition.node;
+            loop {
+                let arena_id = Rc::as_ptr(&condition.arena) as usize;
+                if !visited.insert((arena_id, current)) {
+                    break;
+                }
+                let arena = condition.arena.borrow();
+                let node = &arena.nodes[current];
+                match &node.kind {
+                    PathConditionNodeKind::Append { parent, constraint } => {
+                        branches.insert(constraint.branch);
+                        current = *parent;
+                    }
+                    PathConditionNodeKind::Empty => break,
+                    PathConditionNodeKind::Materialized => {
+                        if let Some(constraints) = node.materialized.get() {
+                            branches.extend(constraints.iter().map(|constraint| constraint.branch));
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+        let mut branches = branches.into_iter().collect::<Vec<_>>();
+        branches.sort_unstable();
+        branches
     }
 
-    pub(super) fn remapped(&self, branches: &HashMap<BranchId, BranchId>) -> Self {
-        let mut constraints = self
-            .constraints
-            .iter()
-            .map(|constraint| BranchConstraint {
-                branch: branches
-                    .get(&constraint.branch)
-                    .copied()
-                    .unwrap_or(constraint.branch),
-                allowed: constraint.allowed.clone(),
-            })
-            .collect::<Vec<_>>();
-        constraints.sort_unstable_by_key(|constraint| constraint.branch);
+    fn remapped_cached(
+        &self,
+        branches: &HashMap<BranchId, BranchId>,
+        arena: usize,
+        cache: &mut HashMap<ConditionNodeKey, Self>,
+    ) -> Self {
+        let key_for = |node| ConditionNodeKey { arena, node };
+        let root_key = key_for(self.node);
+        if let Some(remapped) = cache.get(&root_key) {
+            return remapped.clone();
+        }
+
+        let mut suffix = Vec::new();
+        let mut current = self.node;
+        let (base_key, base) = loop {
+            let key = key_for(current);
+            if let Some(remapped) = cache.get(&key) {
+                break (key, remapped.clone());
+            }
+            let arena = self.arena.borrow();
+            match &arena.nodes[current].kind {
+                PathConditionNodeKind::Append { parent, constraint } => {
+                    suffix.push((current, constraint.clone()));
+                    current = *parent;
+                }
+                PathConditionNodeKind::Empty => break (key, Self::default()),
+                PathConditionNodeKind::Materialized => {
+                    let constraints = arena.nodes[current]
+                        .materialized
+                        .get()
+                        .expect("materialized node contains its constraints")
+                        .iter()
+                        .map(|constraint| BranchConstraint {
+                            branch: branches
+                                .get(&constraint.branch)
+                                .copied()
+                                .unwrap_or(constraint.branch),
+                            allowed: constraint.allowed.clone(),
+                        })
+                        .collect();
+                    break (key, Self::from_constraints(constraints));
+                }
+            }
+        };
+        cache.entry(base_key).or_insert_with(|| base.clone());
+        let mut remapped = base;
+        for (source, mut constraint) in suffix.into_iter().rev() {
+            constraint.branch = branches
+                .get(&constraint.branch)
+                .copied()
+                .unwrap_or(constraint.branch);
+            remapped = remapped.append_constraint(constraint);
+            cache.insert(key_for(source), remapped.clone());
+        }
+        cache.insert(root_key, remapped.clone());
+        remapped
+    }
+
+    fn append_constraint(&self, constraint: BranchConstraint) -> Self {
+        let (length, fingerprint) = self.metadata();
+        let mut hasher = DefaultHasher::new();
+        constraint.hash(&mut hasher);
+        let mut arena = self.arena.borrow_mut();
+        let mut jumps = vec![self.node];
+        let mut power = 1;
+        while let Some(&previous) = jumps.get(power - 1) {
+            let Some(&ancestor) = arena.nodes[previous].jumps.get(power - 1) else {
+                break;
+            };
+            jumps.push(ancestor);
+            power += 1;
+        }
+        let node = PathConditionNode {
+            kind: PathConditionNodeKind::Append {
+                parent: self.node,
+                constraint,
+            },
+            length: length + 1,
+            base_length: arena.nodes[self.node].base_length,
+            fingerprint: fingerprint.rotate_left(7) ^ hasher.finish(),
+            jumps,
+            materialized: OnceCell::new(),
+        };
+        let node_id = arena.nodes.len();
+        arena.nodes.push(node);
         Self {
-            constraints: Rc::new(constraints),
+            arena: self.arena.clone(),
+            node: node_id,
         }
     }
 
     /// Returns the least Cartesian condition covering either input.
     pub(super) fn disjoin(&self, other: &Self) -> Self {
+        if self.is_unconditional() || other.is_unconditional() {
+            return Self::default();
+        }
+        if self.ancestor_node(other) == Some(true) {
+            return self.clone();
+        }
+        if other.ancestor_node(self) == Some(true) {
+            return other.clone();
+        }
+        if Rc::ptr_eq(&self.arena, &other.arena)
+            && let (Some((left_parent, left)), Some((right_parent, right))) =
+                (self.immediate_append(), other.immediate_append())
+            && left_parent == right_parent
+            && left.branch == right.branch
+        {
+            let allowed = left.allowed.union(&right.allowed);
+            let parent = Self {
+                arena: self.arena.clone(),
+                node: left_parent,
+            };
+            if allowed.is_all(left.branch.arms) {
+                return parent;
+            }
+            let Some(&(start, end)) = allowed.ranges.first() else {
+                return parent;
+            };
+            if allowed.ranges.len() == 1 {
+                return parent.with_choice_range(left.branch, start, end);
+            }
+        }
+        let self_constraints = self.constraints();
+        let other_constraints = other.constraints();
         let mut constraints = Vec::new();
-        for constraint in self.constraints.iter() {
-            let Ok(index) = other
-                .constraints
-                .binary_search_by_key(&constraint.branch, |other| other.branch)
+        for constraint in self_constraints.iter() {
+            let Ok(index) =
+                other_constraints.binary_search_by_key(&constraint.branch, |other| other.branch)
             else {
                 continue;
             };
-            let allowed = constraint.allowed.union(&other.constraints[index].allowed);
+            let allowed = constraint.allowed.union(&other_constraints[index].allowed);
             if !allowed.is_all(constraint.branch.arms) {
                 constraints.push(BranchConstraint {
                     branch: constraint.branch,
@@ -311,9 +930,7 @@ impl PathCondition {
                 });
             }
         }
-        Self {
-            constraints: Rc::new(constraints),
-        }
+        Self::from_constraints(constraints)
     }
 }
 
@@ -470,12 +1087,41 @@ struct Undo<K> {
     previous: Option<VersionId>,
 }
 
+#[derive(Clone, Copy)]
+pub(super) struct StateRevision {
+    id: usize,
+    event_start: usize,
+    checkpoint_depth: usize,
+}
+
+#[derive(Clone, Copy)]
+enum StateRevisionEvent<K> {
+    Change {
+        key: K,
+        previous: Option<VersionId>,
+        current: Option<VersionId>,
+    },
+    Exit(usize),
+}
+
+struct RevisionValue {
+    baseline: Option<VersionId>,
+    current: Option<VersionId>,
+    current_since_exit: usize,
+    inputs: HashSet<VersionId>,
+    needs_entry: bool,
+}
+
 pub(super) struct SsaStore<K> {
     versions: Vec<Version<K>>,
     entries: HashMap<K, VersionId>,
     current: HashMap<K, VersionId>,
     undo: Vec<Undo<K>>,
     checkpoints: Vec<usize>,
+    checkpoint_dirty: Vec<HashSet<K>>,
+    revision_events: Vec<StateRevisionEvent<K>>,
+    active_revisions: Vec<usize>,
+    next_revision_id: usize,
 }
 
 impl<K> Default for SsaStore<K> {
@@ -486,6 +1132,10 @@ impl<K> Default for SsaStore<K> {
             current: HashMap::default(),
             undo: Vec::new(),
             checkpoints: Vec::new(),
+            checkpoint_dirty: Vec::new(),
+            revision_events: Vec::new(),
+            active_revisions: Vec::new(),
+            next_revision_id: 0,
         }
     }
 }
@@ -558,16 +1208,20 @@ where
         graph: Rc<DependencyDag<K>>,
         root: Option<usize>,
         bindings: HashMap<K, Vec<(VersionId, PositionRelation)>>,
-        branches: HashMap<BranchId, BranchId>,
+        branches: Rc<BranchRemapper>,
     ) -> VersionId {
         let version = self.versions.len();
         self.versions.push(Version::Imported {
             graph,
             root,
             bindings: Rc::new(bindings),
-            branches: Rc::new(branches),
+            branches,
         });
         version
+    }
+
+    pub(super) fn branch_remapper(branches: HashMap<BranchId, BranchId>) -> Rc<BranchRemapper> {
+        Rc::new(BranchRemapper::new(branches))
     }
 
     pub(super) fn projected(&mut self, source: VersionId, domain: PositionDomain) -> VersionId {
@@ -621,8 +1275,12 @@ where
 
     pub(super) fn bind(&mut self, key: K, version: VersionId) {
         let previous = self.current.insert(key, version);
+        self.record_revision_change(key, previous, Some(version));
         if !self.checkpoints.is_empty() {
             self.undo.push(Undo { key, previous });
+            if let Some(dirty) = self.checkpoint_dirty.last_mut() {
+                dirty.insert(key);
+            }
         }
     }
 
@@ -639,33 +1297,165 @@ where
             version_start: self.versions.len(),
         };
         self.checkpoints.push(checkpoint.undo_start);
+        self.checkpoint_dirty.push(HashSet::default());
         checkpoint
+    }
+
+    /// Start recording the SSA state changes and exits of one function body.
+    /// Nested recorders share the append-only event stream; their exit markers
+    /// are distinguished by `id`, while their state changes remain visible to
+    /// an enclosing call exactly as ordinary SSA changes are.
+    pub(super) fn begin_state_revision(&mut self, checkpoint: Checkpoint) -> StateRevision {
+        assert!(checkpoint.depth < self.checkpoints.len());
+        assert_eq!(self.checkpoints[checkpoint.depth], checkpoint.undo_start);
+        if self.active_revisions.is_empty() {
+            self.revision_events.clear();
+        }
+        let revision = StateRevision {
+            id: self.next_revision_id,
+            event_start: self.revision_events.len(),
+            checkpoint_depth: checkpoint.depth,
+        };
+        self.next_revision_id += 1;
+        self.active_revisions.push(revision.id);
+        revision
+    }
+
+    /// Mark the current state as one feasible exit of `revision`.
+    pub(super) fn record_state_revision_exit(&mut self, revision: StateRevision) {
+        assert!(self.active_revisions.contains(&revision.id));
+        self.revision_events
+            .push(StateRevisionEvent::Exit(revision.id));
+    }
+
+    /// Merge all values observed at exits of `revision` without taking a full
+    /// state snapshot at every exit. Rollbacks are state-change events too, so
+    /// one linear replay recovers the same per-key phi inputs as merging those
+    /// snapshots would.
+    pub(super) fn finish_state_revision(&mut self, revision: StateRevision) -> BranchState<K> {
+        assert_eq!(self.active_revisions.last(), Some(&revision.id));
+        assert!(revision.checkpoint_depth < self.checkpoints.len());
+
+        let mut exit_count = 0;
+        let mut values: HashMap<K, RevisionValue> = HashMap::default();
+        for event in &self.revision_events[revision.event_start..] {
+            #[cfg(test)]
+            REVISION_EVENT_VISITS.set(REVISION_EVENT_VISITS.get() + 1);
+            match *event {
+                StateRevisionEvent::Exit(id) if id == revision.id => exit_count += 1,
+                StateRevisionEvent::Exit(_) => {}
+                StateRevisionEvent::Change {
+                    key,
+                    previous,
+                    current,
+                } => {
+                    let value = values.entry(key).or_insert_with(|| RevisionValue {
+                        baseline: previous,
+                        current: previous,
+                        current_since_exit: 0,
+                        inputs: HashSet::default(),
+                        needs_entry: false,
+                    });
+                    if value.current_since_exit < exit_count {
+                        if let Some(version) = value.current {
+                            value.inputs.insert(version);
+                        } else {
+                            value.needs_entry = true;
+                        }
+                    }
+                    value.current = current;
+                    value.current_since_exit = exit_count;
+                }
+            }
+        }
+        assert!(
+            exit_count != 0,
+            "a completed function has at least one exit"
+        );
+
+        let mut bindings = HashMap::default();
+        for (key, mut value) in values {
+            if value.current_since_exit < exit_count {
+                if let Some(version) = value.current {
+                    value.inputs.insert(version);
+                } else {
+                    value.needs_entry = true;
+                }
+            }
+            let only_baseline = match value.baseline {
+                Some(baseline) => {
+                    !value.needs_entry
+                        && value.inputs.len() == 1
+                        && value.inputs.contains(&baseline)
+                }
+                None => value.needs_entry && value.inputs.is_empty(),
+            };
+            if only_baseline {
+                continue;
+            }
+            if value.needs_entry {
+                value.inputs.insert(self.entry(key));
+            }
+            if value.inputs.is_empty() {
+                continue;
+            }
+            #[cfg(test)]
+            REVISION_CANDIDATE_INPUTS.set(REVISION_CANDIDATE_INPUTS.get() + value.inputs.len());
+            bindings.insert(key, self.phi(value.inputs.into_iter().collect()));
+        }
+
+        assert_eq!(self.active_revisions.pop(), Some(revision.id));
+        if self.active_revisions.is_empty() {
+            self.revision_events.clear();
+        }
+        BranchState { bindings }
     }
 
     pub(super) fn capture_and_rollback(&mut self, checkpoint: Checkpoint) -> BranchState<K> {
         assert_eq!(checkpoint.depth + 1, self.checkpoints.len());
         assert_eq!(self.checkpoints.pop(), Some(checkpoint.undo_start));
+        let dirty = self
+            .checkpoint_dirty
+            .pop()
+            .expect("checkpoint dirty set was pushed together");
 
         let mut bindings = HashMap::default();
-        for undo in &self.undo[checkpoint.undo_start..] {
+        for key in dirty {
             let version = self
                 .current
-                .get(&undo.key)
+                .get(&key)
                 .copied()
                 .expect("a branch binding must exist until rollback");
-            bindings.insert(undo.key, version);
+            bindings.insert(key, version);
         }
 
         while self.undo.len() > checkpoint.undo_start {
             let undo = self.undo.pop().expect("undo length checked above");
+            let current = self.current.get(&undo.key).copied();
             if let Some(previous) = undo.previous {
                 self.current.insert(undo.key, previous);
             } else {
                 self.current.remove(&undo.key);
             }
+            self.record_revision_change(undo.key, current, undo.previous);
         }
         bindings.retain(|key, version| self.current.get(key).copied() != Some(*version));
         BranchState { bindings }
+    }
+
+    fn record_revision_change(
+        &mut self,
+        key: K,
+        previous: Option<VersionId>,
+        current: Option<VersionId>,
+    ) {
+        if previous != current && !self.active_revisions.is_empty() {
+            self.revision_events.push(StateRevisionEvent::Change {
+                key,
+                previous,
+                current,
+            });
+        }
     }
 
     /// Capture bindings changed since an enclosing checkpoint without
@@ -676,9 +1466,13 @@ where
         assert_eq!(self.checkpoints[checkpoint.depth], checkpoint.undo_start);
 
         let mut bindings = HashMap::default();
-        for undo in &self.undo[checkpoint.undo_start..] {
-            if let Some(version) = self.current.get(&undo.key) {
-                bindings.insert(undo.key, *version);
+        for dirty in &self.checkpoint_dirty[checkpoint.depth..] {
+            for key in dirty {
+                #[cfg(test)]
+                SNAPSHOT_KEY_VISITS.set(SNAPSHOT_KEY_VISITS.get() + 1);
+                if let Some(version) = self.current.get(key) {
+                    bindings.insert(*key, *version);
+                }
             }
         }
         BranchState { bindings }
@@ -870,6 +1664,18 @@ where
             .collect()
     }
 
+    pub(super) fn root_source_relations_guarded_including_entry_cached(
+        &self,
+        version: VersionId,
+        cache: &mut SourceCache<K>,
+    ) -> Vec<(K, PositionRelation, PathCondition)> {
+        let sources = self.source_summary(version, true, cache);
+        sources
+            .iter()
+            .map(|(&(source, relation), condition)| (source, relation, condition.clone()))
+            .collect()
+    }
+
     pub(super) fn dependency_dag(
         &self,
         roots: &[VersionId],
@@ -990,6 +1796,7 @@ where
                         .collect::<Vec<_>>();
                     mapped_bindings.sort_unstable_by_key(|(key, _)| *key);
                     let mut mapped_branches = branches
+                        .mapping
                         .iter()
                         .map(|(&source, &destination)| (source, destination))
                         .collect::<Vec<_>>();
@@ -1098,6 +1905,8 @@ where
         let mut queue = VecDeque::from([start]);
 
         while let Some(state @ (current, include_entry, relation)) = queue.pop_front() {
+            #[cfg(test)]
+            SOURCE_SUMMARY_STATE_VISITS.set(SOURCE_SUMMARY_STATE_VISITS.get() + 1);
             queued.remove(&state);
             let condition = reached[&state].clone();
 
@@ -1164,7 +1973,7 @@ where
                     for (key, imported_relation, imported_condition) in
                         dependency_dag_external_sources(graph, *root)
                     {
-                        let imported_condition = imported_condition.remapped(branches);
+                        let imported_condition = branches.remap(&imported_condition);
                         let Some(condition) = condition.conjoin_if_compatible(&imported_condition)
                         else {
                             continue;
@@ -1314,7 +2123,7 @@ fn inline_dependency_dag<K>(
     graph: &DependencyDag<K>,
     root: Option<usize>,
     bindings: &HashMap<K, Vec<(usize, PositionRelation)>>,
-    branches: &HashMap<BranchId, BranchId>,
+    branches: &BranchRemapper,
     nodes: &mut Vec<DependencyDagNode<K>>,
     edges: &mut Vec<DependencyDagEdge>,
     domains: &mut Vec<Vec<PositionDomain>>,
@@ -1369,7 +2178,7 @@ where
             source,
             destination,
             relation: edge.relation,
-            condition: edge.condition.remapped(branches),
+            condition: branches.remap(&edge.condition),
         });
     }
     mapped.get(&root).copied()
@@ -1416,6 +2225,157 @@ fn merge_source_summaries<K>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn persistent_paths_and_remap_caches_are_linear_and_isolated() {
+        const COUNT: usize = 100_000;
+        let mut condition = PathCondition::default();
+        let mut source_branches = Vec::with_capacity(COUNT);
+        for local in 0..COUNT {
+            let branch = BranchId::new(1, local, 2);
+            source_branches.push(branch);
+            condition = condition.with_choice(branch, local % 2);
+        }
+        assert_eq!(condition.arena.borrow().nodes.len(), COUNT + 1);
+        assert!(
+            condition.arena.borrow().nodes[condition.node]
+                .materialized
+                .get()
+                .is_none()
+        );
+
+        let first_mapping = source_branches
+            .iter()
+            .enumerate()
+            .map(|(local, branch)| (*branch, BranchId::new(2, local, 2)))
+            .collect();
+        let second_mapping = source_branches
+            .iter()
+            .enumerate()
+            .map(|(local, branch)| (*branch, BranchId::new(3, local, 2)))
+            .collect();
+        let first = BranchRemapper::new(first_mapping);
+        let second = BranchRemapper::new(second_mapping);
+        let first_remapped = first.remap(&condition);
+        let first_again = first.remap(&condition);
+        let second_remapped = second.remap(&condition);
+
+        assert!(Rc::ptr_eq(&first_remapped.arena, &first_again.arena));
+        assert_eq!(first_remapped.node, first_again.node);
+        assert!(!Rc::ptr_eq(&first_remapped.arena, &second_remapped.arena));
+        assert_eq!(first.cache.borrow().len(), COUNT + 1);
+        assert_eq!(second.cache.borrow().len(), COUNT + 1);
+        assert!(
+            condition.arena.borrow().nodes[condition.node]
+                .materialized
+                .get()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn remap_cache_retains_the_source_arena_identity() {
+        let source = BranchId::new(1, 0, 2);
+        let destination = BranchId::new(2, 0, 2);
+        let condition = PathCondition::default().with_choice(source, 1);
+        let source_arena = Rc::downgrade(&condition.arena);
+        let remapper = BranchRemapper::new([(source, destination)].into_iter().collect());
+
+        remapper.remap(&condition);
+        drop(condition);
+        assert!(source_arena.upgrade().is_some());
+
+        drop(remapper);
+        assert!(source_arena.upgrade().is_none());
+    }
+
+    #[test]
+    fn partially_overlapping_arm_sets_are_intersected_exactly() {
+        let branch = BranchId::new(1, 0, 4);
+        let extra = BranchId::new(1, 1, 2);
+        let left = PathCondition::default().with_choice_range(branch, 0, 2);
+        let right = PathCondition::default()
+            .with_choice_range(branch, 1, 3)
+            .with_choice(extra, 1);
+        let expected = PathCondition::default()
+            .with_choice_range(branch, 1, 2)
+            .with_choice(extra, 1);
+
+        assert_eq!(left.conjoin_if_compatible(&right), Some(expected));
+    }
+
+    #[test]
+    fn imported_roots_share_one_branch_remap_cache() {
+        let source = BranchId::new(1, 0, 2);
+        let destination = BranchId::new(2, 0, 2);
+        let remapper =
+            SsaStore::<u8>::branch_remapper([(source, destination)].into_iter().collect());
+        let graph = Rc::new(DependencyDag::<u8> {
+            nodes: Vec::new(),
+            edges: Vec::new(),
+            roots: vec![None, None],
+            domains: Vec::new(),
+        });
+        let mut ssa = SsaStore::default();
+        let first = ssa.imported(graph.clone(), None, HashMap::default(), remapper.clone());
+        let second = ssa.imported(graph, None, HashMap::default(), remapper);
+        let (
+            Version::Imported {
+                branches: first, ..
+            },
+            Version::Imported {
+                branches: second, ..
+            },
+        ) = (&ssa.versions[first], &ssa.versions[second])
+        else {
+            panic!("both versions are imported roots");
+        };
+        assert!(Rc::ptr_eq(first, second));
+
+        let condition = PathCondition::default().with_choice(source, 1);
+        first.remap(&condition);
+        let cached = first.cache.borrow().len();
+        second.remap(&condition);
+        assert_eq!(second.cache.borrow().len(), cached);
+    }
+
+    #[test]
+    fn remap_cache_maps_a_shared_materialized_prefix_once() {
+        let prefix_source = BranchId::new(1, 0, 2);
+        let suffix_a_source = BranchId::new(1, 1, 2);
+        let suffix_b_source = BranchId::new(1, 2, 2);
+        let prefix_destination = BranchId::new(2, 0, 2);
+        let suffix_a_destination = BranchId::new(2, 1, 2);
+        let suffix_b_destination = BranchId::new(2, 2, 2);
+        let prefix = PathCondition::from_constraints(vec![BranchConstraint {
+            branch: prefix_source,
+            allowed: ArmSet::range(0, 1),
+        }]);
+        let suffix_a = prefix.with_choice(suffix_a_source, 1);
+        let suffix_b = prefix.with_choice(suffix_b_source, 0);
+        let remapper = BranchRemapper::new(
+            [
+                (prefix_source, prefix_destination),
+                (suffix_a_source, suffix_a_destination),
+                (suffix_b_source, suffix_b_destination),
+            ]
+            .into_iter()
+            .collect(),
+        );
+
+        let remapped_a = remapper.remap(&suffix_a);
+        let cached_after_a = remapper.cache.borrow().len();
+        let remapped_b = remapper.remap(&suffix_b);
+        assert_eq!(cached_after_a + 1, remapper.cache.borrow().len());
+        assert_eq!(
+            PathCondition::collect_branches([&remapped_a, &remapped_b]),
+            vec![
+                prefix_destination,
+                suffix_a_destination,
+                suffix_b_destination,
+            ]
+        );
+    }
 
     #[test]
     fn definition_reports_live_on_entry_source() {
@@ -1644,6 +2604,75 @@ mod tests {
     }
 
     #[test]
+    fn state_revision_aggregates_cumulative_unique_writes_linearly() {
+        const COUNT: usize = 10_000;
+
+        reset_flow_scaling_counters();
+        let mut ssa = SsaStore::default();
+        let checkpoint = ssa.checkpoint();
+        let revision = ssa.begin_state_revision(checkpoint);
+        for key in 0..COUNT {
+            let version = ssa.definition(Vec::new());
+            ssa.bind(key, version);
+            ssa.record_state_revision_exit(revision);
+        }
+
+        let exits = ssa.finish_state_revision(revision);
+        assert_eq!(exits.bindings.len(), COUNT);
+        assert_eq!(REVISION_EVENT_VISITS.get(), 2 * COUNT);
+        assert_eq!(REVISION_CANDIDATE_INPUTS.get(), 2 * COUNT - 1);
+
+        let _ = ssa.capture_and_rollback(checkpoint);
+        ssa.merge([&exits]);
+        assert_eq!(ssa.current.len(), COUNT);
+    }
+
+    #[test]
+    fn state_revision_observes_rollback_between_sibling_exits() {
+        let mut ssa = SsaStore::default();
+        let function = ssa.checkpoint();
+        let revision = ssa.begin_state_revision(function);
+
+        let branch = ssa.checkpoint();
+        let source = ssa.read("source");
+        let changed = ssa.definition(vec![source]);
+        ssa.bind("destination", changed);
+        ssa.record_state_revision_exit(revision);
+        let _ = ssa.capture_and_rollback(branch);
+        ssa.record_state_revision_exit(revision);
+
+        let exits = ssa.finish_state_revision(revision);
+        let _ = ssa.capture_and_rollback(function);
+        ssa.merge([&exits]);
+
+        let destination = ssa.read("destination");
+        assert_eq!(
+            ssa.root_sources(destination),
+            ["source"].into_iter().collect()
+        );
+    }
+
+    #[test]
+    fn enclosing_revision_ignores_nested_exit_markers() {
+        let mut ssa = SsaStore::default();
+        let outer_checkpoint = ssa.checkpoint();
+        let outer = ssa.begin_state_revision(outer_checkpoint);
+
+        let inner_checkpoint = ssa.checkpoint();
+        let inner = ssa.begin_state_revision(inner_checkpoint);
+        let changed = ssa.definition(Vec::new());
+        ssa.bind("inner", changed);
+        ssa.record_state_revision_exit(inner);
+        let _ = ssa.finish_state_revision(inner);
+        let _ = ssa.capture_and_rollback(inner_checkpoint);
+
+        ssa.record_state_revision_exit(outer);
+        let exits = ssa.finish_state_revision(outer);
+        assert!(exits.bindings.is_empty());
+        let _ = ssa.capture_and_rollback(outer_checkpoint);
+    }
+
+    #[test]
     fn nested_rollback_preserves_the_outer_transaction() {
         let mut ssa = SsaStore::default();
         let base = ssa.definition(Vec::new());
@@ -1709,12 +2738,37 @@ mod tests {
     }
 
     #[test]
+    fn root_source_walk_does_not_use_the_native_stack() {
+        const COUNT: usize = 100_000;
+
+        let mut ssa = SsaStore::default();
+        let mut version = ssa.read("source");
+        for _ in 0..COUNT {
+            version = ssa.definition(vec![version]);
+        }
+
+        let expected = ["source"].into_iter().collect();
+        assert_eq!(ssa.root_sources(version), expected);
+    }
+
+    #[test]
     fn opposite_arms_of_one_branch_are_incompatible() {
         let branch = BranchId::new(1, 0, 2);
         let true_path = PathCondition::default().with_choice(branch, 0);
         let false_path = PathCondition::default().with_choice(branch, 1);
 
         assert!(true_path.conjoin_if_compatible(&false_path).is_none());
+    }
+
+    #[test]
+    fn expression_branch_namespaces_do_not_alias_procedures_or_calls() {
+        let procedure = BranchId::new(7, 3, 2);
+        let expression = BranchId::expression(7, 3, 2);
+        let call = BranchId::expression_call(7, 3, 0, 2);
+
+        assert_ne!(procedure, expression);
+        assert_ne!(procedure, call);
+        assert_ne!(expression, call);
     }
 
     #[test]

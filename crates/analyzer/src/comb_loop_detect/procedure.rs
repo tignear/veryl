@@ -3536,6 +3536,7 @@ impl<'a, 's> ProcedureAnalysis<'a, 's> {
             }
         }
         let branch_map = self.instantiate_summary_branches(summary);
+        let branch_remapper = SsaStore::<SsaKey>::branch_remapper(branch_map);
         let mut bindings = HashMap::default();
         for node in &summary.graph.nodes {
             let DependencyDagNode::External(key) = node else {
@@ -3555,7 +3556,7 @@ impl<'a, 's> ProcedureAnalysis<'a, 's> {
                 summary.graph.clone(),
                 *root,
                 bindings.clone(),
-                branch_map.clone(),
+                branch_remapper.clone(),
             );
             let mut sources = ExpressionSources {
                 sources: vec![(imported, PositionRelation::default())],
@@ -3613,7 +3614,7 @@ impl<'a, 's> ProcedureAnalysis<'a, 's> {
                             summary.graph.clone(),
                             *root,
                             bindings.clone(),
-                            branch_map.clone(),
+                            branch_remapper.clone(),
                         );
                         let version = if self.path_condition.is_unconditional() {
                             imported
@@ -3652,14 +3653,8 @@ impl<'a, 's> ProcedureAnalysis<'a, 's> {
         &mut self,
         summary: &FunctionSummary,
     ) -> HashMap<BranchId, BranchId> {
-        let mut branches = summary
-            .graph
-            .edges
-            .iter()
-            .flat_map(|edge| edge.condition.branches())
-            .collect::<Vec<_>>();
-        branches.sort_unstable();
-        branches.dedup();
+        let branches =
+            PathCondition::collect_branches(summary.graph.edges.iter().map(|edge| &edge.condition));
         branches
             .into_iter()
             .map(|branch| (branch, self.next_branch_id(branch.arms())))

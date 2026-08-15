@@ -37,7 +37,7 @@ use region::{
     ArraySpan, BitPartition, IdxKey, NodeKey, PackedSpan, dst_writes, signed_difference,
     translate_position, var_reads,
 };
-use ssa::{BranchId, DependencyDagNode, PathCondition};
+use ssa::{BranchId, BranchRemapper, DependencyDagNode, PathCondition};
 use summary::compute_module_summary;
 
 use crate::AnalyzerError;
@@ -1296,7 +1296,7 @@ impl<'a> ModuleGraphBuilder<'a> {
             }
         }
 
-        let summary_branches = remap_module_summary_branches(summary, inst);
+        let summary_branches = BranchRemapper::new(remap_module_summary_branches(summary, inst));
         let mut mapped_nodes = Vec::with_capacity(summary.nodes.len());
         let mut endpoint_mappings = Vec::with_capacity(summary.nodes.len());
         for (index, node) in summary.nodes.iter().enumerate() {
@@ -1370,7 +1370,7 @@ impl<'a> ModuleGraphBuilder<'a> {
         }
 
         for edge in &summary.edges {
-            let condition = edge.condition.remapped(&summary_branches);
+            let condition = summary_branches.remap(&edge.condition);
             if summary.nodes[edge.source].kind == SummaryNodeKind::Input
                 && let Some((array, packed)) = edge.kind.exact_offset()
                 && let Some(destinations) = &endpoint_mappings[edge.destination]
@@ -1544,13 +1544,9 @@ fn remap_module_summary_branches(
     summary: &ModuleCombSummary,
     inst: &InstDeclaration,
 ) -> HashMap<BranchId, BranchId> {
-    let mut branches = summary
-        .edges
-        .iter()
-        .flat_map(|dependency| dependency.condition.branches())
-        .collect::<Vec<_>>();
-    branches.sort_unstable();
-    branches.dedup();
+    let branches = PathCondition::collect_branches(
+        summary.edges.iter().map(|dependency| &dependency.condition),
+    );
     let namespace = std::ptr::from_ref(inst).addr();
     branches
         .into_iter()
