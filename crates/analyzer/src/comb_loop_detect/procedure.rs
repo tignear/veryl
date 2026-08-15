@@ -13,9 +13,9 @@ use super::ssa::{
 use crate::conv::Context;
 use crate::ir::VarId;
 use crate::ir::{
-    ArrayLiteralItem, AssignDestination, CaseStatement, Expression, Factor, ForBound, ForRange,
-    ForStatement, FunctionCall, IfStatement, MemberSelectDomain, Module, Op, Statement,
-    SystemFunctionKind, TypeKind, VarIndex, VarPath, VarSelect,
+    ArrayLiteralItem, AssignDestination, CasePattern, CaseStatement, Expression, Factor, ForBound,
+    ForRange, ForStatement, FunctionCall, IfStatement, MemberSelectDomain, Module, Op, Statement,
+    SystemFunctionCall, SystemFunctionKind, TbMethod, TypeKind, VarIndex, VarPath, VarSelect,
 };
 use crate::value::Value;
 use crate::{HashMap, HashSet};
@@ -37,40 +37,6 @@ fn position_domain(array: ArraySpan, packed: PackedSpan) -> PositionDomain {
         packed_start: packed.start,
         packed_length: packed.length,
     }
-}
-
-fn packed_mask_overlaps(mask: &crate::BigUint, span: PackedSpan) -> bool {
-    let Ok(start) = u64::try_from(span.start) else {
-        return false;
-    };
-    if mask.bits() <= start {
-        return false;
-    }
-    if span.length == 1 {
-        return mask.bit(start);
-    }
-    if span.start == 0 && u64::try_from(span.end()).is_ok_and(|end| end >= mask.bits()) {
-        return mask.bits() != 0;
-    }
-
-    let first_word = span.start / u64::BITS as usize;
-    let last_word = (span.end() - 1) / u64::BITS as usize;
-    mask.iter_u64_digits()
-        .enumerate()
-        .skip(first_word)
-        .take(last_word - first_word + 1)
-        .any(|(word_index, mut word)| {
-            if word_index == first_word {
-                word &= u64::MAX << (span.start % u64::BITS as usize);
-            }
-            if word_index == last_word {
-                let end_bit = span.end() % u64::BITS as usize;
-                if end_bit != 0 {
-                    word &= (1u64 << end_bit) - 1;
-                }
-            }
-            word != 0
-        })
 }
 
 fn translate_packed_span(span: PackedSpan, offset: isize) -> Option<PackedSpan> {
@@ -1637,39 +1603,33 @@ pub(super) struct FunctionSummaries<'a> {
     bit_part: &'a BitPartition,
     summaries: HashMap<FunctionSummaryKey, Option<Rc<FunctionSummary>>>,
     contexts: Vec<ProcedureContext>,
+    module_scope_ids: Rc<HashSet<VarId>>,
 }
 
 /// Reusable module-local evaluation context for independent procedural
-/// declarations. Its large variable and function maps are built once per
-/// active analysis context; SSA and control-flow state remain per analysis.
+/// declarations. Its large variable/function maps are built once per module;
+/// each analysis still gets fresh SSA/control state.
 pub(super) struct ProcedureContext {
     ctx: Option<Context>,
     module_scope_ids: Rc<HashSet<VarId>>,
+    summary_scratch: bool,
 }
 
 impl ProcedureContext {
     pub(super) fn new(module: &Module) -> Self {
-        let mut ctx = Context::default();
-        ctx.variables = module.variables.clone();
-        ctx.variables.extend(module.interface_members.clone());
-        ctx.functions = module.functions.clone();
-        let module_scope_ids = ctx
-            .variables
-            .iter()
-            .filter_map(|(&id, variable)| {
-                matches!(
-                    variable.affiliation,
-                    crate::symbol::Affiliation::Module | crate::symbol::Affiliation::Interface
-                )
-                .then_some(id)
-            })
-            .collect::<HashSet<_>>();
-        #[cfg(test)]
-        MODULE_CONTEXT_ENTRIES
-            .set(MODULE_CONTEXT_ENTRIES.get() + ctx.variables.len() + ctx.functions.len());
+        let (ctx, module_scope_ids) = module_context(module);
         Self {
             ctx: Some(ctx),
             module_scope_ids: Rc::new(module_scope_ids),
+            summary_scratch: false,
+        }
+    }
+
+    fn new_summary(module_scope_ids: Rc<HashSet<VarId>>) -> Self {
+        Self {
+            ctx: Some(Context::default()),
+            module_scope_ids,
+            summary_scratch: true,
         }
     }
 
@@ -1684,6 +1644,341 @@ impl ProcedureContext {
         debug_assert!(self.ctx.is_none());
         self.ctx = Some(ctx);
     }
+
+    fn prepare_summary(&mut self, module: &Module, id: VarId, receiver_index: &VarIndex) {
+        debug_assert!(self.summary_scratch);
+        let ctx = self.ctx.as_mut().expect("summary context is available");
+        debug_assert!(ctx.variables.is_empty());
+        debug_assert!(ctx.functions.is_empty());
+
+        let Some(function) = module.functions.get(&id) else {
+            return;
+        };
+        let Some(body) = function.get_function_for_index(receiver_index) else {
+            return;
+        };
+        let mut ids = body.arg_map.values().copied().collect::<HashSet<_>>();
+        ids.extend(body.ret);
+        collect_summary_statement_variables(module, &body.statements, &mut ids);
+        ctx.variables.reserve(ids.len());
+        for id in ids {
+            let variable = module
+                .interface_members
+                .get(&id)
+                .or_else(|| module.variables.get(&id));
+            if let Some(variable) = variable {
+                ctx.variables.insert(id, variable.clone());
+            }
+        }
+        #[cfg(test)]
+        MODULE_CONTEXT_ENTRIES.set(MODULE_CONTEXT_ENTRIES.get() + ctx.variables.len());
+    }
+
+    fn install_functions(&mut self, functions: HashMap<VarId, crate::ir::Function>) {
+        debug_assert!(self.summary_scratch);
+        let ctx = self.ctx.as_mut().expect("summary context is available");
+        debug_assert!(ctx.functions.is_empty());
+        ctx.functions = functions;
+    }
+
+    fn take_functions(&mut self) -> HashMap<VarId, crate::ir::Function> {
+        debug_assert!(self.summary_scratch);
+        let ctx = self.ctx.as_mut().expect("summary context is available");
+        std::mem::take(&mut ctx.functions)
+    }
+
+    fn clear_summary(&mut self) {
+        debug_assert!(self.summary_scratch);
+        let ctx = self.ctx.as_mut().expect("summary context is available");
+        debug_assert!(ctx.functions.is_empty());
+        ctx.variables.clear();
+    }
+}
+
+fn collect_summary_statement_variables(
+    module: &Module,
+    statements: &[Statement],
+    ids: &mut HashSet<VarId>,
+) {
+    for statement in statements {
+        match statement {
+            Statement::Assign(statement) => {
+                for destination in &statement.dst {
+                    collect_summary_destination_variables(module, destination, ids);
+                }
+                collect_summary_expression_variables(module, &statement.expr, ids);
+            }
+            Statement::If(statement) => {
+                collect_summary_expression_variables(module, &statement.cond, ids);
+                collect_summary_statement_variables(module, &statement.true_side, ids);
+                collect_summary_statement_variables(module, &statement.false_side, ids);
+            }
+            Statement::IfReset(statement) => {
+                collect_summary_statement_variables(module, &statement.true_side, ids);
+                collect_summary_statement_variables(module, &statement.false_side, ids);
+            }
+            Statement::Case(statement) => {
+                collect_summary_expression_variables(module, &statement.case_target, ids);
+                for arm in &statement.arms {
+                    for pattern in &arm.patterns {
+                        match pattern {
+                            CasePattern::Eq(expression) => {
+                                collect_summary_expression_variables(module, expression, ids);
+                            }
+                            CasePattern::Range { lo, hi, .. } => {
+                                collect_summary_expression_variables(module, lo, ids);
+                                collect_summary_expression_variables(module, hi, ids);
+                            }
+                        }
+                    }
+                    collect_summary_statement_variables(module, &arm.body, ids);
+                }
+                collect_summary_statement_variables(module, &statement.default, ids);
+            }
+            Statement::For(statement) => {
+                ids.insert(statement.var_id);
+                let (start, end) = match &statement.range {
+                    ForRange::Forward { start, end, .. }
+                    | ForRange::Reverse { start, end, .. }
+                    | ForRange::Stepped { start, end, .. } => (start, end),
+                };
+                for bound in [start, end] {
+                    if let ForBound::Expression(expression) = bound {
+                        collect_summary_expression_variables(module, expression, ids);
+                    }
+                }
+                collect_summary_statement_variables(module, &statement.body, ids);
+            }
+            Statement::FunctionCall(call) => {
+                collect_summary_call_variables(module, call, ids);
+            }
+            Statement::SystemFunctionCall(call) => {
+                collect_summary_system_call_variables(module, call, ids);
+            }
+            Statement::TbMethodCall(call) => {
+                if let Some(destination) = &call.ret {
+                    collect_summary_destination_variables(module, destination, ids);
+                }
+                match &call.method {
+                    TbMethod::ClockNext { count, period } => {
+                        if let Some(count) = count {
+                            collect_summary_expression_variables(module, count, ids);
+                        }
+                        if let Some(period) = period {
+                            collect_summary_expression_variables(module, period, ids);
+                        }
+                    }
+                    TbMethod::ResetAssert { duration, .. } => {
+                        if let Some(duration) = duration {
+                            collect_summary_expression_variables(module, duration, ids);
+                        }
+                    }
+                    TbMethod::FileOpen { name, .. } => {
+                        collect_summary_expression_variables(module, &name.0, ids);
+                    }
+                    TbMethod::FileWrite { args } | TbMethod::Component { args, .. } => {
+                        for argument in args {
+                            collect_summary_expression_variables(module, &argument.0, ids);
+                        }
+                    }
+                    TbMethod::RandomSeed { value } => {
+                        collect_summary_expression_variables(module, value, ids);
+                    }
+                    TbMethod::RandomGetRange { min, max, .. } => {
+                        collect_summary_expression_variables(module, min, ids);
+                        collect_summary_expression_variables(module, max, ids);
+                    }
+                    TbMethod::FileClose
+                    | TbMethod::FileFlush
+                    | TbMethod::RandomGet { .. }
+                    | TbMethod::RandomGetSeed => {}
+                }
+            }
+            Statement::Break | Statement::Unsupported(_) | Statement::Null => {}
+        }
+    }
+}
+
+fn collect_summary_expression_variables(
+    module: &Module,
+    expression: &Expression,
+    ids: &mut HashSet<VarId>,
+) {
+    match expression {
+        Expression::Term(factor) => match factor.as_ref() {
+            Factor::Variable(id, index, select, _) => {
+                ids.insert(*id);
+                collect_summary_index_variables(module, index, ids);
+                collect_summary_select_variables(module, select, ids);
+            }
+            Factor::HierVariable(reference) => {
+                collect_summary_index_variables(module, &reference.index, ids);
+                collect_summary_select_variables(module, &reference.select, ids);
+            }
+            Factor::FunctionCall(call) => collect_summary_call_variables(module, call, ids),
+            Factor::SystemFunctionCall(call) => {
+                collect_summary_system_call_variables(module, call, ids);
+            }
+            Factor::Value(_) | Factor::Anonymous(_) | Factor::Unknown(_) => {}
+        },
+        Expression::Unary(_, expression, _) => {
+            collect_summary_expression_variables(module, expression, ids);
+        }
+        Expression::Binary(left, _, right, _) => {
+            collect_summary_expression_variables(module, left, ids);
+            collect_summary_expression_variables(module, right, ids);
+        }
+        Expression::Ternary(condition, left, right, _) => {
+            collect_summary_expression_variables(module, condition, ids);
+            collect_summary_expression_variables(module, left, ids);
+            collect_summary_expression_variables(module, right, ids);
+        }
+        Expression::Concatenation(parts, _) => {
+            for (part, repeat) in parts {
+                collect_summary_expression_variables(module, part, ids);
+                if let Some(repeat) = repeat {
+                    collect_summary_expression_variables(module, repeat, ids);
+                }
+            }
+        }
+        Expression::ArrayLiteral(items, _) => {
+            for item in items {
+                match item {
+                    ArrayLiteralItem::Value(value, repeat) => {
+                        collect_summary_expression_variables(module, value, ids);
+                        if let Some(repeat) = repeat {
+                            collect_summary_expression_variables(module, repeat, ids);
+                        }
+                    }
+                    ArrayLiteralItem::Defaul(value) => {
+                        collect_summary_expression_variables(module, value, ids);
+                    }
+                }
+            }
+        }
+        Expression::StructConstructor(_, members, _) => {
+            for (_, value) in members {
+                collect_summary_expression_variables(module, value, ids);
+            }
+        }
+    }
+}
+
+fn collect_summary_call_variables(module: &Module, call: &FunctionCall, ids: &mut HashSet<VarId>) {
+    collect_summary_index_variables(module, &call.receiver_index, ids);
+    for input in call.inputs.values() {
+        collect_summary_expression_variables(module, input, ids);
+    }
+    for outputs in call.outputs.values() {
+        for destination in outputs {
+            collect_summary_destination_variables(module, destination, ids);
+        }
+    }
+    if let Some(body) = module
+        .functions
+        .get(&call.id)
+        .and_then(|function| function.get_function_for_index(&call.receiver_index))
+    {
+        ids.extend(body.arg_map.values().copied());
+        ids.extend(body.ret);
+    }
+}
+
+fn collect_summary_system_call_variables(
+    module: &Module,
+    call: &SystemFunctionCall,
+    ids: &mut HashSet<VarId>,
+) {
+    match &call.kind {
+        SystemFunctionKind::Bits(input)
+        | SystemFunctionKind::Size(input)
+        | SystemFunctionKind::Clog2(input)
+        | SystemFunctionKind::Onehot(input)
+        | SystemFunctionKind::Signed(input)
+        | SystemFunctionKind::Unsigned(input) => {
+            collect_summary_expression_variables(module, &input.0, ids);
+        }
+        SystemFunctionKind::Readmemh(input, output) => {
+            collect_summary_expression_variables(module, &input.0, ids);
+            for destination in &output.0 {
+                collect_summary_destination_variables(module, destination, ids);
+            }
+        }
+        SystemFunctionKind::Display(inputs) | SystemFunctionKind::Write(inputs) => {
+            for input in inputs {
+                collect_summary_expression_variables(module, &input.0, ids);
+            }
+        }
+        SystemFunctionKind::Assert { cond, args, .. } => {
+            collect_summary_expression_variables(module, &cond.0, ids);
+            for input in args {
+                collect_summary_expression_variables(module, &input.0, ids);
+            }
+        }
+        SystemFunctionKind::Finish => {}
+    }
+}
+
+fn collect_summary_destination_variables(
+    module: &Module,
+    destination: &AssignDestination,
+    ids: &mut HashSet<VarId>,
+) {
+    ids.insert(destination.id);
+    collect_summary_index_variables(module, &destination.index, ids);
+    collect_summary_select_variables(module, &destination.select, ids);
+}
+
+fn collect_summary_index_variables(module: &Module, index: &VarIndex, ids: &mut HashSet<VarId>) {
+    for expression in &index.0 {
+        collect_summary_expression_variables(module, expression, ids);
+    }
+}
+
+fn collect_summary_select_variables(module: &Module, select: &VarSelect, ids: &mut HashSet<VarId>) {
+    for expression in &select.0 {
+        collect_summary_expression_variables(module, expression, ids);
+    }
+    if let Some((_, expression)) = &select.1 {
+        collect_summary_expression_variables(module, expression, ids);
+    }
+}
+
+fn module_context(module: &Module) -> (Context, HashSet<VarId>) {
+    let mut ctx = Context::default();
+    ctx.variables = module.variables.clone();
+    ctx.variables.extend(module.interface_members.clone());
+    ctx.functions = module.functions.clone();
+    #[cfg(test)]
+    MODULE_CONTEXT_ENTRIES
+        .set(MODULE_CONTEXT_ENTRIES.get() + ctx.variables.len() + ctx.functions.len());
+    let module_scope_ids = ctx
+        .variables
+        .iter()
+        .filter_map(|(&id, variable)| {
+            matches!(
+                variable.affiliation,
+                crate::symbol::Affiliation::Module | crate::symbol::Affiliation::Interface
+            )
+            .then_some(id)
+        })
+        .collect();
+    (ctx, module_scope_ids)
+}
+
+fn module_scope_ids(module: &Module) -> HashSet<VarId> {
+    module
+        .variables
+        .iter()
+        .chain(&module.interface_members)
+        .filter_map(|(&id, variable)| {
+            matches!(
+                variable.affiliation,
+                crate::symbol::Affiliation::Module | crate::symbol::Affiliation::Interface
+            )
+            .then_some(id)
+        })
+        .collect()
 }
 
 impl<'a> FunctionSummaries<'a> {
@@ -1692,11 +1987,15 @@ impl<'a> FunctionSummaries<'a> {
             module,
             bit_part,
             summaries: HashMap::default(),
+            // Most modules never need a function summary. Allocate the
+            // baseline scratch context lazily so ordinary declarations keep
+            // just the reusable top-level procedure context.
             contexts: Vec::new(),
+            module_scope_ids: Rc::new(module_scope_ids(module)),
         }
     }
 
-    fn get(&mut self, call: &FunctionCall) -> FunctionSummaryLookup {
+    fn get(&mut self, call: &FunctionCall, caller_ctx: &mut Context) -> FunctionSummaryLookup {
         let key = FunctionSummaryKey {
             id: call.id,
             index: call.index.clone(),
@@ -1711,7 +2010,13 @@ impl<'a> FunctionSummaries<'a> {
         let mut context = self
             .contexts
             .pop()
-            .unwrap_or_else(|| ProcedureContext::new(self.module));
+            .unwrap_or_else(|| ProcedureContext::new_summary(Rc::clone(&self.module_scope_ids)));
+        context.prepare_summary(self.module, call.id, &call.receiver_index);
+        // Function IR is immutable during dependency analysis. Move the one
+        // module-wide map down the suspended call chain instead of cloning it
+        // into every recursive scratch context, then restore it before the
+        // caller resumes.
+        context.install_functions(std::mem::take(&mut caller_ctx.functions));
         let summary = ProcedureAnalysis::summarize_function(
             self.module,
             self.bit_part,
@@ -1721,6 +2026,8 @@ impl<'a> FunctionSummaries<'a> {
             self,
         )
         .map(Rc::new);
+        caller_ctx.functions = context.take_functions();
+        context.clear_summary();
         self.contexts.push(context);
         if let Some(summary) = summary {
             // A dynamic receiver summary contains the selector expression of
@@ -1748,8 +2055,9 @@ thread_local! {
     static FORMAL_OUTPUT_REGION_PROBES: Cell<usize> = const { Cell::new(0) };
     static FUNCTION_BARRIER_EVALUATIONS: Cell<usize> = const { Cell::new(0) };
     static FUNCTION_SUMMARY_GRAPH_NODES: Cell<usize> = const { Cell::new(0) };
-    static MODULE_CONTEXT_ENTRIES: Cell<usize> = const { Cell::new(0) };
     static FUNCTION_SUMMARY_METADATA_VISITS: Cell<usize> = const { Cell::new(0) };
+    static MODULE_CONTEXT_ENTRIES: Cell<usize> = const { Cell::new(0) };
+    static WRITE_FOOTPRINT_STATEMENT_VISITS: Cell<usize> = const { Cell::new(0) };
 }
 
 #[cfg(test)]
@@ -1760,9 +2068,9 @@ pub(crate) fn reset_function_evaluation_count() {
     FORMAL_OUTPUT_REGION_PROBES.set(0);
     FUNCTION_BARRIER_EVALUATIONS.set(0);
     FUNCTION_SUMMARY_GRAPH_NODES.set(0);
-    MODULE_CONTEXT_ENTRIES.set(0);
     FUNCTION_SUMMARY_METADATA_VISITS.set(0);
     EXPRESSION_LAYOUT_VISITS.set(0);
+    WRITE_FOOTPRINT_STATEMENT_VISITS.set(0);
 }
 
 #[cfg(test)]
@@ -1796,16 +2104,6 @@ pub(crate) fn function_summary_graph_node_count() -> usize {
 }
 
 #[cfg(test)]
-pub(crate) fn reset_module_context_entries() {
-    MODULE_CONTEXT_ENTRIES.set(0);
-}
-
-#[cfg(test)]
-pub(crate) fn module_context_entries() -> usize {
-    MODULE_CONTEXT_ENTRIES.get()
-}
-
-#[cfg(test)]
 pub(crate) fn function_summary_metadata_visits() -> usize {
     FUNCTION_SUMMARY_METADATA_VISITS.get()
 }
@@ -1815,24 +2113,29 @@ pub(crate) fn expression_layout_visit_count() -> usize {
     EXPRESSION_LAYOUT_VISITS.get()
 }
 
+#[cfg(test)]
+pub(crate) fn write_footprint_statement_visits() -> usize {
+    WRITE_FOOTPRINT_STATEMENT_VISITS.get()
+}
+
+#[cfg(test)]
+pub(crate) fn reset_module_context_entries() {
+    MODULE_CONTEXT_ENTRIES.set(0);
+}
+
+#[cfg(test)]
+pub(crate) fn module_context_entries() -> usize {
+    MODULE_CONTEXT_ENTRIES.get()
+}
+
 pub(super) fn analyze<'a>(
-    module: &'a Module,
     bit_part: &'a BitPartition,
     statements: &[Statement],
-    declaration_index: usize,
     branch_namespace: usize,
     context: &mut ProcedureContext,
     summaries: &mut FunctionSummaries<'a>,
 ) -> ProcedureResult {
-    ProcedureAnalysis::analyze(
-        module,
-        bit_part,
-        statements,
-        declaration_index,
-        branch_namespace,
-        context,
-        summaries,
-    )
+    ProcedureAnalysis::analyze(bit_part, statements, branch_namespace, context, summaries)
 }
 
 pub(super) struct ProcedureResult {
@@ -1965,7 +2268,8 @@ impl<'a, 's> ExpressionAnalysis<'a, 's> {
     ) -> Self {
         let (mut ctx, module_scope_ids) = context.take();
         ctx.begin_analysis_transaction();
-        let mut inner = ProcedureAnalysis::from_context(bit_part, ctx, module_scope_ids);
+        let mut inner =
+            ProcedureAnalysis::from_context(bit_part, summaries.module, ctx, module_scope_ids);
         inner.summaries = Some(summaries);
         Self { inner: Some(inner) }
     }
@@ -1975,9 +2279,8 @@ impl<'a, 's> ExpressionAnalysis<'a, 's> {
     }
 
     pub(super) fn eval(&mut self, expression: &Expression) -> Vec<RegionSource> {
-        let inner = self.inner();
-        inner.prepare_top_expression(expression);
-        inner.eval_expression_sources(expression)
+        self.inner().prepare_top_expression(expression);
+        self.inner().eval_expression_sources(expression)
     }
 
     /// Evaluate an actual once in source order, then project every requested
@@ -1991,9 +2294,8 @@ impl<'a, 's> ExpressionAnalysis<'a, 's> {
         Vec<RegionSource>,
         Vec<(ExpressionRegion, Vec<RegionSource>)>,
     ) {
-        let inner = self.inner();
-        inner.prepare_top_expression(expression);
-        inner.snapshot_expression(expression, |this| {
+        self.inner().prepare_top_expression(expression);
+        self.inner().snapshot_expression(expression, |this| {
             let mut source_cache = SourceCache::default();
             let regions = requests
                 .iter()
@@ -2022,18 +2324,14 @@ impl<'a, 's> ExpressionAnalysis<'a, 's> {
         self.inner().dependencies()
     }
 
+    pub(super) fn is_complete(&mut self) -> bool {
+        self.inner().status.is_complete()
+    }
+
     pub(super) fn restore(mut self, context: &mut ProcedureContext) {
         let mut inner = self.inner.take().expect("expression analysis is active");
         inner.ctx.rollback_analysis_transaction();
         context.restore(inner.ctx);
-    }
-
-    pub(super) fn is_complete(&self) -> bool {
-        self.inner
-            .as_ref()
-            .expect("expression analysis is active")
-            .status
-            .is_complete()
     }
 }
 
@@ -2046,6 +2344,7 @@ pub(super) struct RegionSource {
 
 struct ProcedureAnalysis<'a, 's> {
     bit_part: &'a BitPartition,
+    module: &'a Module,
     ctx: Context,
     module_scope_ids: Rc<HashSet<VarId>>,
     ssa: SsaStore<SsaKey>,
@@ -2073,11 +2372,13 @@ struct ProcedureAnalysis<'a, 's> {
 impl<'a, 's> ProcedureAnalysis<'a, 's> {
     fn from_context(
         bit_part: &'a BitPartition,
+        module: &'a Module,
         ctx: Context,
         module_scope_ids: Rc<HashSet<VarId>>,
     ) -> Self {
         Self {
             bit_part,
+            module,
             ctx,
             module_scope_ids,
             ssa: SsaStore::default(),
@@ -2104,20 +2405,17 @@ impl<'a, 's> ProcedureAnalysis<'a, 's> {
     }
 
     fn analyze(
-        module: &'a Module,
         bit_part: &'a BitPartition,
         statements: &[Statement],
-        declaration_index: usize,
         branch_namespace: usize,
         context: &mut ProcedureContext,
         summaries: &'s mut FunctionSummaries<'a>,
     ) -> ProcedureResult {
         let (mut ctx, module_scope_ids) = context.take();
         ctx.begin_analysis_transaction();
-        let mut this = Self::from_context(bit_part, ctx, module_scope_ids);
+        let mut this = Self::from_context(bit_part, summaries.module, ctx, module_scope_ids);
         this.summaries = Some(summaries);
-        this.causal_write_keys =
-            this.process_write_footprint(module, declaration_index, statements);
+        this.causal_write_keys = this.process_write_footprint(statements);
         this.branch_namespace = branch_namespace;
         this.eval_block(statements, &[]);
         let (graph, destinations) = this.dependency_graph();
@@ -2205,7 +2503,7 @@ impl<'a, 's> ProcedureAnalysis<'a, 's> {
         let formal_ids = body.arg_map.values().copied().collect::<HashSet<_>>();
         let (mut ctx, module_scope_ids) = context.take();
         ctx.begin_analysis_transaction();
-        let mut this = Self::from_context(bit_part, ctx, module_scope_ids);
+        let mut this = Self::from_context(bit_part, module, ctx, module_scope_ids);
         this.summaries = Some(summaries);
         this.call_caches.push(None);
         this.causal_write_keys = this.statement_write_footprint(&body.statements);
@@ -2537,12 +2835,7 @@ impl<'a, 's> ProcedureAnalysis<'a, 's> {
         }
     }
 
-    fn process_write_footprint(
-        &mut self,
-        module: &Module,
-        declaration_index: usize,
-        statements: &[Statement],
-    ) -> Vec<NodeKey> {
+    fn process_write_footprint(&mut self, statements: &[Statement]) -> Vec<NodeKey> {
         let mut keys = HashSet::default();
 
         // Prefer the sparse IR destinations. Besides covering ordinary writes
@@ -2551,33 +2844,6 @@ impl<'a, 's> ProcedureAnalysis<'a, 's> {
         let mut visited = HashSet::default();
         self.collect_statement_write_footprint(statements, &mut keys, &mut visited);
 
-        // `per_decl_refs` is the authoritative, bit-precise ownership record
-        // for writes that the IR cannot recover (for example an unsupported
-        // statement). It prevents an incomplete boundary in one process from
-        // erasing a disjoint bit driven by another process.
-        if let Some(references) = module.per_decl_refs.get(&declaration_index) {
-            for (&id, reference) in references {
-                for key in self.keys_for_id(id) {
-                    if keys.contains(&key) {
-                        continue;
-                    }
-                    let Some(packed) = self.key_span(key) else {
-                        continue;
-                    };
-                    let Some(array_end) = key.1.end() else {
-                        continue;
-                    };
-                    let start = key.1.start.min(reference.mask_assign.len());
-                    let end = array_end.min(reference.mask_assign.len());
-                    if reference.mask_assign[start..end]
-                        .iter()
-                        .any(|mask| packed_mask_overlaps(mask, packed))
-                    {
-                        keys.insert(key);
-                    }
-                }
-            }
-        }
         let mut keys = keys.into_iter().collect::<Vec<_>>();
         keys.sort_unstable();
         keys
@@ -2608,6 +2874,9 @@ impl<'a, 's> ProcedureAnalysis<'a, 's> {
         visited: &mut HashSet<FunctionSummaryKey>,
     ) {
         for statement in statements {
+            #[cfg(test)]
+            WRITE_FOOTPRINT_STATEMENT_VISITS
+                .set(WRITE_FOOTPRINT_STATEMENT_VISITS.get().saturating_add(1));
             match statement {
                 Statement::Assign(assign) => {
                     self.collect_expression_write_footprint(&assign.expr, keys, visited);
@@ -2710,10 +2979,15 @@ impl<'a, 's> ProcedureAnalysis<'a, 's> {
                 Factor::SystemFunctionCall(call) => {
                     self.collect_system_call_write_footprint(call, keys, visited);
                 }
-                Factor::Unknown(_)
-                | Factor::HierVariable(_)
-                | Factor::Value(_)
-                | Factor::Anonymous(_) => {}
+                Factor::HierVariable(reference) => {
+                    for expression in reference.index.0.iter().chain(reference.select.0.iter()) {
+                        self.collect_expression_write_footprint(expression, keys, visited);
+                    }
+                    if let Some((_, expression)) = &reference.select.1 {
+                        self.collect_expression_write_footprint(expression, keys, visited);
+                    }
+                }
+                Factor::Unknown(_) | Factor::Value(_) | Factor::Anonymous(_) => {}
             },
             Expression::Unary(_, expression, _) => {
                 self.collect_expression_write_footprint(expression, keys, visited);
@@ -2764,6 +3038,9 @@ impl<'a, 's> ProcedureAnalysis<'a, 's> {
         keys: &mut HashSet<NodeKey>,
         visited: &mut HashSet<FunctionSummaryKey>,
     ) {
+        for expression in &call.receiver_index.0 {
+            self.collect_expression_write_footprint(expression, keys, visited);
+        }
         for actual in call.inputs.values() {
             self.collect_expression_write_footprint(actual, keys, visited);
         }
@@ -2777,19 +3054,29 @@ impl<'a, 's> ProcedureAnalysis<'a, 's> {
             id: call.id,
             index: call.index.clone(),
         };
-        if !visited.insert(summary_key) {
+        if !visited.insert(summary_key.clone()) {
             return;
         }
         let Some(statements) = self
-            .ctx
+            .module
             .functions
             .get(&call.id)
             .and_then(|function| function.get_function_for_index(&call.receiver_index))
             .map(|body| body.statements)
         else {
+            visited.remove(&summary_key);
             return;
         };
         self.collect_statement_write_footprint(&statements, keys, visited);
+        // The actual expressions and output destinations above remain
+        // call-site-specific and are always visited. A plain function body,
+        // or a receiver body selected by a concrete index, is identical for
+        // every later call in this footprint traversal; retaining its key
+        // avoids walking an N-statement body at N call sites. Dynamic receiver
+        // bodies embed the call-site selector and therefore remain uncached.
+        if call.index.is_none() && !call.receiver_index.0.is_empty() {
+            visited.remove(&summary_key);
+        }
     }
 
     fn collect_system_call_write_footprint(
@@ -3963,7 +4250,7 @@ impl<'a, 's> ProcedureAnalysis<'a, 's> {
     }
 
     fn set_known_iterator_value(&mut self, statement: &ForStatement, value: usize) {
-        let Some(variable) = self.ctx.variables.get_mut(&statement.var_id) else {
+        let Some(variable) = self.ctx.variable_mut(&statement.var_id) else {
             return;
         };
         let Some(width) = statement.var_type.total_width() else {
@@ -3977,7 +4264,7 @@ impl<'a, 's> ProcedureAnalysis<'a, 's> {
     }
 
     fn forget_runtime_iterator_value(&mut self, iterator: VarId) {
-        if let Some(variable) = self.ctx.variables.get_mut(&iterator) {
+        if let Some(variable) = self.ctx.variable_mut(&iterator) {
             // Conversion may leave the range's initial value in the shared
             // compile-time store. It is not a constant in a runtime loop and
             // must not prune iterator-dependent branches.
@@ -5560,7 +5847,7 @@ impl<'a, 's> ProcedureAnalysis<'a, 's> {
         let summary = self
             .summaries
             .as_deref_mut()
-            .map(|summaries| summaries.get(call));
+            .map(|summaries| summaries.get(call, &mut self.ctx));
         match summary {
             Some(FunctionSummaryLookup::Ready(summary)) => {
                 return self.apply_function_summary(call, controls, summary.as_ref());
@@ -5575,7 +5862,7 @@ impl<'a, 's> ProcedureAnalysis<'a, 's> {
         }
 
         let body = self
-            .ctx
+            .module
             .functions
             .get(&call.id)
             .and_then(|function| function.get_function_for_index(&call.receiver_index));

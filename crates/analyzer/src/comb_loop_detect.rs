@@ -52,6 +52,7 @@ pub(crate) use procedure::{
     function_result_region_probe_count, function_result_version_count,
     function_summary_graph_node_count, function_summary_metadata_visits, module_context_entries,
     reset_function_evaluation_count, reset_module_context_entries,
+    write_footprint_statement_visits,
 };
 #[cfg(test)]
 pub(crate) use ssa::{
@@ -1183,10 +1184,8 @@ fn build_module_graph(
             continue;
         };
         let analysis = procedure::analyze(
-            module,
             &bit_part,
             &comb.statements,
-            declaration_index,
             declaration_index + 1,
             &mut builder.procedure_context,
             &mut builder.function_summaries,
@@ -2992,7 +2991,7 @@ impl<'a, 's, 'c> InstanceActualAnalysis<'a, 's, 'c> {
             .dedup_by(|left, right| left.key == right.key && left.condition == right.condition);
         let complete = self
             .procedure
-            .as_ref()
+            .as_mut()
             .is_none_or(procedure::ExpressionAnalysis::is_complete);
         let dependencies = if let Some(mut procedure) = self.procedure.take() {
             let dependencies = procedure.dependencies();
