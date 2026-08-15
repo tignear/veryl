@@ -728,6 +728,19 @@ impl VarSelectOp {
         };
         if swap { (end, beg) } else { (beg, end) }
     }
+
+    fn eval_value_checked(&self, beg: usize, end: usize, is_array: bool) -> Option<(usize, usize)> {
+        let (beg, end, swap) = match self {
+            VarSelectOp::Colon => (beg, end, false),
+            VarSelectOp::PlusColon => (beg.checked_add(end)?.saturating_sub(1), beg, is_array),
+            VarSelectOp::MinusColon => (beg, beg.checked_add(1)?.saturating_sub(end), is_array),
+            VarSelectOp::Step => {
+                let base = beg.checked_mul(end)?;
+                (base.checked_add(end)?.saturating_sub(1), base, is_array)
+            }
+        };
+        Some(if swap { (end, beg) } else { (beg, end) })
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -1060,9 +1073,9 @@ impl VarSelect {
             r#type.width()
         };
 
-        let mut beg = 0;
-        let mut end = 0;
-        let mut base = 1;
+        let mut beg: usize = 0;
+        let mut end: usize = 0;
+        let mut base: usize = 1;
 
         let dim = self.dimension();
         if r#type.dims() < dim {
@@ -1071,7 +1084,7 @@ impl VarSelect {
                 let x = x.eval_value(context)?.to_usize().unwrap_or(0);
                 let (x, y) = if let Some((op, y)) = &self.1 {
                     let y = y.eval_value(context)?.to_usize().unwrap_or(0);
-                    op.eval_value(x, y, is_array)
+                    op.eval_value_checked(x, y, is_array)?
                 } else {
                     (x, x)
                 };
@@ -1089,26 +1102,29 @@ impl VarSelect {
 
                     let (x, y) = if let Some((op, y)) = &self.1 {
                         let y = y.eval_value(context)?.to_usize().unwrap_or(0);
-                        op.eval_value(x, y, is_array)
+                        op.eval_value_checked(x, y, is_array)?
                     } else {
                         (x, x)
                     };
 
                     if is_array {
-                        beg += x * base;
-                        end += (y + 1) * base - 1;
+                        beg = beg.checked_add(x.checked_mul(base)?)?;
+                        end =
+                            end.checked_add(y.checked_add(1)?.checked_mul(base)?.checked_sub(1)?)?;
                     } else {
-                        beg += (x + 1) * base - 1;
-                        end += y * base;
+                        beg =
+                            beg.checked_add(x.checked_add(1)?.checked_mul(base)?.checked_sub(1)?)?;
+                        end = end.checked_add(y.checked_mul(base)?)?;
                     }
                 } else if i > skip {
                     let x = self.0.get(dim - (i - skip) - 1)?;
                     let x = x.eval_value(context)?.to_usize().unwrap_or(0);
 
-                    beg += x * base;
-                    end += x * base;
+                    let coordinate = x.checked_mul(base)?;
+                    beg = beg.checked_add(coordinate)?;
+                    end = end.checked_add(coordinate)?;
                 }
-                base *= w;
+                base = base.checked_mul(*w)?;
             } else {
                 return None;
             }
@@ -1596,6 +1612,19 @@ mod tests {
         assert!(variable.get_value(&[0, 2]).is_none());
         assert!(variable.get_value(&[2, 0]).is_none());
         assert!(!variable.set_value(&[2, 0], Value::new(1, 1, false), None));
+    }
+
+    #[test]
+    fn unbounded_select_rejects_flat_coordinate_overflow() {
+        let mut context = Context::default();
+        let mut r#type = Type::new(TypeKind::Logic);
+        r#type.array = Shape::new(vec![Some(usize::MAX), Some(usize::MAX)]);
+        let select = gen_var_select(&[1, 1], None);
+
+        assert_eq!(
+            select.eval_value_unbounded(&mut context, &r#type, true),
+            None
+        );
     }
 
     #[test]

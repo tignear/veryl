@@ -54,10 +54,10 @@ impl ShapeRef {
         if self.is_empty() {
             Some(1)
         } else {
-            let mut ret = 1;
+            let mut ret: usize = 1;
             for x in &self.0 {
                 if let Some(x) = x {
-                    ret *= x;
+                    ret = ret.checked_mul(*x)?;
                 } else {
                     return None;
                 }
@@ -114,12 +114,12 @@ impl ShapeRef {
         } else if index.len() != self.dims() {
             None
         } else {
-            let mut ret = 0;
-            let mut base = 1;
+            let mut ret: usize = 0;
+            let mut base: usize = 1;
             for (i, x) in self.iter().enumerate().rev() {
                 if let Some(x) = x {
-                    ret += index[i] * base;
-                    base *= x;
+                    ret = ret.checked_add(index[i].checked_mul(base)?)?;
+                    base = base.checked_mul(*x)?;
                 } else {
                     return None;
                 }
@@ -137,7 +137,7 @@ impl ShapeRef {
             None
         } else {
             let mut ret = None;
-            let mut base = 1;
+            let mut base: usize = 1;
             for (i, x) in self.iter().enumerate().rev() {
                 if let Some(x) = x {
                     let index_expr = index[i].clone();
@@ -163,7 +163,7 @@ impl ShapeRef {
                         ret = Some(expr);
                     }
 
-                    base *= x;
+                    base = base.checked_mul(*x)?;
                 } else {
                     return None;
                 }
@@ -777,6 +777,13 @@ impl IndexMut<RangeFrom<usize>> for Shape {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn total_rejects_overflow() {
+        let shape = Shape::new(vec![Some(usize::MAX), Some(2)]);
+        assert_eq!(shape.total(), None);
+        assert_eq!(shape.calc_index(&[1, 1]), None);
+    }
 
     #[test]
     fn test_calc_index() {
