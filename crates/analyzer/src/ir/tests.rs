@@ -3379,7 +3379,7 @@ fn const_fold_switch_arm() {
 }
 
 #[track_caller]
-fn ff_flags(code: &str) -> Vec<(String, bool)> {
+fn analyzed_module(code: &str) -> crate::ir::Module {
     symbol_table::clear();
     attribute_table::clear();
 
@@ -3393,14 +3393,18 @@ fn ff_flags(code: &str) -> Vec<(String, bool)> {
     let _ = Analyzer::analyze_post_pass1();
     let _ = analyzer.analyze_pass2(&parser.veryl, &mut context, Some(&mut ir));
 
-    let module = ir
-        .components
-        .iter()
+    ir.components
+        .into_iter()
         .find_map(|x| match x {
             crate::ir::Component::Module(m) => Some(m),
             _ => None,
         })
-        .expect("module");
+        .expect("module")
+}
+
+#[track_caller]
+fn ff_flags(code: &str) -> Vec<(String, bool)> {
+    let module = analyzed_module(code);
     let mut ret: Vec<(String, bool)> = module
         .ff_table
         .table
@@ -3507,4 +3511,560 @@ fn ff_opt_keeps_a_shift_that_reads_before_it_writes() {
         ff_flags(code),
         vec![("down".to_string(), false), ("up".to_string(), true)]
     );
+}
+
+#[test]
+fn ff_opt_treats_assignment_coordinates_as_reads() {
+    // A coordinate used by a later NBA is evaluated before the NBA updates
+    // take effect. It therefore has to keep its old-value storage. The same
+    // coordinate use from always_comb observes the post-NBA value and remains
+    // eligible for the comb representation.
+    let code = r#"
+    module ModuleA (
+        i_clk : input clock,
+        d     : input logic,
+    ) {
+        var ff_array_index   : u2;
+        var ff_packed_index  : u2;
+        var comb_array_index : u2;
+        var ff_array         : logic [4];
+        var comb_array       : logic [4];
+        var ff_packed        : logic<4>;
+
+        always_ff (i_clk) {
+            ff_array_index  = ff_array_index + 1;
+            ff_array[ff_array_index] = d;
+            ff_packed_index = ff_packed_index + 1;
+            ff_packed[ff_packed_index] = d;
+            comb_array_index = comb_array_index + 1;
+        }
+        always_comb {
+            comb_array[comb_array_index] = d;
+        }
+    }
+    "#;
+
+    assert_eq!(
+        ff_flags(code),
+        vec![
+            ("comb_array_index".to_string(), false),
+            ("ff_array".to_string(), false),
+            ("ff_array".to_string(), false),
+            ("ff_array".to_string(), false),
+            ("ff_array".to_string(), false),
+            ("ff_array_index".to_string(), true),
+            ("ff_packed".to_string(), false),
+            ("ff_packed_index".to_string(), true),
+        ]
+    );
+}
+
+#[test]
+fn ff_opt_dynamic_array_reads_cover_every_possible_element() {
+    // A run-time RHS index can select every element. A constant index remains
+    // precise, so unrelated elements are still eligible for the comb form.
+    let code = r#"
+    module ModuleA (
+        i_clk : input clock,
+        index : input u2,
+        d     : input logic,
+    ) {
+        var dynamic : logic [4];
+        var constant : logic [4];
+        var dynamic_sink : logic;
+        var constant_sink : logic;
+
+        always_ff (i_clk) {
+            dynamic[0] = d;
+            dynamic[1] = d;
+            dynamic[2] = d;
+            dynamic[3] = d;
+            constant[0] = d;
+            constant[1] = d;
+            constant[2] = d;
+            constant[3] = d;
+            dynamic_sink = dynamic[index];
+            constant_sink = constant[0];
+        }
+    }
+    "#;
+
+    assert_eq!(
+        ff_flags(code),
+        vec![
+            ("constant".to_string(), false),
+            ("constant".to_string(), false),
+            ("constant".to_string(), false),
+            ("constant".to_string(), true),
+            ("constant_sink".to_string(), false),
+            ("dynamic".to_string(), true),
+            ("dynamic".to_string(), true),
+            ("dynamic".to_string(), true),
+            ("dynamic".to_string(), true),
+            ("dynamic_sink".to_string(), false),
+        ]
+    );
+}
+
+#[test]
+fn ff_opt_dynamic_packed_writes_cover_every_possible_bit() {
+    // A run-time select may overlap the later self-read and therefore needs
+    // old-value storage. Provably disjoint constant writes do not.
+    let code = r#"
+    module ModuleA (
+        i_clk : input clock,
+        index : input u2,
+        d     : input logic,
+    ) {
+        var dynamic : logic<4>;
+        var disjoint : logic<4>;
+
+        always_ff (i_clk) {
+            dynamic[index] = d;
+            dynamic[1] = !dynamic[1];
+            disjoint[0] = d;
+            disjoint[1] = !disjoint[1];
+        }
+    }
+    "#;
+
+    assert_eq!(
+        ff_flags(code),
+        vec![
+            ("disjoint".to_string(), false),
+            ("dynamic".to_string(), true),
+        ]
+    );
+}
+
+#[test]
+fn ff_opt_dynamic_array_reads_keep_static_prefix_and_suffix() {
+    let code = r#"
+    module ModuleA (
+        i_clk : input clock,
+        index : input u1,
+        d     : input logic,
+    ) {
+        var prefix_hit  : logic [2, 2];
+        var prefix_miss : logic [2, 2];
+        var suffix_hit  : logic [2, 2];
+        var suffix_miss : logic [2, 2];
+        var sink0       : logic;
+        var sink1       : logic;
+        var sink2       : logic;
+        var sink3       : logic;
+
+        always_ff (i_clk) {
+            prefix_hit [0][1] = d;
+            prefix_miss[1][1] = d;
+            suffix_hit [1][0] = d;
+            suffix_miss[1][1] = d;
+            sink0 = prefix_hit [0][index];
+            sink1 = prefix_miss[0][index];
+            sink2 = suffix_hit [index][0];
+            sink3 = suffix_miss[index][0];
+        }
+    }
+    "#;
+
+    let flags = ff_flags(code).into_iter().collect::<crate::HashMap<_, _>>();
+    assert_eq!(flags.get("prefix_hit"), Some(&true));
+    assert_eq!(flags.get("prefix_miss"), Some(&false));
+    assert_eq!(flags.get("suffix_hit"), Some(&true));
+    assert_eq!(flags.get("suffix_miss"), Some(&false));
+}
+
+#[test]
+fn ff_opt_dynamic_array_writes_keep_static_prefix_and_suffix() {
+    let code = r#"
+    module ModuleA (
+        i_clk : input clock,
+        index : input u1,
+        d     : input logic,
+    ) {
+        var prefix_hit  : logic [2, 2];
+        var prefix_miss : logic [2, 2];
+        var suffix_hit  : logic [2, 2];
+        var suffix_miss : logic [2, 2];
+
+        always_ff (i_clk) {
+            prefix_hit [0][index] = d;
+            prefix_hit [0][1] = !prefix_hit[0][1];
+            prefix_miss[0][index] = d;
+            prefix_miss[1][1] = !prefix_miss[1][1];
+            suffix_hit [index][0] = d;
+            suffix_hit [1][0] = !suffix_hit[1][0];
+            suffix_miss[index][0] = d;
+            suffix_miss[1][1] = !suffix_miss[1][1];
+        }
+    }
+    "#;
+
+    let flags = ff_flags(code);
+    let named = |name: &str| {
+        flags
+            .iter()
+            .filter_map(|(candidate, flag)| (candidate == name).then_some(*flag))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(named("prefix_hit"), vec![false, true]);
+    assert_eq!(named("prefix_miss"), vec![false, false, false]);
+    assert_eq!(named("suffix_hit"), vec![false, true]);
+    assert_eq!(named("suffix_miss"), vec![false, false, false]);
+}
+
+#[test]
+fn ff_opt_dynamic_self_read_becomes_unsafe_on_the_second_write() {
+    const COUNT: usize = 8;
+    let code = format!(
+        r#"
+        module ModuleA (
+            i_clk : input clock,
+            index : input u3,
+        ) {{
+            var once : logic [{COUNT}];
+            var twice: logic [{COUNT}];
+            always_ff (i_clk) {{
+                once[index] = once[index];
+                twice[index] = twice[index];
+                twice[index] = twice[index];
+            }}
+        }}
+        "#
+    );
+
+    let module = analyzed_module(&code);
+    let mut context = Context::default();
+    context.variables = module.variables.clone();
+    context.functions = module.functions.clone();
+    let unsafe_reads = super::write_count::unsafe_self_reads(&module.declarations, &mut context);
+    let variable = |name: &str| {
+        module
+            .variables
+            .values()
+            .find(|variable| variable.path.to_string() == name)
+            .expect("test variable")
+    };
+    let once = variable("once");
+    let twice = variable("twice");
+    let assigned_decl = |id| {
+        module
+            .ff_table
+            .table
+            .get(&(id, 0))
+            .and_then(|entry| entry.assigned)
+            .expect("always_ff assignment")
+    };
+    let once_decl = assigned_decl(once.id);
+    let twice_decl = assigned_decl(twice.id);
+    assert!((0..COUNT).all(|index| !unsafe_reads.contains(&(once_decl, once.id, index))));
+    assert!((0..COUNT).all(|index| unsafe_reads.contains(&(twice_decl, twice.id, index))));
+}
+
+#[test]
+fn ff_opt_dynamic_destination_groups_survive_branch_join() {
+    const COUNT: usize = 32;
+    let code = format!(
+        r#"
+        module ModuleA (
+            i_clk : input clock,
+            gate  : input logic,
+            index : input u5,
+            d     : input logic,
+        ) {{
+            var values: logic [{COUNT}];
+            var sink  : logic;
+            always_ff (i_clk) {{
+                if gate {{
+                    values[index] = d;
+                }} else {{
+                    sink = d;
+                    sink = d;
+                }}
+                values[index] = values[index];
+            }}
+        }}
+        "#
+    );
+
+    let flags = ff_flags(&code);
+    let values = flags
+        .iter()
+        .filter(|(name, _)| name == "values")
+        .collect::<Vec<_>>();
+    assert_eq!(values.len(), COUNT);
+    assert!(values.iter().all(|(_, flag)| *flag));
+}
+
+#[test]
+fn ff_opt_function_output_coordinates_keep_the_call_context() {
+    // A function output actual is an lvalue at the call site. Its coordinate
+    // is an old-value read in always_ff, but an always_comb call observes the
+    // post-NBA value and must not make the coordinate register-resident.
+    let code = r#"
+    module ModuleA (
+        i_clk : input clock,
+    ) {
+        function clear(value: output logic) -> logic {
+            value = 0;
+            return 0;
+        }
+
+        var ff_index   : u2;
+        var comb_index : u2;
+        var ff_array   : logic [4];
+        var comb_array : logic [4];
+        var ff_sink    : logic;
+        var comb_sink  : logic;
+
+        always_ff (i_clk) {
+            ff_index = ff_index + 1;
+            ff_sink = clear(ff_array[ff_index]);
+            comb_index = comb_index + 1;
+        }
+        always_comb {
+            comb_sink = clear(comb_array[comb_index]);
+        }
+    }
+    "#;
+
+    assert_eq!(
+        ff_flags(code),
+        vec![
+            ("comb_index".to_string(), false),
+            ("ff_array".to_string(), false),
+            ("ff_array".to_string(), false),
+            ("ff_array".to_string(), false),
+            ("ff_array".to_string(), false),
+            ("ff_index".to_string(), true),
+            ("ff_sink".to_string(), false),
+        ]
+    );
+}
+
+#[test]
+fn ff_opt_applies_expression_function_output_writes_before_later_statements() {
+    let code = r#"
+    module ModuleA (
+        i_clk : input clock,
+    ) {
+        function set(value: output logic) -> logic {
+            value = 1;
+            return 0;
+        }
+
+        var q    : logic;
+        var sink : logic;
+
+        always_ff (i_clk) {
+            sink = set(q);
+            q = q + 1;
+        }
+    }
+    "#;
+
+    assert_eq!(
+        ff_flags(code),
+        vec![("q".to_string(), true), ("sink".to_string(), false)]
+    );
+}
+
+#[test]
+fn ff_opt_applies_function_copybacks_in_variable_coordinates() {
+    let code = r#"
+    module ModuleA (i_clk: input clock) {
+        function touch(value: output logic) -> logic<2> {
+            value = 0;
+            return 0;
+        }
+
+        var index : logic<2>;
+        var values: logic [4];
+        var sink  : logic;
+
+        always_ff (i_clk) {
+            sink = values[touch(index)];
+            index = index + 1;
+        }
+    }
+    "#;
+
+    let flags = ff_flags(code).into_iter().collect::<crate::HashMap<_, _>>();
+    assert_eq!(flags.get("index"), Some(&true));
+}
+
+#[test]
+fn ff_opt_applies_function_copybacks_in_assignment_coordinates() {
+    let code = r#"
+    module ModuleA (
+        i_clk: input clock,
+        d    : input logic,
+    ) {
+        function touch(value: output logic<2>) -> logic<2> {
+            value = 0;
+            return 0;
+        }
+
+        var index : logic<2>;
+        var values: logic [4];
+
+        always_ff (i_clk) {
+            values[touch(index)] = d;
+            index = index + 1;
+        }
+    }
+    "#;
+
+    let flags = ff_flags(code).into_iter().collect::<crate::HashMap<_, _>>();
+    assert_eq!(flags.get("index"), Some(&true));
+}
+
+#[test]
+fn ff_opt_orders_nested_expression_function_copybacks() {
+    let code = r#"
+    module ModuleA (
+        i_clk : input clock,
+    ) {
+        function set(value: output logic) -> logic {
+            value = 1;
+            return 0;
+        }
+        function pass(value: input logic) -> logic {
+            return value;
+        }
+
+        var after       : logic;
+        var before      : logic;
+        var nested      : logic;
+        var nested_sink : logic;
+
+        always_ff (i_clk) {
+            after = set(after) + after;
+            before = before + set(before);
+            nested_sink = pass(set(nested));
+            nested = nested + 1;
+        }
+    }
+    "#;
+
+    assert_eq!(
+        ff_flags(code),
+        vec![
+            ("after".to_string(), true),
+            ("before".to_string(), false),
+            ("nested".to_string(), true),
+            ("nested_sink".to_string(), false),
+        ]
+    );
+}
+
+#[test]
+fn ff_opt_keeps_ternary_copyback_arms_alternative() {
+    let code = r#"
+    module ModuleA (
+        i_clk : input clock,
+        gate  : input logic,
+    ) {
+        function set(value: output logic) -> logic {
+            value = 1;
+            return 0;
+        }
+
+        var disjoint    : logic;
+        var same_branch : logic;
+
+        always_ff (i_clk) {
+            disjoint = if gate ? set(disjoint) : disjoint;
+            same_branch = if gate ? set(same_branch) + same_branch : 0;
+        }
+    }
+    "#;
+
+    assert_eq!(
+        ff_flags(code),
+        vec![
+            ("disjoint".to_string(), false),
+            ("same_branch".to_string(), true),
+        ]
+    );
+}
+
+#[test]
+fn ff_opt_applies_function_copybacks_in_control_expressions() {
+    let code = r#"
+    module ModuleA (
+        i_clk : input clock,
+    ) {
+        function set(value: output logic) -> logic {
+            value = 1;
+            return 0;
+        }
+
+        var from_if   : logic;
+        var from_case : logic;
+        var sink      : logic;
+
+        always_ff (i_clk) {
+            if set(from_if) {
+                sink = 0;
+            }
+            from_if = from_if + 1;
+
+            case set(from_case) {
+                0: sink = 0;
+                default: sink = 1;
+            }
+            from_case = from_case + 1;
+        }
+    }
+    "#;
+
+    assert_eq!(
+        ff_flags(code),
+        vec![
+            ("from_case".to_string(), true),
+            ("from_if".to_string(), true),
+            ("sink".to_string(), false),
+        ]
+    );
+}
+
+#[test]
+fn ff_opt_runtime_footprints_include_output_coordinate_side_effects() {
+    let code = r#"
+    module ModuleA (
+        i_clk : input clock,
+        bound : input u32,
+    ) {
+        function touch(value: output logic<2>) -> logic<2> {
+            value = 0;
+            return 0;
+        }
+        function write(value: output logic) -> logic {
+            value = 0;
+            return 0;
+        }
+
+        var call_index    : logic<2>;
+        var readmem_index : logic<2>;
+        var call_array    : logic [4];
+        var readmem_array : logic [4];
+        var sink          : logic;
+
+        always_ff (i_clk) {
+            for call_iteration in 0..bound {
+                call_index[1] = call_index[0];
+                write(call_array[touch(call_index[0])]);
+            }
+            for readmem_iteration in 0..bound {
+                readmem_index[1] = readmem_index[0];
+                sink = $readmemh("file.hex", readmem_array[touch(readmem_index[0])]);
+            }
+        }
+    }
+    "#;
+
+    let flags = ff_flags(code).into_iter().collect::<crate::HashMap<_, _>>();
+    assert_eq!(flags.get("call_index"), Some(&true));
+    assert_eq!(flags.get("readmem_index"), Some(&true));
 }

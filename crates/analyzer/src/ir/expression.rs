@@ -2,7 +2,7 @@ use crate::analyzer_error::ExceedLimitKind;
 use crate::conv::Context;
 use crate::conv::checker::clock_domain::check_clock_domain;
 use crate::ir::assign_table::{AssignContext, AssignTable};
-use crate::ir::ff_table::AssignTarget;
+use crate::ir::ff_table::{AssignTarget, PackedMask};
 use crate::ir::utils::convert_cast;
 use crate::ir::{
     Comptime, ExpressionContext, FfTable, FunctionCall, Op, Signature, SystemFunctionCall,
@@ -1101,36 +1101,21 @@ impl Factor {
         match self {
             Factor::Variable(id, index, select, comptime) => {
                 if let Some(variable) = context.get_variable_info(*id) {
-                    let src_read_mask = select
-                        .conservative_packed_range(
-                            context,
-                            &variable.r#type,
-                            comptime.member_select_domain,
-                        )
-                        .map(|(beg, end)| ValueBigUint::gen_mask_range(beg, end))
-                        .unwrap_or_default();
-                    if let Some(index) = index.eval_value(context) {
-                        if let Some(index) = variable.r#type.array.calc_index(&index) {
-                            table.insert_refered(
-                                *id,
-                                index,
-                                decl,
-                                assign_target.cloned(),
-                                src_read_mask,
-                                from_ff,
-                            );
-                        }
-                    } else if let Some(total_array) = variable.r#type.total_array() {
-                        for i in 0..total_array {
-                            table.insert_refered(
-                                *id,
-                                i,
-                                decl,
-                                assign_target.cloned(),
-                                src_read_mask.clone(),
-                                from_ff,
-                            );
-                        }
+                    let src_read_mask = PackedMask::from_range(select.conservative_packed_range(
+                        context,
+                        &variable.r#type,
+                        comptime.member_select_domain,
+                    ));
+                    match index.possible_flat_indices(context, &variable.r#type.array) {
+                        Some(indices) => table.insert_refered_candidates(
+                            *id,
+                            indices,
+                            decl,
+                            assign_target.cloned(),
+                            src_read_mask,
+                            from_ff,
+                        ),
+                        None => table.insert_unknown_reference(*id, from_ff),
                     }
                 }
             }

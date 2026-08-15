@@ -404,6 +404,81 @@ impl std::str::FromStr for VarPath {
 #[derive(Clone, Debug, Default)]
 pub struct VarIndex(pub Vec<Expression>);
 
+/// Token-independent geometry of the flat elements selected by a partially
+/// dynamic array index.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct FlatIndexSet {
+    base: usize,
+    axes: Vec<(usize, usize)>,
+    len: usize,
+}
+
+pub(crate) struct FlatIndexCandidates {
+    current: usize,
+    axes: Vec<FlatIndexAxis>,
+    remaining: usize,
+}
+
+struct FlatIndexAxis {
+    extent: usize,
+    stride: usize,
+    digit: usize,
+}
+
+impl Iterator for FlatIndexCandidates {
+    type Item = usize;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.remaining == 0 {
+            return None;
+        }
+
+        let ret = self.current;
+        self.remaining -= 1;
+        if self.remaining == 0 {
+            return Some(ret);
+        }
+
+        for axis in self.axes.iter_mut().rev() {
+            if axis.digit + 1 < axis.extent {
+                axis.digit += 1;
+                self.current += axis.stride;
+                break;
+            }
+            self.current -= axis.digit * axis.stride;
+            axis.digit = 0;
+        }
+        Some(ret)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (self.remaining, Some(self.remaining))
+    }
+}
+
+impl ExactSizeIterator for FlatIndexCandidates {}
+
+impl IntoIterator for FlatIndexSet {
+    type Item = usize;
+    type IntoIter = FlatIndexCandidates;
+
+    fn into_iter(self) -> Self::IntoIter {
+        FlatIndexCandidates {
+            current: self.base,
+            axes: self
+                .axes
+                .into_iter()
+                .map(|(extent, stride)| FlatIndexAxis {
+                    extent,
+                    stride,
+                    digit: 0,
+                })
+                .collect(),
+            remaining: self.len,
+        }
+    }
+}
+
 impl VarIndex {
     pub fn from_index(index: usize, array: &ShapeRef) -> Self {
         let mut remaining = index;
@@ -462,6 +537,68 @@ impl VarIndex {
             ret.push(x.to_usize().unwrap_or(0));
         }
         Some(ret)
+    }
+
+    /// Conservatively enumerate the valid flat elements selected by this
+    /// index. A non-constant coordinate is a wildcard, while every evaluable
+    /// constant coordinate (including suffixes after a wildcard) stays fixed.
+    pub(crate) fn possible_flat_indices(
+        &self,
+        context: &mut Context,
+        array: &ShapeRef,
+    ) -> Option<FlatIndexSet> {
+        if array.is_empty() || (array.dims() == 1 && array[0] == Some(1) && self.0.is_empty()) {
+            return Some(FlatIndexSet {
+                base: 0,
+                axes: Vec::new(),
+                len: 1,
+            });
+        }
+
+        let extents = array.iter().copied().collect::<Option<Vec<_>>>()?;
+        if extents.contains(&0) {
+            return Some(FlatIndexSet {
+                base: 0,
+                axes: Vec::new(),
+                len: 0,
+            });
+        }
+
+        let mut strides = vec![0; extents.len()];
+        let mut stride = 1usize;
+        for (i, extent) in extents.iter().copied().enumerate().rev() {
+            strides[i] = stride;
+            stride = stride.checked_mul(extent)?;
+        }
+
+        // A shorter index denotes a whole trailing subarray. More coordinates
+        // than the shape has are malformed; in that case no coordinate is
+        // trusted, so invalid IR cannot make FF classification unsafely exact.
+        let dimensions_valid = self.0.len() <= extents.len();
+        let mut current = 0usize;
+        let mut axes = Vec::new();
+        let mut remaining = 1usize;
+        for (i, (extent, stride)) in extents.iter().copied().zip(strides).enumerate() {
+            let fixed = dimensions_valid
+                .then(|| self.0.get(i))
+                .flatten()
+                .filter(|expression| expression.comptime().is_const)
+                .and_then(|expression| expression.eval_value(context))
+                .and_then(|value| value.to_usize())
+                .filter(|value| *value < extent);
+            if let Some(value) = fixed {
+                current = current.checked_add(value.checked_mul(stride)?)?;
+            } else if extent > 1 {
+                remaining = remaining.checked_mul(extent)?;
+                axes.push((extent, stride));
+            }
+        }
+
+        Some(FlatIndexSet {
+            base: current,
+            axes,
+            len: remaining,
+        })
     }
 
     pub fn to_select(self) -> VarSelect {
@@ -1586,6 +1723,47 @@ mod tests {
         assert_eq!(z4, (89, 60));
         assert_eq!(z5, (119, 60));
         assert_eq!(z6, (119, 0));
+    }
+
+    #[test]
+    fn possible_flat_indices_keep_static_coordinates_on_both_sides() {
+        let token = TokenRange::default();
+        let fixed = |value| Expression::create_value(Value::new(value, 32, false), token);
+        let dynamic = || unknown_expression();
+        let array = Shape::new(vec![Some(2), Some(3)]);
+        let mut context = Context::default();
+
+        let prefix = VarIndex(vec![fixed(0), dynamic()])
+            .possible_flat_indices(&mut context, &array)
+            .unwrap()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let suffix = VarIndex(vec![dynamic(), fixed(0)])
+            .possible_flat_indices(&mut context, &array)
+            .unwrap()
+            .into_iter()
+            .collect::<Vec<_>>();
+
+        assert_eq!(prefix, vec![0, 1, 2]);
+        assert_eq!(suffix, vec![0, 3]);
+        assert_eq!(
+            VarIndex(vec![dynamic()])
+                .possible_flat_indices(&mut context, &Shape::new(vec![Some(0)]))
+                .unwrap()
+                .into_iter()
+                .count(),
+            0
+        );
+        assert!(
+            VarIndex(vec![dynamic()])
+                .possible_flat_indices(&mut context, &Shape::new(vec![None]))
+                .is_none()
+        );
+        assert!(
+            VarIndex(vec![dynamic(), dynamic()])
+                .possible_flat_indices(&mut context, &Shape::new(vec![Some(usize::MAX), Some(2)]),)
+                .is_none()
+        );
     }
 
     #[test]

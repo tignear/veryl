@@ -1,6 +1,6 @@
 use crate::conv::Context;
 use crate::ir::assign_table::{AssignContext, AssignTable};
-use crate::ir::ff_table::AssignTarget;
+use crate::ir::ff_table::{AssignTarget, PackedMask};
 use crate::ir::utils::{allow_missing_reset_statement, has_cond_type};
 use crate::ir::{
     Comptime, Expression, FfTable, FunctionCall, Op, SystemFunctionCall, SystemFunctionInput, Type,
@@ -724,6 +724,24 @@ pub struct AssignDestination {
 }
 
 impl AssignDestination {
+    fn gather_ff_coordinate_reads(
+        &self,
+        context: &mut Context,
+        table: &mut FfTable,
+        decl: usize,
+        from_ff: bool,
+    ) {
+        for expression in &self.index.0 {
+            expression.gather_ff(context, table, decl, None, from_ff);
+        }
+        for expression in &self.select.0 {
+            expression.gather_ff(context, table, decl, None, from_ff);
+        }
+        if let Some((_, expression)) = &self.select.1 {
+            expression.gather_ff(context, table, decl, None, from_ff);
+        }
+    }
+
     pub fn total_width(&self, context: &mut Context) -> Option<usize> {
         let (beg, end) = self
             .select
@@ -806,6 +824,9 @@ impl AssignDestination {
     }
 
     pub fn gather_ff(&self, context: &mut Context, table: &mut FfTable, decl: usize) {
+        // NBA destination coordinates are evaluated when the statement runs,
+        // so they read variables just like RHS expressions do.
+        self.gather_ff_coordinate_reads(context, table, decl, true);
         if let Some(variable) = context.get_variable_info(self.id) {
             // Let-bound variables use blocking assignment (BA) semantics
             // and must not be registered as FF in the table.
@@ -817,28 +838,25 @@ impl AssignDestination {
             if variable.affiliation == Affiliation::AlwaysFf {
                 return;
             }
-            if let Some(index) = self.index.eval_value(context) {
-                if let Some(index) = variable.r#type.array.calc_index(&index) {
-                    table.insert_assigned(self.id, index, decl);
-                }
-            } else if let Some(total_array) = variable.r#type.total_array() {
-                for i in 0..total_array {
-                    table.insert_assigned(self.id, i, decl);
-                }
+            match self
+                .index
+                .possible_flat_indices(context, &variable.r#type.array)
+            {
+                Some(indices) => table.insert_assigned_candidates(self.id, indices, decl, false),
+                None => table.insert_unknown_assignment(self.id, false),
             }
         }
     }
 
     pub fn gather_ff_comb_assign(&self, context: &mut Context, table: &mut FfTable, decl: usize) {
+        self.gather_ff_coordinate_reads(context, table, decl, false);
         if let Some(variable) = context.get_variable_info(self.id) {
-            if let Some(index) = self.index.eval_value(context) {
-                if let Some(index) = variable.r#type.array.calc_index(&index) {
-                    table.insert_assigned_comb(self.id, index, decl);
-                }
-            } else if let Some(total_array) = variable.r#type.total_array() {
-                for i in 0..total_array {
-                    table.insert_assigned_comb(self.id, i, decl);
-                }
+            match self
+                .index
+                .possible_flat_indices(context, &variable.r#type.array)
+            {
+                Some(indices) => table.insert_assigned_candidates(self.id, indices, decl, true),
+                None => table.insert_unknown_assignment(self.id, true),
             }
         }
     }
@@ -900,11 +918,11 @@ fn compute_assign_target(
     } else {
         None
     };
-    let mask = dst
-        .select
-        .conservative_packed_range(context, &var_info.r#type, dst.comptime.member_select_domain)
-        .map(|(beg, end)| ValueBigUint::gen_mask_range(beg, end))
-        .unwrap_or_default();
+    let mask = PackedMask::from_range(dst.select.conservative_packed_range(
+        context,
+        &var_info.r#type,
+        dst.comptime.member_select_domain,
+    ));
     Some((dst.id, arr_idx, mask))
 }
 

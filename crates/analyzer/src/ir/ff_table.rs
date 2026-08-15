@@ -1,24 +1,39 @@
-use crate::BigUint;
-use crate::HashMap;
 use crate::conv::Context;
 use crate::ir::VarId;
 use crate::ir::declaration::Declaration;
+use crate::ir::variable::FlatIndexSet;
 use crate::ir::write_count::{UnsafeSelfReads, unsafe_self_reads};
+use crate::{HashMap, HashSet};
 
-/// LHS of an assignment: `(VarId, array element index, bit-mask)`.
-/// `None` array index = dynamic. Empty bit-mask = unavailable (consumers
-/// fall back to per-decl aggregates).
-pub type AssignTarget = (VarId, Option<usize>, BigUint);
+/// A compact packed-bit access. `Unknown` conservatively covers every bit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum PackedMask {
+    Range { high: usize, low: usize },
+    Unknown,
+}
+
+impl PackedMask {
+    pub fn from_range(range: Option<(usize, usize)>) -> Self {
+        match range {
+            Some((high, low)) => Self::Range { high, low },
+            None => Self::Unknown,
+        }
+    }
+}
+
+/// LHS of an assignment: `(VarId, array element index, packed access)`.
+/// `None` array index = dynamic.
+pub type AssignTarget = (VarId, Option<usize>, PackedMask);
 
 #[derive(Clone, Debug)]
 pub struct FfTableEntry {
     pub assigned: Option<usize>,
     /// `(decl_index, assign_target, src_read_mask, from_ff)` per reference.
     /// `assign_target` is `None` for condition expressions and similar
-    /// non-assign contexts. Empty `src_read_mask` = unavailable (fall back
-    /// to per-decl aggregate). `from_ff` distinguishes always_ff (NBA-
+    /// non-assign contexts. `PackedMask::Unknown` is unavailable (consumers
+    /// conservatively cover every bit). `from_ff` distinguishes always_ff (NBA-
     /// sensitive) from always_comb / continuous assign.
-    pub refered: Vec<(usize, Option<AssignTarget>, BigUint, bool)>,
+    pub refered: Vec<(usize, Option<AssignTarget>, PackedMask, bool)>,
     pub is_ff: bool,
     pub assigned_comb: Option<usize>,
 }
@@ -67,6 +82,8 @@ impl FfTableEntry {
 #[derive(Clone, Debug, Default)]
 pub struct FfTable {
     pub table: HashMap<(VarId, usize), FfTableEntry>,
+    unknown_ff_reads: HashSet<VarId>,
+    unknown_ff_assignments: HashSet<VarId>,
 }
 
 impl FfTable {
@@ -77,10 +94,14 @@ impl FfTable {
         let unsafe_reads = unsafe_self_reads(decls, context);
         let keys: Vec<_> = self.table.keys().cloned().collect();
         for key in keys {
-            self.table
-                .get_mut(&key)
-                .unwrap()
-                .update_is_ff(key, &unsafe_reads);
+            let entry = self.table.get_mut(&key).unwrap();
+            if self.unknown_ff_assignments.contains(&key.0)
+                || (self.unknown_ff_reads.contains(&key.0) && entry.assigned.is_some())
+            {
+                entry.is_ff = true;
+            } else {
+                entry.update_is_ff(key, &unsafe_reads);
+            }
         }
     }
 
@@ -95,8 +116,11 @@ impl FfTable {
     }
 
     pub fn is_ff(&self, id: VarId, index: usize) -> bool {
+        if self.unknown_ff_assignments.contains(&id) {
+            return true;
+        }
         if let Some(x) = self.table.get(&(id, index)) {
-            x.is_ff
+            x.is_ff || (x.assigned.is_some() && self.unknown_ff_reads.contains(&id))
         } else {
             false
         }
@@ -108,14 +132,14 @@ impl FfTable {
         index: usize,
         decl: usize,
         assign_target: Option<AssignTarget>,
-        src_read_mask: BigUint,
+        src_read_mask: PackedMask,
         from_ff: bool,
     ) {
         self.table
             .entry((id, index))
             .and_modify(|x| {
                 x.refered
-                    .push((decl, assign_target.clone(), src_read_mask.clone(), from_ff))
+                    .push((decl, assign_target, src_read_mask, from_ff))
             })
             .or_insert_with(|| FfTableEntry {
                 assigned: None,
@@ -123,6 +147,26 @@ impl FfTable {
                 is_ff: false,
                 assigned_comb: None,
             });
+    }
+
+    pub(crate) fn insert_refered_candidates(
+        &mut self,
+        id: VarId,
+        candidates: FlatIndexSet,
+        decl: usize,
+        assign_target: Option<AssignTarget>,
+        src_read_mask: PackedMask,
+        from_ff: bool,
+    ) {
+        for index in candidates {
+            self.insert_refered(id, index, decl, assign_target, src_read_mask, from_ff);
+        }
+    }
+
+    pub(crate) fn insert_unknown_reference(&mut self, id: VarId, from_ff: bool) {
+        if from_ff {
+            self.unknown_ff_reads.insert(id);
+        }
     }
 
     pub fn insert_assigned(&mut self, id: VarId, index: usize, decl: usize) {
@@ -151,6 +195,28 @@ impl FfTable {
             });
     }
 
+    pub(crate) fn insert_assigned_candidates(
+        &mut self,
+        id: VarId,
+        candidates: FlatIndexSet,
+        decl: usize,
+        from_comb: bool,
+    ) {
+        for index in candidates {
+            if from_comb {
+                self.insert_assigned_comb(id, index, decl);
+            } else {
+                self.insert_assigned(id, index, decl);
+            }
+        }
+    }
+
+    pub(crate) fn insert_unknown_assignment(&mut self, id: VarId, from_comb: bool) {
+        if !from_comb {
+            self.unknown_ff_assignments.insert(id);
+        }
+    }
+
     #[cfg(debug_assertions)]
     pub fn validate(&self) {
         for ((id, index), entry) in &self.table {
@@ -164,5 +230,29 @@ impl FfTable {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unknown_array_candidates_conservatively_retain_ff() {
+        let read_id = VarId::from_raw(1);
+        let assigned_id = VarId::from_raw(2);
+        let comb_id = VarId::from_raw(3);
+        let mut table = FfTable::default();
+
+        table.insert_assigned(read_id, 7, 0);
+        table.insert_unknown_reference(read_id, true);
+        assert!(table.is_ff(read_id, 7));
+
+        table.insert_unknown_assignment(assigned_id, false);
+        assert!(table.is_ff(assigned_id, 0));
+        assert!(table.is_ff(assigned_id, usize::MAX));
+
+        table.insert_unknown_assignment(comb_id, true);
+        assert!(!table.is_ff(comb_id, 0));
     }
 }
