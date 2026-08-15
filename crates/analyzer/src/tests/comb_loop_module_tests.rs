@@ -2507,6 +2507,7 @@ fn instance_actual_regions_share_source_summary_walks() {
         .collect::<Vec<_>>()
         .join("\n");
     crate::comb_loop_detect::reset_source_summary_state_visits();
+    crate::comb_loop_detect::reset_instance_request_edge_probes();
     assert_comb_loop(
         "many requested regions reuse shared SSA source summaries",
         &format!(
@@ -2538,6 +2539,10 @@ fn instance_actual_regions_share_source_summary_walks() {
     assert!(
         crate::comb_loop_detect::source_summary_state_visits() <= WIDTH * 20,
         "region queries must share walks of the same SSA versions",
+    );
+    assert!(
+        crate::comb_loop_detect::instance_request_edge_probes() <= WIDTH * 4,
+        "positioned input discovery must be linear in summary nodes and edges",
     );
 }
 
