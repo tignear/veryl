@@ -2442,6 +2442,343 @@ fn comb_loop_function_formal_high_bit_ignores_short_unsigned_actual() {
     );
 }
 
+fn signed_function_input_widening_code(source_bit: usize) -> String {
+    format!(
+        r#"
+        module Top (o: output logic) {{
+            var feedback: signed logic<2>;
+            function high (i: input logic<4>) -> logic {{
+                return i[3];
+            }}
+            assign o = high(feedback);
+            assign feedback[{source_bit}] = o;
+            assign feedback[{}] = 0;
+        }}
+        "#,
+        1 - source_bit
+    )
+}
+
+#[test]
+fn comb_loop_function_signed_input_widening_replicates_sign_bit() {
+    assert_comb_loop(
+        "a signed function actual extends its sign bit into a wider formal",
+        &signed_function_input_widening_code(1),
+        true,
+    );
+}
+
+#[test]
+fn comb_loop_function_signed_input_widening_excludes_non_sign_bit() {
+    assert_comb_loop(
+        "a signed function actual does not extend a non-sign bit",
+        &signed_function_input_widening_code(0),
+        false,
+    );
+}
+
+#[test]
+fn comb_loop_function_unsigned_cast_prevents_signed_input_extension() {
+    assert_comb_loop(
+        "an unsigned cast prevents a signed function actual from sign-extending",
+        r#"
+        module Top (o: output logic) {
+            var feedback: signed logic<2>;
+            function high (i: input logic<4>) -> logic {
+                return i[3];
+            }
+            assign o = high($unsigned(feedback));
+            assign feedback[1] = o;
+            assign feedback[0] = 0;
+        }
+        "#,
+        false,
+    );
+}
+
+#[test]
+fn comb_loop_function_signed_concat_input_extends_its_sign_bit() {
+    assert_comb_loop(
+        "a signed cast makes a concatenated function actual sign-extend",
+        r#"
+        module Top (o: output logic) {
+            var feedback: logic<2>;
+            function high (i: input logic<4>) -> logic {
+                return i[3];
+            }
+            assign o = high($signed({feedback}));
+            assign feedback[1] = o;
+            assign feedback[0] = 0;
+        }
+        "#,
+        true,
+    );
+}
+
+fn signed_array_function_input_widening_code(source_element: usize) -> String {
+    format!(
+        r#"
+        module Top (o: output logic) {{
+            var feedback: signed logic<2> [2];
+            function high (i: input logic<4> [2]) -> logic {{
+                return i[0][3];
+            }}
+            assign o = high(feedback);
+            assign feedback[{source_element}][1] = o;
+            assign feedback[{source_element}][0] = 0;
+            assign feedback[{}] = 0;
+        }}
+        "#,
+        1 - source_element
+    )
+}
+
+#[test]
+fn comb_loop_function_signed_input_widening_preserves_array_element() {
+    assert_comb_loop(
+        "signed input widening retains the matching unpacked-array element",
+        &signed_array_function_input_widening_code(0),
+        true,
+    );
+}
+
+#[test]
+fn comb_loop_function_signed_input_widening_keeps_array_elements_disjoint() {
+    assert_comb_loop(
+        "signed input widening keeps sibling unpacked-array elements disjoint",
+        &signed_array_function_input_widening_code(1),
+        false,
+    );
+}
+
+fn function_output_coercion_code(
+    formal_type: &str,
+    actual_type: &str,
+    formal_width: usize,
+    source_bit: usize,
+    actual_bit: usize,
+) -> String {
+    let clears = (0..formal_width)
+        .filter(|bit| *bit != source_bit)
+        .map(|bit| format!("assign feedback[{bit}] = 0;"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!(
+        r#"
+        module Top (o: output logic) {{
+            var feedback: logic<{formal_width}>;
+            var passed: {actual_type};
+            function copy (
+                i: input logic<{formal_width}>,
+                y: output {formal_type},
+            ) {{
+                y = i;
+            }}
+            always_comb {{
+                copy(feedback, passed);
+            }}
+            assign feedback[{source_bit}] = passed[{actual_bit}];
+            {clears}
+            assign o = passed[0];
+        }}
+        "#
+    )
+}
+
+#[test]
+fn comb_loop_function_signed_output_widening_replicates_sign_bit() {
+    assert_comb_loop(
+        "a signed function output extends its sign bit into a wider actual",
+        &function_output_coercion_code("signed logic<2>", "logic<4>", 2, 1, 3),
+        true,
+    );
+}
+
+#[test]
+fn comb_loop_function_signed_output_widening_excludes_non_sign_bit() {
+    assert_comb_loop(
+        "a signed function output does not extend a non-sign bit",
+        &function_output_coercion_code("signed logic<2>", "logic<4>", 2, 0, 3),
+        false,
+    );
+}
+
+#[test]
+fn comb_loop_function_unsigned_output_widening_zero_extends_high_bit() {
+    assert_comb_loop(
+        "an unsigned function output does not feed a zero-extended actual bit",
+        &function_output_coercion_code("logic<2>", "logic<4>", 2, 1, 3),
+        false,
+    );
+}
+
+#[test]
+fn comb_loop_function_unsigned_output_zero_extends_into_signed_actual() {
+    assert_comb_loop(
+        "an unsigned function output zero-extends even when the wider actual is signed",
+        &function_output_coercion_code("logic<2>", "signed logic<4>", 2, 1, 3),
+        false,
+    );
+}
+
+#[test]
+fn comb_loop_function_output_narrowing_retains_low_bit() {
+    assert_comb_loop(
+        "a narrowed function output retains a copied low bit",
+        &function_output_coercion_code("signed logic<4>", "logic<2>", 4, 0, 0),
+        true,
+    );
+}
+
+#[test]
+fn comb_loop_function_output_narrowing_discards_high_bit() {
+    assert_comb_loop(
+        "a narrowed function output discards a formal high bit",
+        &function_output_coercion_code("signed logic<4>", "logic<2>", 4, 3, 0),
+        false,
+    );
+}
+
+fn signed_array_function_output_widening_code(source_element: usize) -> String {
+    format!(
+        r#"
+        module Top (o: output logic) {{
+            var feedback: logic<2> [2];
+            var passed: logic<4> [2];
+            function copy (
+                i: input logic<2> [2],
+                y: output signed logic<2> [2],
+            ) {{
+                y = i;
+            }}
+            always_comb {{
+                copy(feedback, passed);
+            }}
+            assign feedback[{source_element}][1] = passed[0][3];
+            assign feedback[{source_element}][0] = 0;
+            assign feedback[{}] = 0;
+            assign o = passed[0][0];
+        }}
+        "#,
+        1 - source_element
+    )
+}
+
+#[test]
+fn comb_loop_function_signed_output_widening_preserves_array_element() {
+    assert_comb_loop(
+        "signed output widening retains the matching unpacked-array element",
+        &signed_array_function_output_widening_code(0),
+        true,
+    );
+}
+
+#[test]
+fn comb_loop_function_signed_output_widening_keeps_array_elements_disjoint() {
+    assert_comb_loop(
+        "signed output widening keeps sibling unpacked-array elements disjoint",
+        &signed_array_function_output_widening_code(1),
+        false,
+    );
+}
+
+fn signed_function_output_concat_code(source_bit: usize) -> String {
+    format!(
+        r#"
+        module Top (o: output logic) {{
+            var feedback: logic<2>;
+            var high: logic<2>;
+            var low: logic<2>;
+            function copy (
+                i: input logic<2>,
+                y: output signed logic<2>,
+            ) {{
+                y = i;
+            }}
+            always_comb {{
+                copy(feedback, {{high, low}});
+            }}
+            assign feedback[{source_bit}] = high[0];
+            assign feedback[{}] = 0;
+            assign o = low[0];
+        }}
+        "#,
+        1 - source_bit
+    )
+}
+
+#[test]
+fn comb_loop_function_signed_output_extension_maps_concat_high_fragment() {
+    assert_comb_loop(
+        "signed output extension maps into a concatenated high fragment",
+        &signed_function_output_concat_code(1),
+        true,
+    );
+}
+
+#[test]
+fn comb_loop_function_signed_output_concat_excludes_non_sign_bit() {
+    assert_comb_loop(
+        "signed output extension into a concat excludes a non-sign bit",
+        &signed_function_output_concat_code(0),
+        false,
+    );
+}
+
+#[test]
+fn comb_loop_function_nested_summary_retains_signed_input_extension() {
+    assert_comb_loop(
+        "a nested function summary retains signed widening at its inner boundary",
+        r#"
+        module Top (o: output logic) {
+            var feedback: signed logic<2>;
+            function high (i: input logic<4>) -> logic {
+                return i[3];
+            }
+            function nested (i: input signed logic<2>) -> logic {
+                return high(i);
+            }
+            assign o = nested(feedback);
+            assign feedback[1] = o;
+            assign feedback[0] = 0;
+        }
+        "#,
+        true,
+    );
+}
+
+#[test]
+fn comb_loop_function_nested_summary_retains_signed_output_extension() {
+    assert_comb_loop(
+        "a nested function summary retains signed widening during copy-out",
+        r#"
+        module Top (o: output logic) {
+            var feedback: logic<2>;
+            var passed: logic<4>;
+            function inner (
+                i: input logic<2>,
+                y: output signed logic<2>,
+            ) {
+                y = i;
+            }
+            function outer (
+                i: input logic<2>,
+                y: output logic<4>,
+            ) {
+                inner(i, y);
+            }
+            always_comb {
+                outer(feedback, passed);
+            }
+            assign feedback[1] = passed[3];
+            assign feedback[0] = 0;
+            assign o = passed[0];
+        }
+        "#,
+        true,
+    );
+}
+
 #[test]
 fn comb_loop_function_if_expression_arms_are_mutually_exclusive() {
     // Each function invocation selects one feed-forward equation. Flattening

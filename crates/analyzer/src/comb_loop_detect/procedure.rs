@@ -1344,6 +1344,13 @@ struct DestinationSnapshot {
     opaque: bool,
 }
 
+#[derive(Clone, Copy)]
+struct FormalOutputCoercion {
+    actual_width: usize,
+    formal_width: usize,
+    formal_signed: bool,
+}
+
 #[derive(Default)]
 struct ProjectionContext {
     destination_index: Option<AffineIndex>,
@@ -3720,25 +3727,14 @@ impl<'a, 's> ProcedureAnalysis<'a, 's> {
                 },
                 projection,
             );
-            sign.widen_all();
+            // Sign extension broadcasts only along the packed axis. Keep the
+            // unpacked-element relation so sibling array elements stay
+            // independent across context-sized expression boundaries.
+            sign.forget_packed_position();
             reads.extend(sign);
         }
         reads.normalize();
         reads
-    }
-
-    fn eval_expr_bits(
-        &mut self,
-        expression: &Expression,
-        requested_array: ArraySpan,
-        requested: PackedSpan,
-    ) -> ExpressionSources {
-        self.eval_expr_bits_in(
-            expression,
-            requested_array,
-            requested,
-            &ProjectionContext::default(),
-        )
     }
 
     fn eval_expr_bits_in(
@@ -4959,6 +4955,9 @@ impl<'a, 's> ProcedureAnalysis<'a, 's> {
             let Some(&formal) = body.arg_map.get(path) else {
                 continue;
             };
+            let formal_coercion = self.ctx.variables.get(&formal).and_then(|variable| {
+                Some((variable.r#type.total_width()?, variable.r#type.signed))
+            });
             let formal_versions = formal_outputs
                 .get(&formal)
                 .map(Vec::as_slice)
@@ -4967,8 +4966,15 @@ impl<'a, 's> ProcedureAnalysis<'a, 's> {
                 .iter()
                 .map(|destination| self.destination_width(destination))
                 .collect();
-            if widths.iter().all(Option::is_some) {
+            if let Some((formal_width, formal_signed)) = formal_coercion
+                && widths.iter().all(Option::is_some)
+            {
                 let total_width = widths.iter().flatten().sum();
+                let coercion = FormalOutputCoercion {
+                    actual_width: total_width,
+                    formal_width,
+                    formal_signed,
+                };
                 let mut offset = total_width;
                 for (destination, width) in destinations.iter().zip(widths) {
                     let width = width.expect("checked above");
@@ -4977,11 +4983,12 @@ impl<'a, 's> ProcedureAnalysis<'a, 's> {
                         destination,
                         formal_versions,
                         offset,
-                        total_width,
+                        coercion,
                         controls,
                     );
                 }
             } else {
+                self.status = self.status.max(AnalysisStatus::Partial);
                 let sources = formal_versions
                     .iter()
                     .map(|(_, version)| *version)
@@ -5049,13 +5056,23 @@ impl<'a, 's> ProcedureAnalysis<'a, 's> {
             let Some(&formal) = summary.arg_map.get(path) else {
                 continue;
             };
+            let formal_coercion = self.ctx.variables.get(&formal).and_then(|variable| {
+                Some((variable.r#type.total_width()?, variable.r#type.signed))
+            });
             let widths: Vec<_> = destinations
                 .iter()
                 .map(|destination| self.destination_width(destination))
                 .collect();
-            if widths.iter().all(Option::is_some) {
+            if let Some((formal_width, formal_signed)) = formal_coercion
+                && widths.iter().all(Option::is_some)
+            {
                 let formal_versions = self.current_key_versions_for_id(formal);
                 let total_width = widths.iter().flatten().sum();
+                let coercion = FormalOutputCoercion {
+                    actual_width: total_width,
+                    formal_width,
+                    formal_signed,
+                };
                 let mut offset = total_width;
                 for (destination, width) in destinations.iter().zip(widths) {
                     let width = width.expect("checked above");
@@ -5064,11 +5081,12 @@ impl<'a, 's> ProcedureAnalysis<'a, 's> {
                         destination,
                         &formal_versions,
                         offset,
-                        total_width,
+                        coercion,
                         controls,
                     );
                 }
             } else {
+                self.status = self.status.max(AnalysisStatus::Partial);
                 let sources = self
                     .current_key_versions_for_id(formal)
                     .into_iter()
@@ -5287,7 +5305,21 @@ impl<'a, 's> ProcedureAnalysis<'a, 's> {
         let Some(span) = self.key_span(formal_key) else {
             return ExpressionSources::whole(self.eval_expr(actual));
         };
-        self.eval_expr_bits(actual, formal_key.1, span)
+        let formal_width = self
+            .ctx
+            .variables
+            .get(&formal_key.0)
+            .and_then(|variable| variable.r#type.total_width());
+        if actual.comptime().r#type.total_width().is_none() || formal_width.is_none() {
+            self.status = self.status.max(AnalysisStatus::Partial);
+            return ExpressionSources::whole(self.eval_expr(actual));
+        }
+        self.eval_expr_requested(
+            actual,
+            formal_key.1,
+            span,
+            formal_width.expect("checked above"),
+        )
     }
 
     fn snapshot_function_actual(
@@ -5322,9 +5354,14 @@ impl<'a, 's> ProcedureAnalysis<'a, 's> {
         destination: &AssignDestination,
         formal_versions: &[(NodeKey, VersionId)],
         formal_offset: usize,
-        formal_width: usize,
+        coercion: FormalOutputCoercion,
         controls: &[VersionId],
     ) {
+        let FormalOutputCoercion {
+            actual_width,
+            formal_width,
+            formal_signed,
+        } = coercion;
         let variable = self.ctx.variables.get(&destination.id).cloned();
         let selected = if destination.select.is_const_with_range() {
             variable.as_ref().and_then(|variable| {
@@ -5368,21 +5405,54 @@ impl<'a, 's> ProcedureAnalysis<'a, 's> {
                         .intersection(destination_array)
                         .and_then(|array| array.translated(destination_array.start, 0)),
                     span.translated(low, formal_offset)
-                        .and_then(|span| PackedSpan::whole(formal_width)?.intersection(span)),
+                        .and_then(|span| PackedSpan::whole(actual_width)?.intersection(span)),
                 ) {
-                    for (formal_key, version) in formal_versions {
-                        if !formal_key.1.overlaps(requested_array) {
-                            continue;
+                    if let Some(copied) = PackedSpan::whole(formal_width)
+                        .and_then(|formal| formal.intersection(requested))
+                    {
+                        for (formal_key, version) in formal_versions {
+                            if !formal_key.1.overlaps(requested_array) {
+                                continue;
+                            }
+                            let Some(formal_span) = self.key_span(*formal_key) else {
+                                continue;
+                            };
+                            if formal_span.overlaps(copied) {
+                                positional.extend(
+                                    self.project_version_sources(*version, requested_array, copied)
+                                        .into_iter()
+                                        .map(|version| (version, position_offset)),
+                                );
+                            }
                         }
-                        let Some(formal_span) = self.key_span(*formal_key) else {
-                            continue;
+                    }
+                    if formal_signed
+                        && formal_width != 0
+                        && actual_width > formal_width
+                        && requested.end() > formal_width
+                    {
+                        let sign = PackedSpan {
+                            start: formal_width - 1,
+                            length: 1,
                         };
-                        if formal_span.overlaps(requested) {
-                            positional.extend(
-                                self.project_version_sources(*version, requested_array, requested)
-                                    .into_iter()
-                                    .map(|version| (version, position_offset)),
-                            );
+                        let sign_relation = PositionRelation {
+                            array: position_offset.array,
+                            packed: None,
+                        };
+                        for (formal_key, version) in formal_versions {
+                            if !formal_key.1.overlaps(requested_array) {
+                                continue;
+                            }
+                            let Some(formal_span) = self.key_span(*formal_key) else {
+                                continue;
+                            };
+                            if formal_span.overlaps(sign) {
+                                positional.extend(
+                                    self.project_version_sources(*version, requested_array, sign)
+                                        .into_iter()
+                                        .map(|version| (version, sign_relation)),
+                                );
+                            }
                         }
                     }
                 }
