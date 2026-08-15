@@ -2,6 +2,16 @@ use crate::HashMap;
 use crate::conv::Context;
 use crate::ir::{AssignDestination, MemberSelectDomain, Type, VarId, VarIndex, VarSelect};
 
+#[cfg(test)]
+thread_local! {
+    static PACKED_OVERLAP_COMPARISONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn count_packed_overlap_comparison() {
+    PACKED_OVERLAP_COMPARISONS.set(PACKED_OVERLAP_COMPARISONS.get() + 1);
+}
+
 pub(super) fn signed_difference(destination: usize, source: usize) -> Option<isize> {
     isize::try_from(destination)
         .ok()?
@@ -79,6 +89,8 @@ impl PackedSpan {
     }
 
     pub(super) fn overlaps(self, other: Self) -> bool {
+        #[cfg(test)]
+        count_packed_overlap_comparison();
         self.start < other.end() && other.start < self.end()
     }
 
@@ -155,11 +167,12 @@ impl BitPartition {
             .filter(|split| split.overlaps(access))
             .flat_map(|split| {
                 let ranges = self.ranges_of((id, *split));
-                ranges
+                let first = ranges.partition_point(|range| range.end() <= span.start);
+                ranges[first..]
                     .iter()
                     .enumerate()
-                    .filter(|(_, range)| range.overlaps(span))
-                    .map(|(range, _)| (id, *split, range))
+                    .take_while(move |(_, range)| range.overlaps(span))
+                    .map(move |(range, _)| (id, *split, first + range))
             })
             .collect::<Vec<_>>();
         keys.sort_unstable();
@@ -228,4 +241,38 @@ fn array_access_span(index: &VarIndex, r#type: &Type, ctx: &mut Context) -> Opti
         start,
         length: inclusive_end.checked_sub(start)?.checked_add(1)?,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn packed_overlap_lookup_does_not_scan_unrelated_atoms() {
+        const COUNT: usize = 4096;
+        let id = VarId::from_raw(1);
+        let array = ArraySpan {
+            start: 0,
+            length: 1,
+        };
+        let ranges = (0..COUNT)
+            .map(|start| PackedSpan::new(start, 1).unwrap())
+            .collect();
+        let mut partitions = HashMap::default();
+        partitions.insert((id, array), ranges);
+        let partition = BitPartition::new(partitions);
+
+        PACKED_OVERLAP_COMPARISONS.set(0);
+        for start in 0..COUNT {
+            assert_eq!(
+                partition.overlapping_access(id, array, PackedSpan::new(start, 1).unwrap(),),
+                vec![(id, array, start)],
+            );
+        }
+        assert!(
+            PACKED_OVERLAP_COMPARISONS.get() <= COUNT * 2,
+            "overlap lookup performed {} comparisons for {COUNT} point queries",
+            PACKED_OVERLAP_COMPARISONS.get(),
+        );
+    }
 }
