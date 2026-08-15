@@ -44,6 +44,48 @@ use veryl_parser::token_range::TokenRange;
 use veryl_parser::veryl_grammar_trait::*;
 use veryl_parser::veryl_token::Token;
 
+/// Child variables grouped by the first segment of their module-local path.
+/// A modport port path always constrains that segment, so building this once
+/// per instance avoids rescanning every child variable for every port.
+struct InterfaceBindingMemberIndex<'a> {
+    by_root: HashMap<StrId, Vec<(VarId, &'a Variable)>>,
+}
+
+impl<'a> InterfaceBindingMemberIndex<'a> {
+    fn new(component: &'a ir::Module) -> Self {
+        let mut by_root: HashMap<_, Vec<_>> = HashMap::default();
+        for (id, variable) in component
+            .interface_members
+            .iter()
+            .chain(component.variables.iter())
+        {
+            if let Some(root) = variable.path.0.first() {
+                by_root.entry(*root).or_default().push((*id, variable));
+            }
+        }
+        Self { by_root }
+    }
+
+    fn candidates(&self, path: &VarPath) -> &[(VarId, &'a Variable)] {
+        path.0
+            .first()
+            .and_then(|root| self.by_root.get(root))
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+    }
+}
+
+#[cfg(test)]
+impl Context {
+    pub(crate) fn reset_interface_binding_prefix_comparisons() {
+        VarPath::reset_prefix_comparisons();
+    }
+
+    pub(crate) fn interface_binding_prefix_comparisons() -> usize {
+        VarPath::prefix_comparisons()
+    }
+}
+
 impl Conv<&GenerateItem> for ir::DeclarationBlock {
     fn conv(context: &mut Context, value: &GenerateItem) -> IrResult<Self> {
         match value {
@@ -1614,6 +1656,7 @@ impl Conv<&InstDeclaration> for ir::Declaration {
                 let mut inputs = vec![];
                 let mut outputs = vec![];
                 let mut interface_bindings = vec![];
+                let interface_binding_members = std::cell::OnceCell::new();
                 if let Some(x) = &value.component_instantiation_opt2
                     && let Some(x) = &x.inst_port.inst_port_opt
                 {
@@ -1639,10 +1682,11 @@ impl Conv<&InstDeclaration> for ir::Declaration {
                             };
 
                             if let Some(actual) = connects.interface_binding {
-                                for (child, child_variable) in component
-                                    .interface_members
-                                    .iter()
-                                    .chain(component.variables.iter())
+                                #[cfg(test)]
+                                let _prefix_comparison_guard = VarPath::count_prefix_comparisons();
+                                for (child, child_variable) in interface_binding_members
+                                    .get_or_init(|| InterfaceBindingMemberIndex::new(component))
+                                    .candidates(&path)
                                 {
                                     if !child_variable.path.starts_with(&path.0) {
                                         continue;
