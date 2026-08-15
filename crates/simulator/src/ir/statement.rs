@@ -4222,11 +4222,7 @@ impl Conv<&FunctionCall> for Vec<ProtoStatement> {
             .get(&src.id)
             .unwrap()
             .clone();
-        let body = if let Some(ref idx) = src.index {
-            func.get_function(idx).unwrap()
-        } else {
-            func.get_function(&[]).unwrap()
-        };
+        let body = func.get_function_for_index(&src.receiver_index).unwrap();
 
         for (var_path, expr) in &src.inputs {
             let arg_var_id = body.arg_map.get(var_path).unwrap();

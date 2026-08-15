@@ -1042,6 +1042,32 @@ fn interface_instance_synthesizes() {
     );
 }
 
+#[test]
+fn dynamic_interface_array_function_receiver_synthesizes() {
+    let code = r#"
+        interface Bus {
+            var value: logic;
+
+            function get () -> logic {
+                return value;
+            }
+        }
+
+        module Top (
+            index: input  u32,
+            y    : output logic,
+        ) {
+            inst bus: Bus[2];
+            assign bus[0].value = 0;
+            assign bus[1].value = 1;
+            assign y = bus[index].get();
+        }
+    "#;
+    let (ir, top) = analyze(code, "Top");
+
+    build_gate_ir(&ir, top).expect("a dynamic receiver must select a specialized function body");
+}
+
 /// Tries to synthesize every module found in `testcases/veryl/`. Not a pass/
 /// fail test — it's an exploration that prints a per-category error histogram
 /// to help decide what to support next. Run with:

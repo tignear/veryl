@@ -4908,6 +4908,43 @@ fn interface_function() {
 }
 
 #[test]
+fn dynamic_interface_array_function_receiver() {
+    let code = r#"
+    interface BusIf {
+        var data: logic<8>;
+
+        function get_double() -> logic<8> {
+            return data * 2;
+        }
+    }
+
+    module Top (
+        index: input  u32,
+        out  : output logic<8>,
+    ) {
+        inst bus: BusIf[2];
+        assign bus[0].data = 21;
+        assign bus[1].data = 7;
+        assign out = bus[index].get_double();
+    }
+    "#;
+
+    for config in Config::all() {
+        let ir = analyze(code, &config);
+        let mut sim = Simulator::new(ir, None);
+        for (index, expected) in [(0, 42), (1, 14)] {
+            sim.set("index", Value::new(index, 32, false));
+            sim.step(&Event::Clock(VarId::SYNTHETIC));
+            assert_eq!(
+                sim.get("out").unwrap(),
+                Value::new(expected, 8, false),
+                "index={index} config={config:?}",
+            );
+        }
+    }
+}
+
+#[test]
 fn array_literal_comb() {
     let code = r#"
     module Top (

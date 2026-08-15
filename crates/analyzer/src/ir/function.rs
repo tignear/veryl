@@ -165,7 +165,7 @@ impl Function {
         Some(body)
     }
 
-    pub(crate) fn get_function_for_index(&self, index: &VarIndex) -> Option<FunctionBody> {
+    pub fn get_function_for_index(&self, index: &VarIndex) -> Option<FunctionBody> {
         if self.array.is_empty() {
             if !index.0.is_empty() {
                 return None;
