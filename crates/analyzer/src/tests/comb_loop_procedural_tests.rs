@@ -2241,6 +2241,58 @@ fn comb_loop_dynamic_write_keeps_other_static_suffix_disjoint() {
     );
 }
 
+fn signed_ordered_case_code(include_last_pattern: bool) -> String {
+    let last_pattern = if include_last_pattern {
+        "2'b11   : value = 0;"
+    } else {
+        ""
+    };
+    format!(
+        r#"
+        module Top (
+            sel: input  signed bit<2>,
+            o  : output logic,
+        ) {{
+            var feedback: logic;
+            var value   : logic;
+            assign feedback = value;
+            always_comb {{
+                value = 0;
+                case sel {{
+                    2'b00   : value = 0;
+                    2'b01   : value = 0;
+                    2'b10   : value = 0;
+                    {last_pattern}
+                    default: value = feedback;
+                }}
+                o = value;
+            }}
+        }}
+        "#
+    )
+}
+
+#[test]
+fn comb_loop_ordered_case_signed_equalities_make_default_unreachable() {
+    let code = signed_ordered_case_code(true);
+    assert!(comb_loop_analysis_is_complete(&code));
+    assert_comb_loop(
+        "every raw bit pattern shadows the default for a signed 2-state selector",
+        &code,
+        false,
+    );
+}
+
+#[test]
+fn comb_loop_ordered_case_signed_missing_pattern_keeps_default_reachable() {
+    let code = signed_ordered_case_code(false);
+    assert!(comb_loop_analysis_is_complete(&code));
+    assert_comb_loop(
+        "an uncovered signed selector bit pattern keeps the default reachable",
+        &code,
+        true,
+    );
+}
 #[test]
 fn runtime_logical_or_condition_merges_the_skipped_rhs_effect() {
     assert_comb_loop(

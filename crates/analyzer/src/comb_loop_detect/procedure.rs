@@ -3425,15 +3425,16 @@ impl<'a, 's> ProcedureAnalysis<'a, 's> {
 
     /// Return the arms that can win an ordered `case`, plus whether its
     /// default remains reachable. Keep the general path conservative: this
-    /// finite interval model applies only to an unsigned, scalar, 2-state
-    /// selector and constant, non-X/Z equality/range bounds.
+    /// finite interval model applies only to a scalar, 2-state selector and
+    /// constant, non-X/Z bounds. Signed selectors accept only equal-width
+    /// equality patterns, whose raw bit-pattern comparison is unambiguous;
+    /// signed ranges and context-sized equalities keep the general fallback.
     fn ordered_case_reachability(
         &mut self,
         statement: &CaseStatement,
     ) -> Option<(Vec<usize>, bool)> {
         let target_type = &statement.case_target.comptime().r#type;
         if !matches!(target_type.kind, TypeKind::Bit)
-            || target_type.signed
             || !target_type.array.is_empty()
             || !target_type.is_2state()
         {
@@ -3454,7 +3455,9 @@ impl<'a, 's> ProcedureAnalysis<'a, 's> {
         for (index, arm) in statement.arms.iter().enumerate() {
             let mut intervals = Vec::with_capacity(arm.patterns.len());
             for pattern in &arm.patterns {
-                if let Some(interval) = self.case_pattern_interval(pattern, domain_high)? {
+                if let Some(interval) =
+                    self.case_pattern_interval(pattern, domain_high, width, target_type.signed)?
+                {
                     intervals.push(interval);
                 }
             }
@@ -3477,7 +3480,21 @@ impl<'a, 's> ProcedureAnalysis<'a, 's> {
         &mut self,
         pattern: &crate::ir::CasePattern,
         domain_high: usize,
+        target_width: usize,
+        target_signed: bool,
     ) -> Option<Option<(usize, usize)>> {
+        if target_signed {
+            let crate::ir::CasePattern::Eq(expression) = pattern else {
+                return None;
+            };
+            let value = expression.eval_value(&mut self.ctx)?;
+            if value.is_xz() || value.width() == 0 || value.width() != target_width {
+                return None;
+            }
+            let value = value.to_usize()?;
+            return Some(Some((value, value)));
+        }
+
         let constant = |this: &mut Self, expression: &Expression| {
             let value = expression.eval_value(&mut this.ctx)?;
             // Width-zero values are the unbased all-bit literals (`'0`,
