@@ -670,6 +670,692 @@ fn comb_loop_instance_output_address_contributes_dependency() {
 }
 
 #[test]
+fn comb_loop_dynamic_instance_output_considers_a_nonzero_unpacked_element() {
+    assert_comb_loop(
+        "a dynamic instance output can select a nonzero unpacked element",
+        r#"
+        module Child (i: input logic, o: output logic) {
+            assign o = i;
+        }
+        module Top (o: output logic) {
+            var index: logic;
+            var bus  : logic [2];
+            inst child: Child (
+                i: index,
+                o: bus[index],
+            );
+            assign index = bus[1];
+            assign o = index;
+        }
+        "#,
+        true,
+    );
+}
+
+#[test]
+fn comb_loop_large_dynamic_instance_output_stays_sparse() {
+    let code = r#"
+        module Child (i: input logic, o: output logic) {
+            assign o = i;
+        }
+        module Top (index: input u32, o: output logic) {
+            var feedback: logic;
+            var bus     : logic [1000000];
+            inst child: Child (
+                i: feedback,
+                o: bus[index],
+            );
+            assign feedback = bus[999999];
+            assign o = feedback;
+        }
+    "#;
+    assert!(comb_loop_analysis_is_complete(code));
+    assert_comb_loop(
+        "a large dynamic output retains a distant candidate without expanding the array",
+        code,
+        true,
+    );
+}
+
+fn multidimensional_dynamic_instance_output_code(selector_source: &str) -> String {
+    format!(
+        r#"
+        module Child (i: input logic, o: output logic) {{
+            assign o = i;
+        }}
+        module Top (o: output logic) {{
+            var index: logic;
+            var bus  : logic [2, 2];
+            inst child: Child (
+                i: index,
+                o: bus[1][index],
+            );
+            assign index = {selector_source};
+            assign o = index;
+        }}
+        "#
+    )
+}
+
+#[test]
+fn comb_loop_dynamic_instance_output_preserves_a_multidimensional_static_prefix() {
+    assert_comb_loop(
+        "a dynamic inner coordinate can select every element below its static prefix",
+        &multidimensional_dynamic_instance_output_code("bus[1][1]"),
+        true,
+    );
+}
+
+#[test]
+fn comb_loop_dynamic_instance_output_keeps_multidimensional_prefixes_disjoint() {
+    assert_comb_loop(
+        "a dynamic inner coordinate cannot escape its static outer prefix",
+        &multidimensional_dynamic_instance_output_code("bus[0][1]"),
+        false,
+    );
+}
+
+fn packed_dynamic_instance_output_code(selector_source: &str) -> String {
+    format!(
+        r#"
+        module Child (i: input logic<2>, o: output logic<2>) {{
+            assign o = i;
+        }}
+        module Top (o: output logic) {{
+            var index: logic;
+            var bus  : logic<4> [2];
+            inst child: Child (
+                i: {{index, index}},
+                o: bus[1][index+:2],
+            );
+            assign bus[0] = 0;
+            assign index = {selector_source};
+            assign o = index;
+        }}
+        "#
+    )
+}
+
+#[test]
+fn comb_loop_dynamic_instance_output_considers_every_packed_part_select_candidate() {
+    assert_comb_loop(
+        "an indexed packed part-select can include a bit beyond its zero-based window",
+        &packed_dynamic_instance_output_code("bus[1][2]"),
+        true,
+    );
+}
+
+#[test]
+fn comb_loop_dynamic_instance_output_keeps_packed_array_elements_disjoint() {
+    assert_comb_loop(
+        "a dynamic packed select cannot escape its selected unpacked element",
+        &packed_dynamic_instance_output_code("bus[0][2]"),
+        false,
+    );
+}
+
+fn summarized_dynamic_instance_output_code(selector_source: &str) -> String {
+    format!(
+        r#"
+        module Leaf (i: input logic, o: output logic) {{
+            assign o = i;
+        }}
+        module Middle (selector: input logic, o: output logic) {{
+            var bus: logic [2, 2];
+            inst leaf: Leaf (
+                i: selector,
+                o: bus[1][selector],
+            );
+            assign o = {selector_source};
+        }}
+        module Top (o: output logic) {{
+            var feedback: logic;
+            inst middle: Middle (
+                selector: feedback,
+                o       : feedback,
+            );
+            assign o = feedback;
+        }}
+        "#
+    )
+}
+
+#[test]
+fn comb_loop_dynamic_instance_output_dependency_survives_a_module_summary() {
+    assert_comb_loop(
+        "a dynamic output address remains a dependency through a module summary",
+        &summarized_dynamic_instance_output_code("bus[1][1]"),
+        true,
+    );
+}
+
+#[test]
+fn comb_loop_dynamic_instance_output_summary_keeps_static_prefixes_disjoint() {
+    assert_comb_loop(
+        "a summarized dynamic output remains confined to its static prefix",
+        &summarized_dynamic_instance_output_code("bus[0][1]"),
+        false,
+    );
+}
+
+fn packed_concat_conditional_actual_code(first: &str, second: &str) -> String {
+    format!(
+        r#"
+        module Identity (i: input logic<2>, o: output logic<2>) {{
+            assign o = i;
+        }}
+        module Top (
+            c0: input logic,
+            c1: input logic,
+            o : output logic,
+        ) {{
+            var a     : logic;
+            var b     : logic;
+            var passed: logic<2>;
+            inst identity: Identity (
+                i: {{{first}, {second}}},
+                o: passed,
+            );
+            assign a = passed[0];
+            assign b = passed[1];
+            assign o = a | b;
+        }}
+        "#
+    )
+}
+
+fn ordered_instance_actual_code(actual: &str) -> String {
+    format!(
+        r#"
+        module PickMiddle (i: input logic<3>, o: output logic) {{
+            assign o = i[1];
+        }}
+        module Top (independent: input logic, o: output logic) {{
+            var x       : logic;
+            var feedback: logic;
+            function set_x (value: input logic) -> logic {{
+                x = value;
+                return 0;
+            }}
+            inst pick: PickMiddle (
+                i: {actual},
+                o: feedback,
+            );
+            assign o = feedback;
+        }}
+        "#
+    )
+}
+
+#[test]
+fn instance_actual_projection_reads_the_version_at_each_syntax_occurrence() {
+    crate::comb_loop_detect::reset_function_evaluation_count();
+    assert_comb_loop(
+        "a projected actual read sees the side effect that precedes its occurrence",
+        &ordered_instance_actual_code("{set_x(feedback), x, set_x(independent)}"),
+        true,
+    );
+    assert_eq!(
+        crate::comb_loop_detect::function_evaluation_count(),
+        2,
+        "each syntactic side-effecting call in the actual is evaluated exactly once",
+    );
+}
+
+#[test]
+fn actual_branch_layout_walk_is_linear_in_syntactic_calls() {
+    const CALLS: usize = 10_000;
+    let actual = (0..CALLS)
+        .map(|_| "identity(i)")
+        .collect::<Vec<_>>()
+        .join(", ");
+    crate::comb_loop_detect::reset_function_evaluation_count();
+    let errors = analyze(&format!(
+        r#"
+        module Sink (i: input logic<{CALLS}>, o: output logic) {{ assign o = |i; }}
+        module Top (i: input logic, o: output logic) {{
+            function identity (value: input logic) -> logic {{ return value; }}
+            inst sink: Sink (i: {{{actual}}}, o: o);
+        }}
+        "#
+    ));
+    assert!(
+        errors.is_empty(),
+        "large call layout remains acyclic: {errors:#?}"
+    );
+    assert!(
+        crate::comb_loop_detect::expression_layout_visit_count() <= CALLS * 4 + 16,
+        "the preorder layout walk must visit each syntactic expression only a constant number of times",
+    );
+}
+
+#[test]
+fn following_instance_actual_effect_does_not_retroactively_taint_a_read() {
+    assert_comb_loop(
+        "a later actual side effect cannot alter an already captured middle bit",
+        &ordered_instance_actual_code("{set_x(independent), x, set_x(feedback)}"),
+        false,
+    );
+}
+
+#[test]
+fn nested_instance_actual_projection_preserves_source_order() {
+    assert_comb_loop(
+        "nested concat layout projects an occurrence-time value",
+        &ordered_instance_actual_code("{{set_x(feedback), x}, set_x(independent)}"),
+        true,
+    );
+}
+
+#[test]
+fn unpacked_instance_actual_projection_preserves_source_order() {
+    assert_comb_loop(
+        "unpacked literal layout projects an occurrence-time value",
+        r#"
+        module PickMiddle (i: input logic [3], o: output logic) {
+            assign o = i[1];
+        }
+        module Top (independent: input logic, o: output logic) {
+            var x       : logic;
+            var feedback: logic;
+            function set_x (value: input logic) -> logic {
+                x = value;
+                return 0;
+            }
+            inst pick: PickMiddle (
+                i: '{set_x(feedback), x, set_x(independent)},
+                o: feedback,
+            );
+            assign o = feedback;
+        }
+        "#,
+        true,
+    );
+}
+
+#[test]
+fn struct_instance_actual_projection_preserves_source_order() {
+    assert_comb_loop(
+        "structure layout projects an occurrence-time member value",
+        r#"
+        package Types {
+            struct Triple { high: logic, mid: logic, low: logic, }
+        }
+        module PickMiddle (i: input Types::Triple, o: output logic) {
+            assign o = i.mid;
+        }
+        module Top (independent: input logic, o: output logic) {
+            var x       : logic;
+            var feedback: logic;
+            function set_x (value: input logic) -> logic {
+                x = value;
+                return 0;
+            }
+            inst pick: PickMiddle (
+                i: Types::Triple'{
+                    high: set_x(feedback),
+                    mid : x,
+                    low : set_x(independent),
+                },
+                o: feedback,
+            );
+            assign o = feedback;
+        }
+        "#,
+        true,
+    );
+}
+
+#[test]
+fn instance_actual_effect_and_value_share_the_same_branch_identity() {
+    assert_comb_loop(
+        "side effects and values from opposite ternary arms cannot form one cycle",
+        r#"
+        module Identity (i: input logic, o: output logic) {
+            assign o = i;
+        }
+        module Top (select: input logic, o: output logic) {
+            var x       : logic;
+            var feedback: logic;
+            function set_x (value: input logic) -> logic {
+                x = value;
+                return 0;
+            }
+            inst identity: Identity (
+                i: if select ? set_x(feedback) : x,
+                o: feedback,
+            );
+            assign o = feedback | x;
+        }
+        "#,
+        false,
+    );
+}
+
+#[test]
+fn an_instance_actual_branch_with_direct_feedback_remains_a_loop() {
+    assert_comb_loop(
+        "one feasible ternary arm still retains its direct feedback",
+        r#"
+        module Identity (i: input logic, o: output logic) {
+            assign o = i;
+        }
+        module Top (select: input logic, o: output logic) {
+            var x       : logic;
+            var feedback: logic;
+            function set_x (value: input logic) -> logic {
+                x = value;
+                return 0;
+            }
+            inst identity: Identity (
+                i: if select ? set_x(x) : feedback,
+                o: feedback,
+            );
+            assign o = feedback | x;
+        }
+        "#,
+        true,
+    );
+}
+
+#[test]
+fn comb_loop_packed_concat_gives_each_conditional_a_stable_syntax_identity() {
+    for (first, second) in [
+        ("if c0 ? a : 1'b0", "if c1 ? b : 1'b0"),
+        ("if c0 ? a : 1'b0", "if c1 ? 1'b0 : b"),
+        ("if c0 ? 1'b0 : a", "if c1 ? b : 1'b0"),
+        ("if c0 ? 1'b0 : a", "if c1 ? 1'b0 : b"),
+    ] {
+        assert_comb_loop(
+            "each pair of independently selectable arms contains a realizable feedback cycle",
+            &packed_concat_conditional_actual_code(first, second),
+            true,
+        );
+    }
+}
+
+#[test]
+fn comb_loop_one_packed_ternary_keeps_its_arms_mutually_exclusive() {
+    assert_comb_loop(
+        "one vector ternary cannot combine dependencies from its opposite arms",
+        r#"
+        module Identity (i: input logic<2>, o: output logic<2>) {
+            assign o = i;
+        }
+        module Top (select: input logic, o: output logic) {
+            var a     : logic;
+            var b     : logic;
+            var passed: logic<2>;
+            inst identity: Identity (
+                i: if select ? {a, 1'b0} : {1'b0, b},
+                o: passed,
+            );
+            assign a = passed[0];
+            assign b = passed[1];
+            assign o = a | b;
+        }
+        "#,
+        false,
+    );
+}
+
+#[test]
+fn comb_loop_unpacked_literal_conditional_regions_do_not_regress() {
+    assert_comb_loop(
+        "separate unpacked literal elements retain independently selectable feedback",
+        r#"
+        module Identity (i: input logic [2], o: output logic [2]) {
+            assign o = i;
+        }
+        module Top (
+            c0: input logic,
+            c1: input logic,
+            o : output logic,
+        ) {
+            var a     : logic;
+            var b     : logic;
+            var passed: logic [2];
+            inst identity: Identity (
+                i: '{if c0 ? a : 0, if c1 ? 0 : b},
+                o: passed,
+            );
+            assign a = passed[1];
+            assign b = passed[0];
+            assign o = a | b;
+        }
+        "#,
+        true,
+    );
+}
+
+#[test]
+fn comb_loop_conditional_function_calls_in_separate_concat_regions_keep_their_ids() {
+    assert_comb_loop(
+        "function-summary branches are remapped by syntactic call identity, not visit order",
+        r#"
+        module Identity (i: input logic<2>, o: output logic<2>) {
+            assign o = i;
+        }
+        module Top (
+            c0: input logic,
+            c1: input logic,
+            o : output logic,
+        ) {
+            function when_true (value: input logic, select: input logic) -> logic {
+                return if select ? value : 0;
+            }
+            function when_false (value: input logic, select: input logic) -> logic {
+                return if select ? 0 : value;
+            }
+            var a     : logic;
+            var b     : logic;
+            var passed: logic<2>;
+            inst identity: Identity (
+                i: {when_true(a, c0), when_false(b, c1)},
+                o: passed,
+            );
+            assign a = passed[0];
+            assign b = passed[1];
+            assign o = a | b;
+        }
+        "#,
+        true,
+    );
+}
+
+#[test]
+fn comb_loop_function_summary_preserves_one_ternarys_arm_exclusivity_across_regions() {
+    assert_comb_loop(
+        "one summarized vector ternary cannot combine its opposite arms",
+        r#"
+        module Identity (i: input logic<2>, o: output logic<2>) {
+            assign o = i;
+        }
+        module Top (select: input logic, o: output logic) {
+            function choose (
+                a     : input logic,
+                b     : input logic,
+                select: input logic,
+            ) -> logic<2> {
+                return if select ? {a, 1'b0} : {1'b0, b};
+            }
+            var a     : logic;
+            var b     : logic;
+            var passed: logic<2>;
+            inst identity: Identity (
+                i: choose(a, b, select),
+                o: passed,
+            );
+            assign a = passed[0];
+            assign b = passed[1];
+            assign o = a | b;
+        }
+        "#,
+        false,
+    );
+}
+
+#[test]
+fn comb_loop_generated_actual_clones_have_distinct_branch_namespaces() {
+    assert_comb_loop(
+        "actuals cloned from one source range keep independent branch choices",
+        r#"
+        module Gate (i: input logic, o: output logic) {
+            assign o = i;
+        }
+        module Top (select: input logic<2>, o: output logic) {
+            var state : logic<2>;
+            var passed: logic<2>;
+            for i in 0..2 :gates {
+                inst gate: Gate (
+                    i: if i == 0 ?
+                        (if select[i] ? state[i] : 0) :
+                        (if select[i] ? 0 : state[i]),
+                    o: passed[i],
+                );
+            }
+            assign state[0] = passed[1];
+            assign state[1] = passed[0];
+            assign o = |state;
+        }
+        "#,
+        true,
+    );
+}
+
+fn conditional_instance_input_side_effect_code(return_value: &str) -> String {
+    format!(
+        r#"
+        module Identity (i: input logic<2>, o: output logic<2>) {{
+            assign o = i;
+        }}
+        module Top (c: input logic, o: output logic) {{
+            var a     : logic;
+            var x     : logic;
+            var passed: logic<2>;
+            function capture (value: input logic) -> logic {{
+                x = value;
+                return {return_value};
+            }}
+            inst identity: Identity (
+                i: {{if c ? capture(a) : x, 1'b0}},
+                o: passed,
+            );
+            assign a = passed[1];
+            assign o = x;
+        }}
+        "#
+    )
+}
+
+#[test]
+fn comb_loop_instance_actual_does_not_join_opposite_side_effect_arms() {
+    assert_comb_loop(
+        "a packed actual cannot combine a true-arm write with a false-arm value dependency",
+        &conditional_instance_input_side_effect_code("0"),
+        false,
+    );
+}
+
+#[test]
+fn comb_loop_instance_actual_retains_a_same_arm_side_effect_loop() {
+    assert_comb_loop(
+        "the same packed actual still detects feedback wholly inside its true arm",
+        &conditional_instance_input_side_effect_code("value"),
+        true,
+    );
+}
+
+fn conditional_instance_output_selector_side_effect_code(return_value: &str) -> String {
+    format!(
+        r#"
+        module Source (o: output logic) {{
+            assign o = 0;
+        }}
+        module Top (c: input logic, o: output logic) {{
+            var a  : logic;
+            var x  : logic;
+            var bus: logic<2>;
+            function capture (value: input logic) -> logic {{
+                x = value;
+                return {return_value};
+            }}
+            inst source: Source (
+                o: bus[if c ? capture(a) : x],
+            );
+            assign a = bus[0];
+            assign o = x;
+        }}
+        "#
+    )
+}
+
+#[test]
+fn comb_loop_instance_output_selector_does_not_join_opposite_side_effect_arms() {
+    assert_comb_loop(
+        "an output selector cannot combine its true-arm write with its false-arm address",
+        &conditional_instance_output_selector_side_effect_code("0"),
+        false,
+    );
+}
+
+#[test]
+fn comb_loop_instance_output_selector_retains_a_same_arm_side_effect_loop() {
+    assert_comb_loop(
+        "an output selector still detects feedback wholly inside its true arm",
+        &conditional_instance_output_selector_side_effect_code("value"),
+        true,
+    );
+}
+
+fn short_circuit_instance_actual_code(expression: &str, return_value: &str) -> String {
+    format!(
+        r#"
+        module Identity (i: input logic, o: output logic) {{
+            assign o = i;
+        }}
+        module Top (c: input logic, o: output logic) {{
+            var a     : logic;
+            var x     : logic;
+            var passed: logic;
+            function capture (value: input logic) -> logic {{
+                x = value;
+                return {return_value};
+            }}
+            inst identity: Identity (
+                i: {expression},
+                o: passed,
+            );
+            assign a = passed;
+            assign o = x;
+        }}
+        "#
+    )
+}
+
+#[test]
+fn comb_loop_short_circuit_actuals_keep_dead_function_results_loop_free() {
+    for (expression, return_value) in [("c && capture(a)", "0"), ("c || capture(a)", "1")] {
+        assert_comb_loop(
+            "a dynamic short-circuit call with a constant result has no return path",
+            &short_circuit_instance_actual_code(expression, return_value),
+            false,
+        );
+    }
+}
+
+#[test]
+fn comb_loop_short_circuit_actuals_retain_live_function_result_feedback() {
+    for expression in ["c && capture(a)", "c || capture(a)"] {
+        assert_comb_loop(
+            "a dynamic short-circuit call retains feedback in its evaluated arm",
+            &short_circuit_instance_actual_code(expression, "value"),
+            true,
+        );
+    }
+}
+
+#[test]
 fn comb_loop_instance_input_selector_side_effect_is_recorded() {
     // Why this case exists: an otherwise plain instance actual still evaluates
     // the expressions in its selectors. Skipping the observer for mem[touch(o)]
@@ -1452,6 +2138,7 @@ fn comb_loop_instance_summary_region_mapping_is_reused() {
         .map(|index| format!("assign feedback[{index}] = 0;"))
         .collect::<Vec<_>>()
         .join("\n");
+    crate::comb_loop_detect::reset_instance_request_edge_probes();
     assert_comb_loop(
         "an instance summary Cartesian product retains parent feedback",
         &format!(
@@ -1484,6 +2171,56 @@ fn comb_loop_instance_summary_region_mapping_is_reused() {
             "#
         ),
         true,
+    );
+    assert!(
+        crate::comb_loop_detect::instance_request_edge_probes() <= WIDTH * WIDTH * 3,
+        "request discovery must scan summary edges a constant number of times",
+    );
+}
+
+#[test]
+fn instance_actual_regions_share_source_summary_walks() {
+    const WIDTH: usize = 128;
+    let child_outputs = (0..WIDTH)
+        .map(|bit| format!("assign o[{bit}] = i[{bit}];"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let clears = (1..WIDTH)
+        .map(|bit| format!("assign feedback[{bit}] = 0;"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    crate::comb_loop_detect::reset_source_summary_state_visits();
+    assert_comb_loop(
+        "many requested regions reuse shared SSA source summaries",
+        &format!(
+            r#"
+            module Child (
+                i: input logic<{WIDTH}>,
+                o: output logic<{WIDTH}>,
+            ) {{
+                {child_outputs}
+            }}
+            module Top (
+                independent: input  logic<{WIDTH}>,
+                o          : output logic<{WIDTH}>,
+            ) {{
+                var feedback: logic<{WIDTH}>;
+                var passed  : logic<{WIDTH}>;
+                inst child: Child (
+                    i: feedback + independent,
+                    o: passed,
+                );
+                assign feedback[0] = passed[0];
+                {clears}
+                assign o = passed;
+            }}
+            "#
+        ),
+        true,
+    );
+    assert!(
+        crate::comb_loop_detect::source_summary_state_visits() <= WIDTH * 20,
+        "region queries must share walks of the same SSA versions",
     );
 }
 

@@ -138,15 +138,6 @@ impl BitPartition {
         self.ranges.get(&key).map(|v| v.as_slice()).unwrap_or(&[])
     }
 
-    pub(super) fn overlapping(&self, key: IdxKey, span: PackedSpan) -> Vec<usize> {
-        self.ranges_of(key)
-            .iter()
-            .enumerate()
-            .filter(|(_, range)| range.overlaps(span))
-            .map(|(i, _)| i)
-            .collect()
-    }
-
     pub(super) fn overlapping_access(
         &self,
         id: VarId,

@@ -20,8 +20,23 @@ mod ssa;
 mod summary;
 
 #[cfg(test)]
+thread_local! {
+    static INSTANCE_REQUEST_EDGE_PROBES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn reset_instance_request_edge_probes() {
+    INSTANCE_REQUEST_EDGE_PROBES.set(0);
+}
+
+#[cfg(test)]
+pub(crate) fn instance_request_edge_probes() -> usize {
+    INSTANCE_REQUEST_EDGE_PROBES.get()
+}
+
+#[cfg(test)]
 pub(crate) use procedure::{
-    function_barrier_evaluation_count, function_evaluation_count,
+    expression_layout_visit_count, function_barrier_evaluation_count, function_evaluation_count,
     function_result_region_probe_count, function_result_version_count,
     function_summary_graph_node_count, module_context_entries, reset_function_evaluation_count,
     reset_module_context_entries,
@@ -185,17 +200,8 @@ fn build_bit_partition(
                     .push(packed);
             } else {
                 for dst in &out.dst {
-                    if let Some((idx, packed)) = eval_dst_span(dst, &module.variables, ctx) {
-                        accesses
-                            .entry((
-                                dst.id,
-                                ArraySpan {
-                                    start: idx,
-                                    length: 1,
-                                },
-                            ))
-                            .or_default()
-                            .push(packed);
+                    for (array, packed) in dst_writes(dst, ctx) {
+                        accesses.entry((dst.id, array)).or_default().push(packed);
                     }
                 }
             }
@@ -957,24 +963,6 @@ fn collect_called_function_statement_spans(
     }
 }
 
-/// None if the index is dynamic.
-fn eval_dst_span(
-    dst: &AssignDestination,
-    parent_vars: &HashMap<VarId, Variable>,
-    ctx: &mut Context,
-) -> Option<(usize, PackedSpan)> {
-    let v = parent_vars.get(&dst.id)?;
-    let idx_path = dst.index.eval_value(ctx)?;
-    let flat = v.r#type.array.calc_index(&idx_path)?;
-    let span = if let Some((high, low)) = dst.select.eval_value(ctx, &v.r#type, false) {
-        PackedSpan::from_select(high, low)?
-    } else {
-        let width = v.total_width()?;
-        PackedSpan::whole(width)?
-    };
-    Some((flat, span))
-}
-
 fn build_module_graph(
     module: &Module,
     summaries: &HashMap<Signature, ModuleCombSummary>,
@@ -1156,17 +1144,22 @@ impl<'a> ModuleGraphBuilder<'a> {
         let bit_part = self.bit_part;
         let graph = &mut self.graph;
         let node_map = &mut self.node_map;
-        let parent_vars = &module.variables;
         let ctx = &mut self.ctx;
         let procedure_context = &mut self.procedure_context;
         let function_summaries = &mut self.function_summaries;
         let mut complete = true;
+        let input_requests = instance_input_region_requests(inst, child, summary, bit_part, ctx);
         let mut input_reads: HashMap<VarId, Vec<procedure::RegionSource>> = HashMap::default();
+        let mut input_region_mappings: HashMap<SummaryRegion, InstanceRegionMapping> =
+            HashMap::default();
         for inp in &inst.inputs {
             if !is_pure_input_or_output(inp.id, &child.variables, Direction::Input) {
                 continue;
             }
             let mut reads = Vec::new();
+            let mut regions = Vec::new();
+            let mut dependencies = Vec::new();
+            let mut actual_complete = true;
             if let Some(src) = &inp.range_src {
                 let range_reads: Vec<procedure::RegionSource> =
                     PackedSpan::new(src.parent_packed_start, src.parent_packed_length)
@@ -1188,28 +1181,54 @@ impl<'a> ModuleGraphBuilder<'a> {
                         })
                         .collect();
                 reads.extend(range_reads);
+            } else if let (Some(expression), Some((requests, context_width))) = (
+                inp.single(),
+                input_requests
+                    .get(&inp.id)
+                    .zip(child.variables.get(&inp.id).and_then(Variable::total_width)),
+            ) {
+                let analysis = analyze_instance_actual_regions(
+                    bit_part,
+                    expression,
+                    requests,
+                    context_width,
+                    procedure_context,
+                    function_summaries,
+                );
+                reads.extend(analysis.reads);
+                regions.extend(analysis.mappings);
+                dependencies.extend(analysis.dependencies);
+                actual_complete &= analysis.complete;
             } else {
                 for expression in &inp.exprs {
-                    let (sources, dependencies, actual_complete) = analyze_instance_actual(
-                        bit_part,
-                        expression,
-                        ctx,
-                        procedure_context,
-                        function_summaries,
-                    );
-                    complete &= actual_complete;
-                    reads.extend(sources);
-                    for dependency in dependencies {
-                        add_region_dependency(
-                            graph,
-                            node_map,
+                    let (sources, expression_dependencies, expression_complete) =
+                        analyze_instance_actual(
                             bit_part,
-                            dependency.source,
-                            dependency.destination,
-                            GraphDependency::unconditional(dependency.kind),
+                            expression,
+                            ctx,
+                            procedure_context,
+                            function_summaries,
                         );
-                    }
+                    actual_complete &= expression_complete;
+                    reads.extend(sources);
+                    dependencies.extend(expression_dependencies);
                 }
+            }
+            input_region_mappings.extend(regions);
+            complete &= actual_complete;
+            for dependency in dependencies {
+                add_region_dependency(
+                    graph,
+                    node_map,
+                    bit_part,
+                    dependency.source,
+                    dependency.destination,
+                    GraphDependency {
+                        kind: dependency.kind,
+                        condition: dependency.condition,
+                        carrier: false,
+                    },
+                );
             }
             reads.sort_unstable_by_key(|source| {
                 (source.key, source.offset, source.condition.clone())
@@ -1233,7 +1252,7 @@ impl<'a> ModuleGraphBuilder<'a> {
             if out.range_dst.is_none() {
                 for dst in &out.dst {
                     let mut destination_keys = Vec::new();
-                    collect_dst_node_keys(dst, bit_part, &mut destination_keys, parent_vars, ctx);
+                    collect_dst_node_keys(dst, bit_part, &mut destination_keys, ctx);
                     let (selector_reads, dependencies, selector_complete) =
                         analyze_instance_destination(
                             bit_part,
@@ -1250,7 +1269,11 @@ impl<'a> ModuleGraphBuilder<'a> {
                             bit_part,
                             dependency.source,
                             dependency.destination,
-                            GraphDependency::unconditional(dependency.kind),
+                            GraphDependency {
+                                kind: dependency.kind,
+                                condition: dependency.condition,
+                                carrier: false,
+                            },
                         );
                     }
                     for source in selector_reads {
@@ -1317,6 +1340,7 @@ impl<'a> ModuleGraphBuilder<'a> {
                         node.region,
                         preserve_position,
                         input_reads.get(&node.region.id).map(Vec::as_slice),
+                        Some(&input_region_mappings),
                         bit_part,
                         ctx,
                         procedure_context,
@@ -1399,6 +1423,7 @@ impl<'a> ModuleGraphBuilder<'a> {
                                 input_reads
                                     .get(&summary.nodes[edge.source].region.id)
                                     .map(Vec::as_slice),
+                                Some(&input_region_mappings),
                                 bit_part,
                                 ctx,
                                 procedure_context,
@@ -1470,6 +1495,7 @@ fn map_instance_source_region<'a>(
     region: SummaryRegion,
     preserve_position: bool,
     allowed: Option<&[procedure::RegionSource]>,
+    evaluated: Option<&HashMap<SummaryRegion, InstanceRegionMapping>>,
     bit_part: &'a BitPartition,
     ctx: &mut Context,
     procedure_context: &mut procedure::ProcedureContext,
@@ -1509,6 +1535,15 @@ fn map_instance_source_region<'a>(
     let Some(width) = variable.total_width() else {
         return parent_sources;
     };
+    if let Some(evaluated) = evaluated {
+        let Some(mut mapping) = evaluated.get(&region).cloned() else {
+            return parent_sources;
+        };
+        mapping.nodes.retain(|source| {
+            allowed.is_some_and(|allowed| allowed.iter().any(|item| item.key == source.key))
+        });
+        return mapping;
+    }
     let mut mapping = analyze_instance_actual_region(
         bit_part,
         expression,
@@ -1564,6 +1599,94 @@ enum RegionProjection {
     Exact(SummaryRegion),
     Disjoint,
     Unknown,
+}
+
+fn instance_input_region_requests(
+    inst: &InstDeclaration,
+    child: &Module,
+    summary: &ModuleCombSummary,
+    bit_part: &BitPartition,
+    ctx: &mut Context,
+) -> HashMap<VarId, Vec<SummaryRegion>> {
+    let mut requests: HashMap<VarId, Vec<SummaryRegion>> = HashMap::default();
+    let mut positioned_inputs = HashSet::default();
+    for edge in &summary.edges {
+        #[cfg(test)]
+        INSTANCE_REQUEST_EDGE_PROBES.set(INSTANCE_REQUEST_EDGE_PROBES.get() + 1);
+        if edge.kind.has_position() {
+            positioned_inputs.insert(edge.source);
+        }
+    }
+    for index in positioned_inputs {
+        let Some(node) = summary.nodes.get(index) else {
+            continue;
+        };
+        if node.kind == SummaryNodeKind::Input {
+            requests
+                .entry(node.region.id)
+                .or_default()
+                .push(node.region);
+        }
+    }
+
+    // Endpoint translation is pure: it resolves only declared ranges and
+    // compile-time selectors. Dynamic output selectors deliberately yield no
+    // exact request and retain the conservative base-region mapping.
+    let endpoint_mappings = summary
+        .nodes
+        .iter()
+        .map(|node| match node.kind {
+            SummaryNodeKind::Output => Some(instance_region_mapping(
+                inst,
+                child,
+                node.region,
+                Direction::Output,
+                None,
+                bit_part,
+                ctx,
+            )),
+            SummaryNodeKind::Interface => Some(instance_region_mapping(
+                inst,
+                child,
+                node.region,
+                Direction::Input,
+                None,
+                bit_part,
+                ctx,
+            )),
+            SummaryNodeKind::Input | SummaryNodeKind::Internal => None,
+        })
+        .collect::<Vec<_>>();
+    for edge in &summary.edges {
+        #[cfg(test)]
+        INSTANCE_REQUEST_EDGE_PROBES.set(INSTANCE_REQUEST_EDGE_PROBES.get() + 1);
+        if summary.nodes[edge.source].kind != SummaryNodeKind::Input {
+            continue;
+        }
+        let Some((array, packed)) = edge.kind.exact_offset() else {
+            continue;
+        };
+        let Some(destinations) = &endpoint_mappings[edge.destination] else {
+            continue;
+        };
+        for destination in &destinations.nodes {
+            if let RegionProjection::Exact(region) = child_source_region_for_destination(
+                summary.nodes[edge.source].region,
+                summary.nodes[edge.destination].region,
+                array,
+                packed,
+                destination,
+                bit_part,
+            ) {
+                requests.entry(region.id).or_default().push(region);
+            }
+        }
+    }
+    for regions in requests.values_mut() {
+        regions.sort_unstable();
+        regions.dedup();
+    }
+    requests
 }
 
 fn child_source_region_for_destination(
@@ -2194,6 +2317,63 @@ fn analyze_instance_actual<'a>(
     analysis.finish()
 }
 
+struct InstanceActualRegionAnalysis {
+    reads: Vec<procedure::RegionSource>,
+    mappings: Vec<(SummaryRegion, InstanceRegionMapping)>,
+    dependencies: Vec<procedure::Dependency>,
+    complete: bool,
+}
+
+fn analyze_instance_actual_regions<'a>(
+    bit_part: &'a BitPartition,
+    expression: &Expression,
+    requests: &[SummaryRegion],
+    context_width: usize,
+    procedure_context: &mut procedure::ProcedureContext,
+    summaries: &mut procedure::FunctionSummaries<'a>,
+) -> InstanceActualRegionAnalysis {
+    let mut analysis = procedure::ExpressionAnalysis::new(bit_part, procedure_context, summaries);
+    let expression_requests = requests
+        .iter()
+        .map(|region| procedure::ExpressionRegion {
+            array: region.array,
+            packed: region.packed,
+            context_width,
+        })
+        .collect::<Vec<_>>();
+    let (reads, mapped) = analysis.eval_with_regions(expression, &expression_requests);
+    let mappings = requests
+        .iter()
+        .copied()
+        .zip(mapped)
+        .map(|(region, (_, sources))| {
+            (
+                region,
+                InstanceRegionMapping {
+                    nodes: sources
+                        .into_iter()
+                        .map(|source| MappedNode {
+                            key: source.key,
+                            offset: source.offset,
+                            condition: source.condition,
+                        })
+                        .collect(),
+                },
+            )
+        })
+        .collect();
+    let dependencies = analysis.dependencies();
+    let complete = analysis.is_complete();
+    let result = InstanceActualRegionAnalysis {
+        reads,
+        mappings,
+        dependencies,
+        complete,
+    };
+    analysis.restore(procedure_context);
+    result
+}
+
 fn analyze_instance_destination<'a>(
     bit_part: &'a BitPartition,
     destination: &AssignDestination,
@@ -2300,18 +2480,24 @@ impl<'a, 's, 'c> InstanceActualAnalysis<'a, 's, 'c> {
             self.reads.extend(procedure.eval(expression));
             return;
         }
+        // Once an actual needs guarded SSA, analyze its complete syntax tree.
+        // Starting at the first nested conditional or call would give that
+        // subtree a different branch namespace from later region projections
+        // of the complete actual, so mutually exclusive paths could combine.
+        if requires_guarded_expression_analysis(expression) {
+            let summaries = self.summaries.take().expect("initialized once");
+            let mut procedure = procedure::ExpressionAnalysis::new(
+                self.bit_part,
+                self.procedure_context,
+                summaries,
+            );
+            self.reads.extend(procedure.eval(expression));
+            self.procedure = Some(procedure);
+            return;
+        }
         match expression {
             Expression::Term(factor) => match factor.as_ref() {
-                Factor::FunctionCall(_) => {
-                    let summaries = self.summaries.take().expect("initialized once");
-                    let procedure = procedure::ExpressionAnalysis::new(
-                        self.bit_part,
-                        self.procedure_context,
-                        summaries,
-                    );
-                    self.procedure = Some(procedure);
-                    self.eval(expression);
-                }
+                Factor::FunctionCall(_) => unreachable!("guarded expression checked above"),
                 Factor::Variable(_, index, select, _) => {
                     for expression in index.0.iter().chain(select.0.iter()) {
                         self.eval(expression);
@@ -2344,27 +2530,11 @@ impl<'a, 's, 'c> InstanceActualAnalysis<'a, 's, 'c> {
                 _ => {}
             },
             Expression::Unary(_, operand, _) => self.eval(operand),
-            Expression::Binary(left, op, right, _) => {
+            Expression::Binary(left, _, right, _) => {
                 self.eval(left);
-                let evaluate_right = match op {
-                    Op::LogicAnd => constant_truth(left, self.ctx) != Some(false),
-                    Op::LogicOr => constant_truth(left, self.ctx) != Some(true),
-                    _ => true,
-                };
-                if evaluate_right {
-                    self.eval(right);
-                }
+                self.eval(right);
             }
-            Expression::Ternary(_, _, _, _) => {
-                let summaries = self.summaries.take().expect("initialized once");
-                let procedure = procedure::ExpressionAnalysis::new(
-                    self.bit_part,
-                    self.procedure_context,
-                    summaries,
-                );
-                self.procedure = Some(procedure);
-                self.eval(expression);
-            }
+            Expression::Ternary(_, _, _, _) => unreachable!("guarded expression checked above"),
             Expression::Concatenation(parts, _) => {
                 for (part, repeat) in parts {
                     self.eval(part);
@@ -2395,11 +2565,87 @@ impl<'a, 's, 'c> InstanceActualAnalysis<'a, 's, 'c> {
     }
 }
 
-fn constant_truth(expression: &Expression, ctx: &mut Context) -> Option<bool> {
-    expression
-        .eval_value(ctx)
-        .and_then(|value| value.to_usize())
-        .map(|value| value != 0)
+fn requires_guarded_expression_analysis(expression: &Expression) -> bool {
+    match expression {
+        Expression::Term(factor) => match factor.as_ref() {
+            Factor::FunctionCall(_) => true,
+            Factor::Variable(_, index, select, _) => {
+                var_access_requires_guarded_analysis(index, select)
+            }
+            Factor::SystemFunctionCall(call) => match &call.kind {
+                SystemFunctionKind::Bits(input)
+                | SystemFunctionKind::Size(input)
+                | SystemFunctionKind::Clog2(input)
+                | SystemFunctionKind::Onehot(input)
+                | SystemFunctionKind::Signed(input)
+                | SystemFunctionKind::Unsigned(input) => {
+                    requires_guarded_expression_analysis(&input.0)
+                }
+                SystemFunctionKind::Readmemh(input, output) => {
+                    requires_guarded_expression_analysis(&input.0)
+                        || output.0.iter().any(|destination| {
+                            var_access_requires_guarded_analysis(
+                                &destination.index,
+                                &destination.select,
+                            )
+                        })
+                }
+                SystemFunctionKind::Display(inputs) | SystemFunctionKind::Write(inputs) => inputs
+                    .iter()
+                    .any(|input| requires_guarded_expression_analysis(&input.0)),
+                SystemFunctionKind::Assert { cond, args, .. } => {
+                    requires_guarded_expression_analysis(&cond.0)
+                        || args
+                            .iter()
+                            .any(|input| requires_guarded_expression_analysis(&input.0))
+                }
+                SystemFunctionKind::Finish => false,
+            },
+            _ => false,
+        },
+        Expression::Unary(_, operand, _) => requires_guarded_expression_analysis(operand),
+        Expression::Binary(left, op, right, _) => {
+            matches!(op, Op::LogicAnd | Op::LogicOr)
+                || requires_guarded_expression_analysis(left)
+                || requires_guarded_expression_analysis(right)
+        }
+        Expression::Ternary(_, _, _, _) => true,
+        Expression::Concatenation(parts, _) => parts.iter().any(|(part, repeat)| {
+            requires_guarded_expression_analysis(part)
+                || repeat
+                    .as_ref()
+                    .is_some_and(requires_guarded_expression_analysis)
+        }),
+        Expression::ArrayLiteral(items, _) => items.iter().any(|item| match item {
+            crate::ir::ArrayLiteralItem::Value(value, repeat) => {
+                requires_guarded_expression_analysis(value)
+                    || repeat
+                        .as_ref()
+                        .is_some_and(|repeat| requires_guarded_expression_analysis(repeat))
+            }
+            crate::ir::ArrayLiteralItem::Defaul(value) => {
+                requires_guarded_expression_analysis(value)
+            }
+        }),
+        Expression::StructConstructor(_, fields, _) => fields
+            .iter()
+            .any(|(_, value)| requires_guarded_expression_analysis(value)),
+    }
+}
+
+fn var_access_requires_guarded_analysis(
+    index: &crate::ir::VarIndex,
+    select: &crate::ir::VarSelect,
+) -> bool {
+    index
+        .0
+        .iter()
+        .chain(select.0.iter())
+        .any(requires_guarded_expression_analysis)
+        || select
+            .1
+            .as_ref()
+            .is_some_and(|(_, expression)| requires_guarded_expression_analysis(expression))
 }
 
 fn collect_factor_node_keys(
@@ -2425,18 +2671,10 @@ fn collect_dst_node_keys(
     dst: &AssignDestination,
     bit_part: &BitPartition,
     out: &mut Vec<NodeKey>,
-    parent_vars: &HashMap<VarId, Variable>,
     ctx: &mut Context,
 ) {
-    let Some((idx, packed)) = eval_dst_span(dst, parent_vars, ctx) else {
-        return;
-    };
-    let span = ArraySpan {
-        start: idx,
-        length: 1,
-    };
-    for r in bit_part.overlapping((dst.id, span), packed) {
-        out.push((dst.id, span, r));
+    for (array, packed) in dst_writes(dst, ctx) {
+        out.extend(bit_part.overlapping_access(dst.id, array, packed));
     }
 }
 
@@ -2456,6 +2694,71 @@ fn is_inout(id: VarId, variables: &HashMap<VarId, Variable>) -> bool {
 #[cfg(test)]
 mod partition_tests {
     use super::*;
+
+    #[test]
+    fn disjoint_array_point_queries_do_not_scan_every_partition() {
+        const COUNT: usize = 16_384;
+
+        let id = VarId::from_raw(0);
+        let packed = PackedSpan {
+            start: 0,
+            length: 32,
+        };
+        let mut accesses = HashMap::default();
+        for start in 0..COUNT {
+            accesses.insert((id, ArraySpan { start, length: 1 }), vec![packed]);
+        }
+
+        let ranges = split_array_spans(accesses, &HashMap::default());
+        let partition = BitPartition::new(ranges);
+        assert_eq!(partition.array_spans(id).len(), COUNT);
+        for start in 0..COUNT {
+            assert_eq!(
+                partition.overlapping_access(id, ArraySpan { start, length: 1 }, packed),
+                vec![(id, ArraySpan { start, length: 1 }, 0)]
+            );
+        }
+    }
+
+    #[test]
+    fn array_partition_sweep_keeps_an_access_active_until_its_own_end() {
+        let id = VarId::from_raw(0);
+        let packed = PackedSpan {
+            start: 0,
+            length: 1,
+        };
+        let mut accesses = HashMap::default();
+        accesses.insert(
+            (
+                id,
+                ArraySpan {
+                    start: 0,
+                    length: 2,
+                },
+            ),
+            vec![packed],
+        );
+        accesses.insert(
+            (
+                id,
+                ArraySpan {
+                    start: 1,
+                    length: 2,
+                },
+            ),
+            vec![packed],
+        );
+
+        let ranges = split_array_spans(accesses, &HashMap::default());
+        for start in 0..3 {
+            assert_eq!(
+                ranges
+                    .get(&(id, ArraySpan { start, length: 1 }))
+                    .map(Vec::as_slice),
+                Some([packed].as_slice())
+            );
+        }
+    }
 
     #[test]
     fn packed_partition_storage_depends_on_endpoints_not_declared_width() {
