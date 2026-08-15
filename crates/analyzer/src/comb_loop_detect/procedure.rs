@@ -330,6 +330,95 @@ fn destination_array_projection(
     })
 }
 
+#[cfg(test)]
+mod destination_array_projection_tests {
+    use super::*;
+
+    #[test]
+    fn periodic_projection_is_constant_work_for_a_large_destination() {
+        let selection = DestinationArraySelection {
+            dynamic: true,
+            period: Some(2),
+            phase: 1,
+            extent: Some(1),
+            static_filters: Vec::new(),
+        };
+        let candidates = ArraySpan {
+            start: 0,
+            length: 1_000_000,
+        };
+
+        assert!(
+            destination_array_projection(
+                ArraySpan {
+                    start: 999_998,
+                    length: 1,
+                },
+                candidates,
+                &selection,
+            )
+            .is_none()
+        );
+        let selected = destination_array_projection(
+            ArraySpan {
+                start: 999_999,
+                length: 1,
+            },
+            candidates,
+            &selection,
+        )
+        .expect("the odd static suffix is reachable");
+        assert_eq!(
+            selected.source,
+            ArraySpan {
+                start: 0,
+                length: 1
+            }
+        );
+        assert_eq!(selected.array_offset, Some(999_999));
+
+        let broad = destination_array_projection(candidates, candidates, &selection)
+            .expect("a broad key contains periodic candidates");
+        assert_eq!(
+            broad.source,
+            ArraySpan {
+                start: 0,
+                length: 1
+            }
+        );
+        assert_eq!(broad.array_offset, None);
+    }
+
+    #[test]
+    fn unavailable_or_overflowed_periodic_geometry_falls_back_conservatively() {
+        let key = ArraySpan {
+            start: 0,
+            length: 4,
+        };
+        for selection in [
+            DestinationArraySelection {
+                dynamic: true,
+                period: None,
+                phase: 0,
+                extent: Some(1),
+                static_filters: Vec::new(),
+            },
+            DestinationArraySelection {
+                dynamic: true,
+                period: Some(usize::MAX),
+                phase: usize::MAX,
+                extent: Some(1),
+                static_filters: Vec::new(),
+            },
+        ] {
+            let projection = destination_array_projection(key, key, &selection)
+                .expect("unknown geometry must retain every possible candidate");
+            assert_eq!(projection.destination, key);
+            assert_eq!(projection.array_offset, None);
+        }
+    }
+}
+
 impl AffineIndex {
     fn variable(id: VarId) -> Self {
         Self {
