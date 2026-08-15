@@ -2725,3 +2725,316 @@ fn comb_loop_wide_module_summary_shift_closure_is_sparse() {
         false,
     );
 }
+
+fn module_output_coercion_code(
+    child_output_type: &str,
+    actual_type: &str,
+    child_width: usize,
+    source_bit: usize,
+    actual_bit: usize,
+) -> String {
+    let clears = (0..child_width)
+        .filter(|bit| *bit != source_bit)
+        .map(|bit| format!("assign feedback[{bit}] = 0;"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!(
+        r#"
+        module Child (
+            i: input logic<{child_width}>,
+            o: output {child_output_type},
+        ) {{
+            assign o = i;
+        }}
+        module Top (o: output logic) {{
+            var feedback: logic<{child_width}>;
+            var passed: {actual_type};
+            inst u: Child (i: feedback, o: passed);
+            assign feedback[{source_bit}] = passed[{actual_bit}];
+            {clears}
+            assign o = passed[0];
+        }}
+        "#
+    )
+}
+
+#[test]
+fn comb_loop_narrow_module_output_retains_copied_low_bit() {
+    assert_comb_loop(
+        "a narrowed module output retains its copied low bit",
+        &module_output_coercion_code("logic<4>", "logic<2>", 4, 0, 0),
+        true,
+    );
+}
+
+#[test]
+fn comb_loop_narrow_module_output_discards_child_high_bit() {
+    assert_comb_loop(
+        "a narrowed module output discards a child high bit",
+        &module_output_coercion_code("logic<4>", "logic<2>", 4, 3, 0),
+        false,
+    );
+}
+
+#[test]
+fn comb_loop_unsigned_module_output_widening_retains_copied_low_bit() {
+    assert_comb_loop(
+        "an unsigned widened module output retains its copied low bit",
+        &module_output_coercion_code("logic<2>", "logic<4>", 2, 0, 0),
+        true,
+    );
+}
+
+#[test]
+fn comb_loop_unsigned_module_output_widening_drops_zero_extended_high_bit() {
+    assert_comb_loop(
+        "an unsigned widened module output does not depend on a zero-extended high bit",
+        &module_output_coercion_code("logic<2>", "logic<4>", 2, 0, 3),
+        false,
+    );
+}
+
+#[test]
+fn comb_loop_signed_module_output_widening_replicates_sign_bit() {
+    assert_comb_loop(
+        "a signed widened module output replicates its sign bit",
+        &module_output_coercion_code("signed logic<2>", "logic<4>", 2, 1, 3),
+        true,
+    );
+}
+
+#[test]
+fn comb_loop_signed_module_output_widening_does_not_replicate_non_sign_bit() {
+    assert_comb_loop(
+        "a signed widened module output does not replicate a non-sign bit",
+        &module_output_coercion_code("signed logic<2>", "logic<4>", 2, 0, 3),
+        false,
+    );
+}
+
+#[test]
+fn comb_loop_signed_child_output_extends_into_signed_actual() {
+    assert_comb_loop(
+        "a signed child output extends into a signed actual",
+        &module_output_coercion_code("signed logic<2>", "signed logic<4>", 2, 1, 3),
+        true,
+    );
+}
+
+#[test]
+fn comb_loop_unsigned_child_output_zero_extends_into_signed_actual() {
+    assert_comb_loop(
+        "an unsigned child output zero-extends into a signed actual",
+        &module_output_coercion_code("logic<2>", "signed logic<4>", 2, 1, 3),
+        false,
+    );
+}
+
+fn signed_array_module_output_code(actual_element: usize) -> String {
+    format!(
+        r#"
+        module Child (
+            i: input logic<2> [2],
+            o: output signed logic<2> [2],
+        ) {{
+            assign o = i;
+        }}
+        module Top (o: output logic) {{
+            var feedback: logic<2> [2];
+            var passed: logic<4> [2];
+            inst u: Child (i: feedback, o: passed);
+            assign feedback[0][1] = passed[{actual_element}][3];
+            assign feedback[0][0] = 0;
+            assign feedback[1] = 0;
+            assign o = passed[0][0];
+        }}
+        "#
+    )
+}
+
+#[test]
+fn comb_loop_signed_module_output_widening_preserves_array_element_identity() {
+    assert_comb_loop(
+        "signed output widening preserves the matching array element",
+        &signed_array_module_output_code(0),
+        true,
+    );
+}
+
+#[test]
+fn comb_loop_signed_module_output_widening_keeps_array_elements_disjoint() {
+    assert_comb_loop(
+        "signed output widening keeps different array elements disjoint",
+        &signed_array_module_output_code(1),
+        false,
+    );
+}
+
+fn signed_array_range_module_output_code(actual_element: usize) -> String {
+    format!(
+        r#"
+        module Child (
+            i: input logic<2> [2],
+            o: output signed logic<2> [2],
+        ) {{
+            assign o = i;
+        }}
+        module Top (o: output logic) {{
+            var feedback: logic<2> [2];
+            var passed: logic<4> [4];
+            inst u: Child (i: feedback, o: passed[1:2]);
+            assign feedback[0][1] = passed[{actual_element}][3];
+            assign feedback[0][0] = 0;
+            assign feedback[1] = 0;
+            assign o = passed[1][0];
+        }}
+        "#
+    )
+}
+
+#[test]
+fn comb_loop_signed_module_output_range_widening_preserves_array_element_identity() {
+    assert_comb_loop(
+        "signed output range widening preserves the matching array element",
+        &signed_array_range_module_output_code(1),
+        true,
+    );
+}
+
+#[test]
+fn comb_loop_signed_module_output_range_widening_keeps_array_elements_disjoint() {
+    assert_comb_loop(
+        "signed output range widening keeps different array elements disjoint",
+        &signed_array_range_module_output_code(2),
+        false,
+    );
+}
+
+fn retained_signed_module_output_code(source_bit: usize) -> String {
+    format!(
+        r#"
+        module Child (
+            i: input logic<2>,
+            o: output signed logic<2>,
+        ) {{
+            var retained: signed logic<2>;
+            assign retained = i;
+            assign o = retained;
+        }}
+        module Top (o: output logic) {{
+            var feedback: logic<2>;
+            var passed: logic<4>;
+            inst u: Child (i: feedback, o: passed);
+            assign feedback[{source_bit}] = passed[3];
+            assign feedback[{}] = 0;
+            assign o = passed[0];
+        }}
+        "#,
+        1 - source_bit
+    )
+}
+
+#[test]
+fn comb_loop_signed_output_replication_survives_retained_internal_node() {
+    assert_comb_loop(
+        "signed output replication survives a retained child internal node",
+        &retained_signed_module_output_code(1),
+        true,
+    );
+}
+
+#[test]
+fn comb_loop_signed_output_replication_through_internal_excludes_non_sign_bit() {
+    assert_comb_loop(
+        "signed output replication through an internal excludes a non-sign bit",
+        &retained_signed_module_output_code(0),
+        false,
+    );
+}
+
+fn signed_output_concat_code(source_bit: usize) -> String {
+    format!(
+        r#"
+        module Child (
+            i: input logic<2>,
+            o: output signed logic<2>,
+        ) {{
+            assign o = i;
+        }}
+        module Top (o: output logic) {{
+            var feedback: logic<2>;
+            var high: logic<2>;
+            var low: logic<2>;
+            inst u: Child (i: feedback, o: {{high, low}});
+            assign feedback[{source_bit}] = high[0];
+            assign feedback[{}] = 0;
+            assign o = low[0];
+        }}
+        "#,
+        1 - source_bit
+    )
+}
+
+#[test]
+fn comb_loop_signed_output_extension_maps_into_concat_high_fragment() {
+    assert_comb_loop(
+        "signed output extension maps into a concatenated high fragment",
+        &signed_output_concat_code(1),
+        true,
+    );
+}
+
+#[test]
+fn comb_loop_signed_output_extension_concat_excludes_non_sign_bit() {
+    assert_comb_loop(
+        "signed output extension into a concat excludes a non-sign bit",
+        &signed_output_concat_code(0),
+        false,
+    );
+}
+
+fn two_level_signed_output_widening_code(source_bit: usize) -> String {
+    format!(
+        r#"
+        module Leaf (
+            i: input logic<2>,
+            o: output signed logic<2>,
+        ) {{
+            assign o = i;
+        }}
+        module Wrapper (
+            i: input logic<2>,
+            o: output logic<4>,
+        ) {{
+            inst leaf: Leaf (i: i, o: o);
+        }}
+        module Top (o: output logic) {{
+            var feedback: logic<2>;
+            var passed: logic<4>;
+            inst wrapper: Wrapper (i: feedback, o: passed);
+            assign feedback[{source_bit}] = passed[3];
+            assign feedback[{}] = 0;
+            assign o = passed[0];
+        }}
+        "#,
+        1 - source_bit
+    )
+}
+
+#[test]
+fn comb_loop_signed_output_extension_survives_two_module_summaries() {
+    assert_comb_loop(
+        "signed output extension survives two module summaries",
+        &two_level_signed_output_widening_code(1),
+        true,
+    );
+}
+
+#[test]
+fn comb_loop_signed_output_extension_two_level_excludes_non_sign_bit() {
+    assert_comb_loop(
+        "two summaries keep a non-sign bit out of signed output extension",
+        &two_level_signed_output_widening_code(0),
+        false,
+    );
+}

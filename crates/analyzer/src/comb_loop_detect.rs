@@ -68,7 +68,7 @@ use region::{
     ArraySpan, BitPartition, IdxKey, NodeKey, PackedSpan, dst_writes, signed_difference,
     translate_position, var_reads,
 };
-use ssa::{BranchId, BranchRemapper, DependencyDagNode, PathCondition};
+use ssa::{BranchId, BranchRemapper, DependencyDagNode, PathCondition, PositionDomain};
 use summary::compute_module_summary;
 
 use crate::AnalyzerError;
@@ -347,7 +347,7 @@ fn summary_parent_accesses(
         && let Some(output) = inst.outputs.iter().find(|output| output.id == region.id)
     {
         let accesses = if let Some(actual) = &output.range_dst {
-            translated_contiguous_actual_accesses(region, variable, actual)
+            translated_coerced_contiguous_actual_accesses(region, variable, actual)
         } else {
             translated_fragment_accesses(region, variable, &output.dst, ctx)
         };
@@ -1794,7 +1794,7 @@ fn instance_region_mapping(
         )
     {
         let mapping = if let Some(actual) = &output.range_dst {
-            map_summary_region_to_contiguous_actual(region, variable, actual, bit_part)
+            map_summary_region_to_coerced_contiguous_actual(region, variable, actual, bit_part)
         } else {
             map_summary_region_to_fragments(region, variable, &output.dst, bit_part, ctx)
         };
@@ -1901,7 +1901,80 @@ struct TranslatedFragmentAccess {
     child_domain: SummaryRegion,
 }
 
+#[allow(clippy::too_many_arguments)]
+fn append_coerced_actual_fragments(
+    fragments: &mut Vec<ActualFragment>,
+    parent: VarId,
+    child_array: ArraySpan,
+    actual_packed: PackedSpan,
+    parent_array: ArraySpan,
+    parent_packed: PackedSpan,
+    child_packed_width: usize,
+    child_signed: bool,
+) -> Option<()> {
+    let array_offset = if parent_array.length == child_array.length {
+        Some(signed_difference(parent_array.start, child_array.start)?)
+    } else {
+        None
+    };
+
+    let parent_segment = |actual: PackedSpan| -> Option<(PackedSpan, Option<isize>)> {
+        if parent_packed.length == actual_packed.length {
+            let relative = actual.start.checked_sub(actual_packed.start)?;
+            let start = parent_packed.start.checked_add(relative)?;
+            let parent = PackedSpan::new(start, actual.length)?;
+            let offset = signed_difference(parent.start, actual.start)?;
+            Some((parent, Some(offset)))
+        } else {
+            Some((parent_packed, None))
+        }
+    };
+
+    let copied_width = child_packed_width.min(actual_packed.end());
+    if let Some(copied) = actual_packed.intersection(PackedSpan::new(0, copied_width)?) {
+        let (parent_packed, packed_offset) = parent_segment(copied)?;
+        fragments.push(ActualFragment {
+            parent,
+            child_array,
+            child_packed: copied,
+            parent_array,
+            parent_packed,
+            offset: BitDependency {
+                array: array_offset,
+                packed: packed_offset,
+            },
+        });
+    }
+
+    if child_signed && child_packed_width != 0 {
+        let actual_end = actual_packed.end();
+        if actual_end > child_packed_width
+            && let Some(extension) = actual_packed.intersection(PackedSpan::new(
+                child_packed_width,
+                actual_end.checked_sub(child_packed_width)?,
+            )?)
+        {
+            let (parent_packed, _) = parent_segment(extension)?;
+            fragments.push(ActualFragment {
+                parent,
+                child_array,
+                child_packed: PackedSpan::new(child_packed_width - 1, 1)?,
+                parent_array,
+                parent_packed,
+                offset: BitDependency {
+                    array: array_offset,
+                    packed: None,
+                },
+            });
+        }
+    }
+    Some(())
+}
+
 fn destination_packed_width(destination: &AssignDestination, ctx: &mut Context) -> Option<usize> {
+    if destination.select.is_empty() {
+        return destination.comptime.r#type.total_width();
+    }
     if let Some((op, width)) = &destination.select.1
         && matches!(
             op,
@@ -1931,7 +2004,6 @@ fn actual_fragments(
 ) -> Option<Vec<ActualFragment>> {
     let child_array_length = child.r#type.array.total()?;
     let child_packed_width = child.total_width()?;
-    let child_packed = PackedSpan::whole(child_packed_width)?;
     let accesses = actual
         .iter()
         .map(|destination| {
@@ -1961,37 +2033,27 @@ fn actual_fragments(
         .try_fold(0usize, |total, (_, _, _, length, _)| {
             total.checked_add(*length)
         })?;
-    if array_length == child_array_length
-        && accesses
-            .iter()
-            .all(|(_, _, _, _, width)| *width == child_packed_width)
-    {
+    if array_length == child_array_length {
         let mut child_start = 0usize;
-        return accesses
-            .into_iter()
-            .map(|(parent, parent_array, parent_packed, array_length, _)| {
-                let child_array = ArraySpan {
-                    start: child_start,
-                    length: array_length,
-                };
-                child_start = child_start.checked_add(array_length)?;
-                Some(ActualFragment {
-                    parent,
-                    child_array,
-                    child_packed,
-                    parent_array,
-                    parent_packed,
-                    offset: BitDependency {
-                        array: if parent_array.length == array_length {
-                            Some(signed_difference(parent_array.start, child_array.start)?)
-                        } else {
-                            None
-                        },
-                        packed: Some(signed_difference(parent_packed.start, child_packed.start)?),
-                    },
-                })
-            })
-            .collect();
+        let mut fragments = Vec::new();
+        for (parent, parent_array, parent_packed, array_length, packed_width) in accesses {
+            let child_array = ArraySpan {
+                start: child_start,
+                length: array_length,
+            };
+            child_start = child_start.checked_add(array_length)?;
+            append_coerced_actual_fragments(
+                &mut fragments,
+                parent,
+                child_array,
+                PackedSpan::whole(packed_width)?,
+                parent_array,
+                parent_packed,
+                child_packed_width,
+                child.r#type.signed,
+            )?;
+        }
+        return Some(fragments);
     }
 
     let packed_width = accesses
@@ -2000,7 +2062,6 @@ fn actual_fragments(
             total.checked_add(*width)
         })?;
     if child_array_length != 1
-        || packed_width != child_packed_width
         || accesses
             .iter()
             .any(|(_, _, _, array_length, _)| *array_length != 1)
@@ -2008,36 +2069,25 @@ fn actual_fragments(
         return None;
     }
 
-    let mut child_start = child_packed_width;
-    accesses
-        .into_iter()
-        .map(|(parent, parent_array, parent_packed, _, packed_width)| {
-            child_start = child_start.checked_sub(packed_width)?;
-            let child_packed = PackedSpan::new(child_start, packed_width)?;
-            Some(ActualFragment {
-                parent,
-                child_array: ArraySpan {
-                    start: 0,
-                    length: 1,
-                },
-                child_packed,
-                parent_array,
-                parent_packed,
-                offset: BitDependency {
-                    array: if parent_array.length == 1 {
-                        Some(signed_difference(parent_array.start, 0)?)
-                    } else {
-                        None
-                    },
-                    packed: if parent_packed.length == packed_width {
-                        Some(signed_difference(parent_packed.start, child_packed.start)?)
-                    } else {
-                        None
-                    },
-                },
-            })
-        })
-        .collect()
+    let mut actual_start = packed_width;
+    let mut fragments = Vec::new();
+    for (parent, parent_array, parent_packed, _, fragment_width) in accesses {
+        actual_start = actual_start.checked_sub(fragment_width)?;
+        append_coerced_actual_fragments(
+            &mut fragments,
+            parent,
+            ArraySpan {
+                start: 0,
+                length: 1,
+            },
+            PackedSpan::new(actual_start, fragment_width)?,
+            parent_array,
+            parent_packed,
+            child_packed_width,
+            child.r#type.signed,
+        )?;
+    }
+    Some(fragments)
 }
 
 fn contiguous_actual_fragment(
@@ -2068,6 +2118,38 @@ fn contiguous_actual_fragment(
             packed: Some(signed_difference(actual.parent_packed_start, 0)?),
         },
     })
+}
+
+fn coerced_contiguous_actual_fragments(
+    child: &Variable,
+    actual: &InstActualFragment,
+) -> Option<Vec<ActualFragment>> {
+    let child_array_length = child.r#type.array.total()?;
+    let child_packed_width = child.total_width()?;
+    if child_array_length != actual.parent_array_length {
+        return None;
+    }
+    let child_array = ArraySpan {
+        start: 0,
+        length: child_array_length,
+    };
+    let parent_array = ArraySpan {
+        start: actual.parent_array_start,
+        length: actual.parent_array_length,
+    };
+    let parent_packed = PackedSpan::new(actual.parent_packed_start, actual.parent_packed_length)?;
+    let mut fragments = Vec::new();
+    append_coerced_actual_fragments(
+        &mut fragments,
+        actual.parent,
+        child_array,
+        PackedSpan::whole(actual.parent_packed_length)?,
+        parent_array,
+        parent_packed,
+        child_packed_width,
+        child.r#type.signed,
+    )?;
+    Some(fragments)
 }
 
 fn translate_actual_fragments(
@@ -2137,6 +2219,14 @@ fn translated_contiguous_actual_accesses(
     translate_actual_fragments(region, [contiguous_actual_fragment(child, actual)?])
 }
 
+fn translated_coerced_contiguous_actual_accesses(
+    region: SummaryRegion,
+    child: &Variable,
+    actual: &InstActualFragment,
+) -> Option<Vec<TranslatedFragmentAccess>> {
+    translate_actual_fragments(region, coerced_contiguous_actual_fragments(child, actual)?)
+}
+
 fn map_translated_fragment_accesses(
     accesses: Vec<TranslatedFragmentAccess>,
     bit_part: &BitPartition,
@@ -2186,6 +2276,16 @@ fn map_summary_region_to_contiguous_actual(
     bit_part: &BitPartition,
 ) -> Option<InstanceRegionMapping> {
     let accesses = translated_contiguous_actual_accesses(region, child, actual)?;
+    Some(map_translated_fragment_accesses(accesses, bit_part))
+}
+
+fn map_summary_region_to_coerced_contiguous_actual(
+    region: SummaryRegion,
+    child: &Variable,
+    actual: &InstActualFragment,
+    bit_part: &BitPartition,
+) -> Option<InstanceRegionMapping> {
+    let accesses = translated_coerced_contiguous_actual_accesses(region, child, actual)?;
     Some(map_translated_fragment_accesses(accesses, bit_part))
 }
 
@@ -2285,9 +2385,42 @@ fn resolve_instance_mapping(
         .nodes
         .into_iter()
         .filter_map(|mapped| {
-            let node = ensure_node(graph, node_map, bit_part, mapped.key)?;
+            let parent = ensure_node(graph, node_map, bit_part, mapped.key)?;
+            if let Some(child_domain) = mapped.child_domain
+                && (mapped.offset.array.is_none() || mapped.offset.packed.is_none())
+            {
+                // Preserve the exact child endpoint until after the imported
+                // summary edge. Otherwise a broadcast/dynamic boundary would
+                // erase which child bit or element feeds the parent region.
+                let boundary = graph.add_node(GraphNode {
+                    region: child_domain,
+                    domains: vec![PositionDomain {
+                        array_start: child_domain.array.start,
+                        array_length: child_domain.array.length,
+                        packed_start: child_domain.packed.start,
+                        packed_length: child_domain.packed.length,
+                    }],
+                    regular_transfer: false,
+                    diagnostic: None,
+                });
+                add_dependency_edge(
+                    graph,
+                    boundary,
+                    parent,
+                    GraphDependency {
+                        kind: mapped.offset,
+                        condition: mapped.condition,
+                        carrier: false,
+                    },
+                );
+                return Some(ResolvedMappedNode {
+                    node: boundary,
+                    offset: BitDependency::identity(),
+                    condition: PathCondition::default(),
+                });
+            }
             Some(ResolvedMappedNode {
-                node,
+                node: parent,
                 offset: mapped.offset,
                 condition: mapped.condition,
             })
