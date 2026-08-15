@@ -75,6 +75,34 @@ fn identical_ternary_arms_retain_structural_control_dependence() {
 }
 
 #[test]
+fn inclusive_equal_runtime_bounds_are_not_proven_singleton() {
+    // The concrete inclusive range n..=n always executes exactly once and
+    // therefore kills `value`. Runtime-loop lowering deliberately treats the
+    // condition check structurally and does not prove the two bound
+    // expressions equal, so the zero-trip path remains conservative.
+    assert_intentional_false_positive(
+        "equal dynamic inclusive bounds are not correlated into one iteration",
+        r#"
+        module Top (
+            n: input  u32,
+            o: output logic,
+        ) {
+            var feedback: logic;
+            var value   : logic;
+            assign feedback = value;
+            always_comb {
+                value = feedback;
+                for _index in n..=n {
+                    value = 0;
+                }
+                o = feedback;
+            }
+        }
+        "#,
+    );
+}
+
+#[test]
 fn identical_function_branches_retain_structural_control_dependence() {
     assert_intentional_false_positive(
         "the detector does not prove a function result independent of its condition",

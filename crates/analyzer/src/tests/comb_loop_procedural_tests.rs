@@ -2294,6 +2294,70 @@ fn comb_loop_ordered_case_signed_missing_pattern_keeps_default_reachable() {
     );
 }
 #[test]
+#[ignore = "side effects in runtime loop condition bounds will be rejected or modeled separately"]
+fn runtime_condition_bound_final_check_kills_feedback() {
+    assert_comb_loop(
+        "the final failed condition check executes the bound function and kills feedback",
+        r#"
+        module Top (
+            n: input  u32,
+            o: output logic,
+        ) {
+            var feedback: logic;
+            var value   : logic;
+            function bound () -> u32 {
+                value = 0;
+                return n;
+            }
+            always_comb {
+                value = 0;
+                for _index in 0..bound() {
+                    value = feedback;
+                }
+                o = value;
+            }
+            assign feedback = o;
+        }
+        "#,
+        false,
+    );
+}
+
+#[test]
+#[ignore = "side effects in runtime loop condition bounds will be rejected or modeled separately"]
+fn runtime_condition_bound_repeats_side_effects() {
+    assert_comb_loop(
+        "each condition check repeats the bound function's state transfer",
+        r#"
+        module Top (
+            n: input  u32,
+            o: output logic,
+        ) {
+            var feedback: logic;
+            var a       : logic;
+            var b       : logic;
+            var c       : logic;
+            function bound () -> u32 {
+                c = b;
+                b = a;
+                a = 0;
+                return n;
+            }
+            always_comb {
+                a = feedback;
+                b = 0;
+                c = 0;
+                for _index in 0..bound() {}
+                o = c;
+            }
+            assign feedback = o;
+        }
+        "#,
+        true,
+    );
+}
+
+#[test]
 fn runtime_logical_or_condition_merges_the_skipped_rhs_effect() {
     assert_comb_loop(
         "a runtime logical-or condition retains the skipped RHS state",
