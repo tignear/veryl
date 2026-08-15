@@ -3948,12 +3948,16 @@ pub(crate) fn var_path_to_contiguous_fragment(
 ) -> Option<ir::InstActualFragment> {
     let (parent_path, select, token) = actual.clone().into();
     let (parent, mut comptime) = context.find_path(&parent_path)?;
+    let selected_signed = comptime.r#type.signed;
     let part_select = comptime.part_select.clone();
     if let Some(part_select) = &part_select {
         comptime.r#type = part_select.base.clone();
     }
 
     let (array_select, width_select) = select.split(comptime.r#type.array.dims());
+    // Packed bit/part selects are unsigned; selecting only unpacked array
+    // coordinates retains the element type's signedness.
+    let signed = selected_signed && width_select.is_empty();
     if !array_select.is_const_with_range() || !width_select.is_const_with_range() {
         return None;
     }
@@ -3992,6 +3996,7 @@ pub(crate) fn var_path_to_contiguous_fragment(
         parent_array_length,
         parent_packed_start,
         parent_packed_length,
+        signed,
     })
 }
 

@@ -379,6 +379,9 @@ pub struct InstActualFragment {
     pub parent_array_length: usize,
     pub parent_packed_start: usize,
     pub parent_packed_length: usize,
+    /// Signedness of the complete actual expression before it is expanded
+    /// into per-element legacy expressions.
+    pub signed: bool,
 }
 
 #[derive(Clone)]

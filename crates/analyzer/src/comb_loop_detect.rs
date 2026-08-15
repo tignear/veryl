@@ -480,7 +480,12 @@ fn summary_parent_accesses(
     if direction == Direction::Input
         && let Some(input) = inst.inputs.iter().find(|input| input.id == region.id)
         && let Some(actual) = &input.range_src
-        && let Some(accesses) = translated_contiguous_actual_accesses(region, variable, actual)
+        && let Some(accesses) = translated_coerced_input_contiguous_actual_accesses(
+            region,
+            variable,
+            actual,
+            actual.signed,
+        )
     {
         return accesses
             .into_iter()
@@ -1542,8 +1547,13 @@ impl<'a> ModuleGraphBuilder<'a> {
                         bit_part,
                         ctx,
                     );
-                    let resolved =
-                        resolve_instance_mapping(graph, node_map, bit_part, mapping.clone());
+                    let resolved = resolve_instance_mapping(
+                        graph,
+                        node_map,
+                        bit_part,
+                        mapping.clone(),
+                        BoundaryFlow::ParentToChild,
+                    );
                     (resolved, Some(mapping))
                 }
                 SummaryNodeKind::Output => {
@@ -1556,8 +1566,13 @@ impl<'a> ModuleGraphBuilder<'a> {
                         bit_part,
                         ctx,
                     );
-                    let resolved =
-                        resolve_instance_mapping(graph, node_map, bit_part, mapping.clone());
+                    let resolved = resolve_instance_mapping(
+                        graph,
+                        node_map,
+                        bit_part,
+                        mapping.clone(),
+                        BoundaryFlow::ChildToParent,
+                    );
                     (resolved, Some(mapping))
                 }
                 SummaryNodeKind::Interface => {
@@ -1570,8 +1585,13 @@ impl<'a> ModuleGraphBuilder<'a> {
                         bit_part,
                         ctx,
                     );
-                    let resolved =
-                        resolve_instance_mapping(graph, node_map, bit_part, mapping.clone());
+                    let resolved = resolve_instance_mapping(
+                        graph,
+                        node_map,
+                        bit_part,
+                        mapping.clone(),
+                        BoundaryFlow::ChildToParent,
+                    );
                     (resolved, Some(mapping))
                 }
                 SummaryNodeKind::Internal => (
@@ -1623,8 +1643,13 @@ impl<'a> ModuleGraphBuilder<'a> {
                                 bit_part,
                                 ctx,
                             );
-                            let sources =
-                                resolve_instance_mapping(graph, node_map, bit_part, sources);
+                            let sources = resolve_instance_mapping(
+                                graph,
+                                node_map,
+                                bit_part,
+                                sources,
+                                BoundaryFlow::ParentToChild,
+                            );
                             let destinations = resolve_instance_mapping(
                                 graph,
                                 node_map,
@@ -1632,6 +1657,7 @@ impl<'a> ModuleGraphBuilder<'a> {
                                 InstanceRegionMapping {
                                     nodes: vec![destination.clone()],
                                 },
+                                BoundaryFlow::ChildToParent,
                             );
                             add_resolved_dependency_edges(
                                 graph,
@@ -1658,6 +1684,7 @@ impl<'a> ModuleGraphBuilder<'a> {
                     InstanceRegionMapping {
                         nodes: fallback_destinations,
                     },
+                    BoundaryFlow::ChildToParent,
                 );
                 add_resolved_dependency_edges(
                     graph,
@@ -1745,6 +1772,12 @@ struct ResolvedMappedNode {
     node: NodeIndex,
     offset: BitDependency,
     condition: PathCondition,
+}
+
+#[derive(Clone, Copy)]
+enum BoundaryFlow {
+    ParentToChild,
+    ChildToParent,
 }
 
 fn remap_module_summary_branches(
@@ -1996,8 +2029,13 @@ fn instance_region_mapping(
             inst.inputs.iter().find(|input| input.id == region.id),
         )
         && let Some(actual) = &input.range_src
-        && let Some(mapping) =
-            map_summary_region_to_contiguous_actual(region, variable, actual, bit_part)
+        && let Some(mapping) = map_summary_region_to_coerced_input_contiguous_actual(
+            region,
+            variable,
+            actual,
+            actual.signed,
+            bit_part,
+        )
     {
         return mapping;
     }
@@ -2354,6 +2392,72 @@ fn coerced_contiguous_actual_fragments(
     Some(fragments)
 }
 
+fn coerced_input_contiguous_actual_fragments(
+    child: &Variable,
+    actual: &InstActualFragment,
+    actual_signed: bool,
+) -> Option<Vec<ActualFragment>> {
+    let child_array_length = child.r#type.array.total()?;
+    let child_packed_width = child.total_width()?;
+    let actual_packed_width = actual.parent_packed_length;
+    if child_array_length != actual.parent_array_length {
+        return None;
+    }
+
+    let child_array = ArraySpan {
+        start: 0,
+        length: child_array_length,
+    };
+    let parent_array = ArraySpan {
+        start: actual.parent_array_start,
+        length: actual.parent_array_length,
+    };
+    let array_offset = Some(signed_difference(parent_array.start, child_array.start)?);
+    let mut fragments = Vec::new();
+
+    let copied_width = child_packed_width.min(actual_packed_width);
+    if copied_width != 0 {
+        let child_packed = PackedSpan::new(0, copied_width)?;
+        let parent_packed = PackedSpan::new(actual.parent_packed_start, copied_width)?;
+        fragments.push(ActualFragment {
+            parent: actual.parent,
+            child_array,
+            child_packed,
+            parent_array,
+            parent_packed,
+            array_filters: StaticArrayFilters::default(),
+            offset: BitDependency {
+                array: array_offset,
+                packed: Some(signed_difference(parent_packed.start, child_packed.start)?),
+            },
+        });
+    }
+
+    if actual_signed && actual_packed_width != 0 && child_packed_width > actual_packed_width {
+        fragments.push(ActualFragment {
+            parent: actual.parent,
+            child_array,
+            child_packed: PackedSpan::new(
+                actual_packed_width,
+                child_packed_width.checked_sub(actual_packed_width)?,
+            )?,
+            parent_array,
+            parent_packed: PackedSpan::new(
+                actual
+                    .parent_packed_start
+                    .checked_add(actual_packed_width - 1)?,
+                1,
+            )?,
+            array_filters: StaticArrayFilters::default(),
+            offset: BitDependency {
+                array: array_offset,
+                packed: None,
+            },
+        });
+    }
+    Some(fragments)
+}
+
 fn translate_actual_fragments(
     region: SummaryRegion,
     fragments: impl IntoIterator<Item = ActualFragment>,
@@ -2414,20 +2518,24 @@ fn translated_interface_binding_accesses(
     )
 }
 
-fn translated_contiguous_actual_accesses(
-    region: SummaryRegion,
-    child: &Variable,
-    actual: &InstActualFragment,
-) -> Option<Vec<TranslatedFragmentAccess>> {
-    translate_actual_fragments(region, [contiguous_actual_fragment(child, actual)?])
-}
-
 fn translated_coerced_contiguous_actual_accesses(
     region: SummaryRegion,
     child: &Variable,
     actual: &InstActualFragment,
 ) -> Option<Vec<TranslatedFragmentAccess>> {
     translate_actual_fragments(region, coerced_contiguous_actual_fragments(child, actual)?)
+}
+
+fn translated_coerced_input_contiguous_actual_accesses(
+    region: SummaryRegion,
+    child: &Variable,
+    actual: &InstActualFragment,
+    actual_signed: bool,
+) -> Option<Vec<TranslatedFragmentAccess>> {
+    translate_actual_fragments(
+        region,
+        coerced_input_contiguous_actual_fragments(child, actual, actual_signed)?,
+    )
 }
 
 fn map_translated_fragment_accesses(
@@ -2477,16 +2585,6 @@ fn map_summary_region_to_interface_binding(
     Some(map_translated_fragment_accesses(accesses, bit_part))
 }
 
-fn map_summary_region_to_contiguous_actual(
-    region: SummaryRegion,
-    child: &Variable,
-    actual: &InstActualFragment,
-    bit_part: &BitPartition,
-) -> Option<InstanceRegionMapping> {
-    let accesses = translated_contiguous_actual_accesses(region, child, actual)?;
-    Some(map_translated_fragment_accesses(accesses, bit_part))
-}
-
 fn map_summary_region_to_coerced_contiguous_actual(
     region: SummaryRegion,
     child: &Variable,
@@ -2494,6 +2592,18 @@ fn map_summary_region_to_coerced_contiguous_actual(
     bit_part: &BitPartition,
 ) -> Option<InstanceRegionMapping> {
     let accesses = translated_coerced_contiguous_actual_accesses(region, child, actual)?;
+    Some(map_translated_fragment_accesses(accesses, bit_part))
+}
+
+fn map_summary_region_to_coerced_input_contiguous_actual(
+    region: SummaryRegion,
+    child: &Variable,
+    actual: &InstActualFragment,
+    actual_signed: bool,
+    bit_part: &BitPartition,
+) -> Option<InstanceRegionMapping> {
+    let accesses =
+        translated_coerced_input_contiguous_actual_accesses(region, child, actual, actual_signed)?;
     Some(map_translated_fragment_accesses(accesses, bit_part))
 }
 
@@ -2595,6 +2705,7 @@ fn resolve_instance_mapping(
     node_map: &mut HashMap<NodeKey, NodeIndex>,
     bit_part: &BitPartition,
     mapping: InstanceRegionMapping,
+    boundary_flow: BoundaryFlow,
 ) -> ResolvedInstanceRegionMapping {
     let nodes = mapping
         .nodes
@@ -2618,12 +2729,31 @@ fn resolve_instance_mapping(
                     regular_transfer: false,
                     diagnostic: None,
                 });
+                let (source, destination) = match boundary_flow {
+                    BoundaryFlow::ParentToChild => (parent, boundary),
+                    BoundaryFlow::ChildToParent => (boundary, parent),
+                };
+                let kind = match boundary_flow {
+                    BoundaryFlow::ParentToChild => BitDependency {
+                        array: mapped.offset.array.map(|offset| {
+                            offset
+                                .checked_neg()
+                                .expect("mapped array dependency offset must fit in isize")
+                        }),
+                        packed: mapped.offset.packed.map(|offset| {
+                            offset
+                                .checked_neg()
+                                .expect("mapped packed dependency offset must fit in isize")
+                        }),
+                    },
+                    BoundaryFlow::ChildToParent => mapped.offset,
+                };
                 add_dependency_edge(
                     graph,
-                    boundary,
-                    parent,
+                    source,
+                    destination,
                     GraphDependency {
-                        kind: mapped.offset,
+                        kind,
                         condition: mapped.condition,
                         carrier: false,
                     },

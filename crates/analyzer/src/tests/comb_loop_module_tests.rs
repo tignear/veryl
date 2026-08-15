@@ -3215,3 +3215,147 @@ fn comb_loop_signed_output_extension_two_level_excludes_non_sign_bit() {
         false,
     );
 }
+fn module_input_range_coercion_code(
+    actual_type: &str,
+    formal_type: &str,
+    formal_bit: usize,
+    feedback_element: usize,
+    feedback_bit: usize,
+) -> String {
+    let actual_width = if actual_type.contains("<2>") { 2 } else { 4 };
+    let clears = (0..4)
+        .flat_map(|element| (0..actual_width).map(move |bit| (element, bit)))
+        .filter(|&(element, bit)| (element, bit) != (feedback_element, feedback_bit))
+        .map(|(element, bit)| format!("assign source[{element}][{bit}] = 0;"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!(
+        r#"
+        module Child (i: input {formal_type} [2], o: output logic) {{
+            assign o = i[0][{formal_bit}];
+        }}
+        module Top (o: output logic) {{
+            var source: {actual_type} [4];
+            var passed: logic;
+            inst u: Child (i: source[1:2], o: passed);
+            assign source[{feedback_element}][{feedback_bit}] = passed;
+            {clears}
+            assign o = passed;
+        }}
+        "#,
+    )
+}
+
+fn assert_module_input_range_coercion(
+    case: &str,
+    actual_type: &str,
+    formal_type: &str,
+    formal_bit: usize,
+    feedback_element: usize,
+    feedback_bit: usize,
+    expected: bool,
+) {
+    let code = module_input_range_coercion_code(
+        actual_type,
+        formal_type,
+        formal_bit,
+        feedback_element,
+        feedback_bit,
+    );
+    assert!(
+        comb_loop_analysis_is_complete(&code),
+        "{case}: analysis must remain complete",
+    );
+    assert_comb_loop(case, &code, expected);
+}
+
+#[test]
+fn comb_loop_unsigned_module_input_range_widening_copies_low_bit() {
+    assert_module_input_range_coercion(
+        "an unsigned widened input range retains a copied low bit",
+        "logic<2>",
+        "logic<4>",
+        0,
+        1,
+        0,
+        true,
+    );
+}
+
+#[test]
+fn comb_loop_unsigned_module_input_range_widening_zero_extends_high_bit() {
+    assert_module_input_range_coercion(
+        "an unsigned widened input range does not read a zero-extended high bit",
+        "logic<2>",
+        "logic<4>",
+        3,
+        1,
+        0,
+        false,
+    );
+}
+
+#[test]
+fn comb_loop_signed_module_input_range_widening_replicates_sign_bit() {
+    assert_module_input_range_coercion(
+        "a signed widened input range replicates its sign bit",
+        "signed logic<2>",
+        "logic<4>",
+        3,
+        1,
+        1,
+        true,
+    );
+}
+
+#[test]
+fn comb_loop_signed_module_input_range_widening_excludes_non_sign_bit() {
+    assert_module_input_range_coercion(
+        "a signed widened input range does not replicate a non-sign bit",
+        "signed logic<2>",
+        "logic<4>",
+        3,
+        1,
+        0,
+        false,
+    );
+}
+
+#[test]
+fn comb_loop_module_input_range_narrowing_retains_copied_bit() {
+    assert_module_input_range_coercion(
+        "a narrowed input range retains a copied bit",
+        "logic<4>",
+        "logic<2>",
+        1,
+        1,
+        1,
+        true,
+    );
+}
+
+#[test]
+fn comb_loop_module_input_range_narrowing_discards_high_bit() {
+    assert_module_input_range_coercion(
+        "a narrowed input range discards an actual high bit",
+        "logic<4>",
+        "logic<2>",
+        1,
+        1,
+        3,
+        false,
+    );
+}
+
+#[test]
+fn comb_loop_signed_module_input_range_widening_keeps_sibling_elements_disjoint() {
+    assert_module_input_range_coercion(
+        "signed input range widening preserves unpacked element identity",
+        "signed logic<2>",
+        "logic<4>",
+        3,
+        2,
+        1,
+        false,
+    );
+}
