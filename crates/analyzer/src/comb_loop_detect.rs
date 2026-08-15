@@ -22,6 +22,7 @@ mod summary;
 #[cfg(test)]
 thread_local! {
     static INSTANCE_REQUEST_EDGE_PROBES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static GUARDED_EXPRESSION_PROBES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 #[cfg(test)]
@@ -32,6 +33,16 @@ pub(crate) fn reset_instance_request_edge_probes() {
 #[cfg(test)]
 pub(crate) fn instance_request_edge_probes() -> usize {
     INSTANCE_REQUEST_EDGE_PROBES.get()
+}
+
+#[cfg(test)]
+pub(crate) fn reset_guarded_expression_probes() {
+    GUARDED_EXPRESSION_PROBES.set(0);
+}
+
+#[cfg(test)]
+pub(crate) fn guarded_expression_probes() -> usize {
+    GUARDED_EXPRESSION_PROBES.get()
 }
 
 #[cfg(test)]
@@ -1340,11 +1351,9 @@ impl<'a> ModuleGraphBuilder<'a> {
                         node.region,
                         preserve_position,
                         input_reads.get(&node.region.id).map(Vec::as_slice),
-                        Some(&input_region_mappings),
+                        &input_region_mappings,
                         bit_part,
                         ctx,
-                        procedure_context,
-                        function_summaries,
                     );
                     let resolved =
                         resolve_instance_mapping(graph, node_map, bit_part, mapping.clone());
@@ -1423,11 +1432,9 @@ impl<'a> ModuleGraphBuilder<'a> {
                                 input_reads
                                     .get(&summary.nodes[edge.source].region.id)
                                     .map(Vec::as_slice),
-                                Some(&input_region_mappings),
+                                &input_region_mappings,
                                 bit_part,
                                 ctx,
-                                procedure_context,
-                                function_summaries,
                             );
                             let sources =
                                 resolve_instance_mapping(graph, node_map, bit_part, sources);
@@ -1489,17 +1496,15 @@ impl<'a> ModuleGraphBuilder<'a> {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn map_instance_source_region<'a>(
+fn map_instance_source_region(
     inst: &InstDeclaration,
     child: &Module,
     region: SummaryRegion,
     preserve_position: bool,
     allowed: Option<&[procedure::RegionSource]>,
-    evaluated: Option<&HashMap<SummaryRegion, InstanceRegionMapping>>,
-    bit_part: &'a BitPartition,
+    evaluated: &HashMap<SummaryRegion, InstanceRegionMapping>,
+    bit_part: &BitPartition,
     ctx: &mut Context,
-    procedure_context: &mut procedure::ProcedureContext,
-    function_summaries: &mut procedure::FunctionSummaries<'a>,
 ) -> InstanceRegionMapping {
     let parent_sources = instance_region_mapping(
         inst,
@@ -1523,35 +1528,9 @@ fn map_instance_source_region<'a>(
     {
         return parent_sources;
     }
-    let Some(input) = inst.inputs.iter().find(|input| input.id == region.id) else {
+    let Some(mut mapping) = evaluated.get(&region).cloned() else {
         return parent_sources;
     };
-    let Some(expression) = input.single() else {
-        return parent_sources;
-    };
-    let Some(variable) = child.variables.get(&region.id) else {
-        return parent_sources;
-    };
-    let Some(width) = variable.total_width() else {
-        return parent_sources;
-    };
-    if let Some(evaluated) = evaluated {
-        let Some(mut mapping) = evaluated.get(&region).cloned() else {
-            return parent_sources;
-        };
-        mapping.nodes.retain(|source| {
-            allowed.is_some_and(|allowed| allowed.iter().any(|item| item.key == source.key))
-        });
-        return mapping;
-    }
-    let mut mapping = analyze_instance_actual_region(
-        bit_part,
-        expression,
-        region,
-        width,
-        procedure_context,
-        function_summaries,
-    );
     mapping.nodes.retain(|source| {
         allowed.is_some_and(|allowed| allowed.iter().any(|item| item.key == source.key))
     });
@@ -2400,30 +2379,6 @@ fn analyze_instance_destination<'a>(
     analysis.finish()
 }
 
-fn analyze_instance_actual_region<'a>(
-    bit_part: &'a BitPartition,
-    expression: &Expression,
-    region: SummaryRegion,
-    context_width: usize,
-    procedure_context: &mut procedure::ProcedureContext,
-    summaries: &mut procedure::FunctionSummaries<'a>,
-) -> InstanceRegionMapping {
-    let mut analysis = procedure::ExpressionAnalysis::new(bit_part, procedure_context, summaries);
-    let sources = analysis.eval_region(expression, region.array, region.packed, context_width);
-    let mapping = InstanceRegionMapping {
-        nodes: sources
-            .into_iter()
-            .map(|source| MappedNode {
-                key: source.key,
-                offset: source.offset,
-                condition: source.condition,
-            })
-            .collect(),
-    };
-    analysis.restore(procedure_context);
-    mapping
-}
-
 struct InstanceActualAnalysis<'a, 's, 'c> {
     bit_part: &'a BitPartition,
     ctx: &'c mut Context,
@@ -2495,15 +2450,23 @@ impl<'a, 's, 'c> InstanceActualAnalysis<'a, 's, 'c> {
             self.procedure = Some(procedure);
             return;
         }
+        self.eval_unguarded(expression);
+    }
+
+    /// Collect reads after `eval` has established that the complete
+    /// expression contains no guarded construct. Descendants are therefore
+    /// unguarded as well, so walking them must not repeat the whole-subtree
+    /// classification at every level.
+    fn eval_unguarded(&mut self, expression: &Expression) {
         match expression {
             Expression::Term(factor) => match factor.as_ref() {
                 Factor::FunctionCall(_) => unreachable!("guarded expression checked above"),
                 Factor::Variable(_, index, select, _) => {
                     for expression in index.0.iter().chain(select.0.iter()) {
-                        self.eval(expression);
+                        self.eval_unguarded(expression);
                     }
                     if let Some((_, expression)) = &select.1 {
-                        self.eval(expression);
+                        self.eval_unguarded(expression);
                     }
                     let mut reads = Vec::new();
                     collect_factor_node_keys(factor, self.bit_part, &mut reads, self.ctx);
@@ -2518,7 +2481,7 @@ impl<'a, 's, 'c> InstanceActualAnalysis<'a, 's, 'c> {
                     SystemFunctionKind::Onehot(input)
                     | SystemFunctionKind::Signed(input)
                     | SystemFunctionKind::Unsigned(input)
-                    | SystemFunctionKind::Readmemh(input, _) => self.eval(&input.0),
+                    | SystemFunctionKind::Readmemh(input, _) => self.eval_unguarded(&input.0),
                     SystemFunctionKind::Bits(_)
                     | SystemFunctionKind::Size(_)
                     | SystemFunctionKind::Clog2(_)
@@ -2529,17 +2492,17 @@ impl<'a, 's, 'c> InstanceActualAnalysis<'a, 's, 'c> {
                 },
                 _ => {}
             },
-            Expression::Unary(_, operand, _) => self.eval(operand),
+            Expression::Unary(_, operand, _) => self.eval_unguarded(operand),
             Expression::Binary(left, _, right, _) => {
-                self.eval(left);
-                self.eval(right);
+                self.eval_unguarded(left);
+                self.eval_unguarded(right);
             }
             Expression::Ternary(_, _, _, _) => unreachable!("guarded expression checked above"),
             Expression::Concatenation(parts, _) => {
                 for (part, repeat) in parts {
-                    self.eval(part);
+                    self.eval_unguarded(part);
                     if let Some(repeat) = repeat {
-                        self.eval(repeat);
+                        self.eval_unguarded(repeat);
                     }
                 }
             }
@@ -2547,18 +2510,18 @@ impl<'a, 's, 'c> InstanceActualAnalysis<'a, 's, 'c> {
                 for item in items {
                     match item {
                         crate::ir::ArrayLiteralItem::Value(value, repeat) => {
-                            self.eval(value);
+                            self.eval_unguarded(value);
                             if let Some(repeat) = repeat {
-                                self.eval(repeat);
+                                self.eval_unguarded(repeat);
                             }
                         }
-                        crate::ir::ArrayLiteralItem::Defaul(value) => self.eval(value),
+                        crate::ir::ArrayLiteralItem::Defaul(value) => self.eval_unguarded(value),
                     }
                 }
             }
             Expression::StructConstructor(_, fields, _) => {
                 for (_, value) in fields {
-                    self.eval(value);
+                    self.eval_unguarded(value);
                 }
             }
         }
@@ -2566,6 +2529,8 @@ impl<'a, 's, 'c> InstanceActualAnalysis<'a, 's, 'c> {
 }
 
 fn requires_guarded_expression_analysis(expression: &Expression) -> bool {
+    #[cfg(test)]
+    GUARDED_EXPRESSION_PROBES.set(GUARDED_EXPRESSION_PROBES.get() + 1);
     match expression {
         Expression::Term(factor) => match factor.as_ref() {
             Factor::FunctionCall(_) => true,

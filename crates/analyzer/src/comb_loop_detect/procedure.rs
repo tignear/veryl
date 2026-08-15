@@ -1383,19 +1383,6 @@ impl<'a, 's> ExpressionAnalysis<'a, 's> {
         inner.eval_expression_sources(expression)
     }
 
-    pub(super) fn eval_region(
-        &mut self,
-        expression: &Expression,
-        array: super::region::ArraySpan,
-        packed: PackedSpan,
-        context_width: usize,
-    ) -> Vec<RegionSource> {
-        let inner = self.inner();
-        inner.prepare_top_expression(expression);
-        let sources = inner.eval_expr_requested(expression, array, packed, context_width);
-        inner.mapped_region_sources(sources)
-    }
-
     /// Evaluate an actual once in source order, then project every requested
     /// region from the variable versions and call results captured at each
     /// syntactic occurrence. The ordered effects are committed only once.
@@ -1570,10 +1557,6 @@ impl<'a, 's> ProcedureAnalysis<'a, 's> {
         sources.sort_unstable_by_key(|source| (source.key, source.condition.clone()));
         sources.dedup_by(|left, right| left.key == right.key && left.condition == right.condition);
         sources
-    }
-
-    fn mapped_region_sources(&mut self, sources: ExpressionSources) -> Vec<RegionSource> {
-        self.mapped_region_sources_cached(&mut SourceCache::default(), sources)
     }
 
     fn mapped_region_sources_cached(

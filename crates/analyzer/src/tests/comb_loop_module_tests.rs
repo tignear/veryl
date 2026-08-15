@@ -930,6 +930,36 @@ fn actual_branch_layout_walk_is_linear_in_syntactic_calls() {
 }
 
 #[test]
+fn pure_instance_actual_is_classified_once_before_its_linear_walk() {
+    const TERMS: usize = 1_024;
+    let mut level = vec!["i".to_string(); TERMS];
+    while level.len() > 1 {
+        level = level
+            .chunks_exact(2)
+            .map(|pair| format!("({} | {})", pair[0], pair[1]))
+            .collect();
+    }
+    let actual = level.pop().expect("the expression has at least one term");
+    crate::comb_loop_detect::reset_guarded_expression_probes();
+    let errors = analyze(&format!(
+        r#"
+        module Sink (i: input logic, o: output logic) {{ assign o = i; }}
+        module Top (i: input logic, o: output logic) {{
+            inst sink: Sink (i: {actual}, o: o);
+        }}
+        "#
+    ));
+    assert!(
+        errors.is_empty(),
+        "deep pure actual is acyclic: {errors:#?}"
+    );
+    assert!(
+        crate::comb_loop_detect::guarded_expression_probes() <= TERMS * 3 + 16,
+        "guarded-expression classification must visit the actual only once",
+    );
+}
+
+#[test]
 fn following_instance_actual_effect_does_not_retroactively_taint_a_read() {
     assert_comb_loop(
         "a later actual side effect cannot alter an already captured middle bit",
