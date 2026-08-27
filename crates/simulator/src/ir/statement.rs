@@ -125,6 +125,254 @@ pub(crate) fn array_literal_element_exprs(
     Some(out)
 }
 
+fn drain_function_arg_pending(context: &mut Context, result: &mut Vec<ProtoStatement>) {
+    let mut pending = std::mem::take(&mut context.pending_statements);
+    result.append(&mut pending);
+}
+
+fn append_function_array_arg_assign(
+    result: &mut Vec<ProtoStatement>,
+    arg_meta: &crate::ir::VariableMeta,
+    arg_index: usize,
+    select: Option<(usize, usize)>,
+    mut expr: ProtoExpression,
+    token: &TokenRange,
+) -> Result<(), SimulatorError> {
+    size_literal_rhs(&mut expr, select, None, arg_meta.width);
+    let arg_element = arg_meta
+        .elements
+        .get(arg_index)
+        .ok_or_else(|| SimulatorError::unsupported_description(token))?;
+    result.push(ProtoStatement::Assign(ProtoAssignStatement {
+        dst: arg_element.current,
+        dst_width: arg_meta.width,
+        select,
+        dynamic_select: None,
+        rhs_select: None,
+        expr,
+        dst_ff_current_offset: 0,
+        token: *token,
+    }));
+    Ok(())
+}
+
+fn function_array_arg_base(shape: &air::ShapeRef, prefix: &[usize]) -> Option<(usize, usize)> {
+    let suffix = &shape[prefix.len()..];
+    let count = suffix
+        .iter()
+        .try_fold(1usize, |acc, dim| acc.checked_mul((*dim)?))?;
+    let mut first = prefix.to_vec();
+    first.resize(shape.dims(), 0);
+    Some((shape.calc_index(&first)?, count))
+}
+
+/// Bind an unpacked-array function argument in source evaluation order.
+///
+/// `eval_array_literal` returns flattened destinations in storage order, which
+/// is ideal for constant folding but loses two properties needed while
+/// inlining calls: a `default` expression's source position and an item that
+/// supplies an entire inner array.  This walk keeps source order while mapping
+/// every scalar evaluation to its formal element.
+fn append_function_array_arg(
+    context: &mut Context,
+    result: &mut Vec<ProtoStatement>,
+    arg_meta: &crate::ir::VariableMeta,
+    expr: &air::Expression,
+    prefix: &mut Vec<usize>,
+    broadcast_scalar: bool,
+    token: &TokenRange,
+) -> Result<(), SimulatorError> {
+    let shape = &arg_meta.r#type.array;
+    if prefix.len() == shape.dims() {
+        let arg_index = shape
+            .calc_index(prefix)
+            .ok_or_else(|| SimulatorError::unsupported_description(token))?;
+
+        if matches!(expr, air::Expression::ArrayLiteral(..)) {
+            let mut expr = expr.clone();
+            let array_exprs = eval_array_literal(
+                &mut context.scope().analyzer_context,
+                None,
+                Some(arg_meta.r#type.width()),
+                &mut expr,
+            )
+            .map_err(|_| SimulatorError::unsupported_description(token))?
+            .ok_or_else(|| SimulatorError::unsupported_description(token))?;
+            for array_expr in array_exprs {
+                let select = if array_expr.select.is_empty() {
+                    None
+                } else {
+                    Some(
+                        array_expr
+                            .to_var_select()
+                            .eval_value(
+                                &mut context.scope().analyzer_context,
+                                &arg_meta.r#type,
+                                false,
+                            )
+                            .ok_or_else(|| SimulatorError::unsupported_description(token))?,
+                    )
+                };
+                let proto_expr: ProtoExpression = Conv::conv(context, &array_expr.expr)?;
+                drain_function_arg_pending(context, result);
+                append_function_array_arg_assign(
+                    result, arg_meta, arg_index, select, proto_expr, token,
+                )?;
+            }
+        } else {
+            let proto_expr: ProtoExpression = Conv::conv(context, expr)?;
+            drain_function_arg_pending(context, result);
+            append_function_array_arg_assign(result, arg_meta, arg_index, None, proto_expr, token)?;
+        }
+        return Ok(());
+    }
+
+    if let air::Expression::ArrayLiteral(items, _) = expr {
+        let target_len = shape
+            .get(prefix.len())
+            .and_then(|x| *x)
+            .ok_or_else(|| SimulatorError::unsupported_description(token))?;
+        let mut value_counts = Vec::with_capacity(items.len());
+        let mut explicit_len = 0usize;
+        let mut default_count = 0usize;
+        for item in items {
+            let count = match item {
+                air::ArrayLiteralItem::Value(_, Some(repeat)) => repeat
+                    .eval_value(&mut context.scope().analyzer_context)
+                    .and_then(|x| x.to_usize())
+                    .ok_or_else(|| SimulatorError::unsupported_description(token))?,
+                air::ArrayLiteralItem::Value(_, None) => 1,
+                air::ArrayLiteralItem::Defaul(_) => {
+                    default_count += 1;
+                    0
+                }
+            };
+            explicit_len = explicit_len
+                .checked_add(count)
+                .ok_or_else(|| SimulatorError::unsupported_description(token))?;
+            value_counts.push(count);
+        }
+        if explicit_len > target_len
+            || default_count > 1
+            || (default_count == 0 && explicit_len != target_len)
+        {
+            return Err(SimulatorError::unsupported_description(token));
+        }
+
+        let mut value_index = 0usize;
+        for (item, count) in items.iter().zip(value_counts) {
+            match item {
+                air::ArrayLiteralItem::Value(item_expr, _) => {
+                    for _ in 0..count {
+                        prefix.push(value_index);
+                        append_function_array_arg(
+                            context, result, arg_meta, item_expr, prefix, false, token,
+                        )?;
+                        prefix.pop();
+                        value_index += 1;
+                    }
+                }
+                air::ArrayLiteralItem::Defaul(item_expr) => {
+                    for index in explicit_len..target_len {
+                        prefix.push(index);
+                        append_function_array_arg(
+                            context, result, arg_meta, item_expr, prefix, true, token,
+                        )?;
+                        prefix.pop();
+                    }
+                }
+            }
+        }
+        return Ok(());
+    }
+
+    let (target_base, target_count) = function_array_arg_base(shape, prefix)
+        .ok_or_else(|| SimulatorError::unsupported_description(token))?;
+
+    if let Some(exprs) = const_array_element_exprs(expr, target_count) {
+        for (index, proto_expr) in exprs.into_iter().enumerate() {
+            append_function_array_arg_assign(
+                result,
+                arg_meta,
+                target_base + index,
+                None,
+                proto_expr,
+                token,
+            )?;
+        }
+        return Ok(());
+    }
+
+    if let air::Expression::Term(factor) = expr
+        && let air::Factor::Variable(parent_id, index, select, _) = factor.as_ref()
+        && select.is_empty()
+    {
+        let parent_scope = context.scope();
+        if let Some(parent_meta) = parent_scope.variable_meta.get(parent_id).cloned()
+            && let Some(parent_shape) = remaining_array_shape(context, parent_id, index)
+            && parent_shape.as_slice() == &shape[prefix.len()..]
+        {
+            let base = if index.0.is_empty() {
+                Some(0)
+            } else {
+                index
+                    .eval_value(&mut context.scope().analyzer_context)
+                    .and_then(|indices| {
+                        partial_index_base(
+                            parent_meta.r#type.array.as_slice(),
+                            &indices,
+                            target_count,
+                            parent_meta.elements.len(),
+                        )
+                    })
+            };
+            if let Some(base) = base {
+                for offset in 0..target_count {
+                    let parent_element = &parent_meta.elements[base + offset];
+                    let proto_expr = ProtoExpression::Variable {
+                        var_offset: parent_element.current,
+                        select: None,
+                        dynamic_select: None,
+                        width: arg_meta.width,
+                        var_full_width: arg_meta.width,
+                        expr_context: ExpressionContext {
+                            width: arg_meta.width,
+                            signed: false,
+                        },
+                    };
+                    append_function_array_arg_assign(
+                        result,
+                        arg_meta,
+                        target_base + offset,
+                        None,
+                        proto_expr,
+                        token,
+                    )?;
+                }
+                return Ok(());
+            }
+        }
+    }
+
+    if broadcast_scalar {
+        for offset in 0..target_count {
+            let proto_expr: ProtoExpression = Conv::conv(context, expr)?;
+            drain_function_arg_pending(context, result);
+            append_function_array_arg_assign(
+                result,
+                arg_meta,
+                target_base + offset,
+                None,
+                proto_expr,
+                token,
+            )?;
+        }
+        return Ok(());
+    }
+
+    Err(SimulatorError::unsupported_description(token))
+}
+
 #[derive(Clone)]
 pub enum ProtoStatementBlock {
     Interpreted(Vec<ProtoStatement>),
@@ -4391,21 +4639,6 @@ impl Conv<&air::IfResetStatement> for ProtoIfStatement {
 
 impl Conv<&FunctionCall> for Vec<ProtoStatement> {
     fn conv(context: &mut Context, src: &FunctionCall) -> Result<Self, SimulatorError> {
-        if !context.expanding_functions.insert(src.id) {
-            let name = context
-                .scope()
-                .analyzer_context
-                .functions
-                .get(&src.id)
-                .unwrap()
-                .name
-                .to_string();
-            return Err(SimulatorError::recursive_function(
-                &name,
-                &src.comptime.token,
-            ));
-        }
-
         let mut result = Vec::new();
 
         // Clone to avoid borrow conflict with context
@@ -4431,54 +4664,16 @@ impl Conv<&FunctionCall> for Vec<ProtoStatement> {
             if let Some(arg_meta) = arg_meta_clone.as_ref()
                 && matches!(expr, air::Expression::ArrayLiteral(..))
             {
-                let mut expr = expr.clone();
-                let array_exprs = eval_array_literal(
-                    &mut context.scope().analyzer_context,
-                    Some(&arg_meta.r#type.array),
-                    Some(arg_meta.r#type.width()),
-                    &mut expr,
-                )
-                .map_err(|_| SimulatorError::unsupported_description(&src.comptime.token))?
-                .ok_or_else(|| SimulatorError::unsupported_description(&src.comptime.token))?;
-
-                for array_expr in array_exprs {
-                    let arg_index = arg_meta
-                        .r#type
-                        .array
-                        .calc_index(&array_expr.index)
-                        .ok_or_else(|| {
-                            SimulatorError::unsupported_description(&src.comptime.token)
-                        })?;
-                    let select = if array_expr.select.is_empty() {
-                        None
-                    } else {
-                        Some(
-                            array_expr
-                                .to_var_select()
-                                .eval_value(
-                                    &mut context.scope().analyzer_context,
-                                    &arg_meta.r#type,
-                                    false,
-                                )
-                                .ok_or_else(|| {
-                                    SimulatorError::unsupported_description(&src.comptime.token)
-                                })?,
-                        )
-                    };
-                    let mut proto_expr: ProtoExpression = Conv::conv(context, &array_expr.expr)?;
-                    size_literal_rhs(&mut proto_expr, select, None, arg_meta.width);
-                    let arg_element = &arg_meta.elements[arg_index];
-                    result.push(ProtoStatement::Assign(ProtoAssignStatement {
-                        dst: arg_element.current,
-                        dst_width: arg_meta.width,
-                        select,
-                        dynamic_select: None,
-                        rhs_select: None,
-                        expr: proto_expr,
-                        dst_ff_current_offset: 0,
-                        token: TokenRange::default(),
-                    }));
-                }
+                let mut prefix = Vec::new();
+                append_function_array_arg(
+                    context,
+                    &mut result,
+                    arg_meta,
+                    expr,
+                    &mut prefix,
+                    false,
+                    &src.comptime.token,
+                )?;
                 continue;
             }
 
@@ -4560,6 +4755,7 @@ impl Conv<&FunctionCall> for Vec<ProtoStatement> {
             }
 
             let mut proto_expr: ProtoExpression = Conv::conv(context, expr)?;
+            drain_function_arg_pending(context, &mut result);
             let scope = context.scope();
             let meta = scope.variable_meta.get(arg_var_id).unwrap();
             let element = &meta.elements[0];
@@ -4577,15 +4773,29 @@ impl Conv<&FunctionCall> for Vec<ProtoStatement> {
             }));
         }
 
-        // Drain pending statements from nested function calls in input expressions
-        let mut pending = std::mem::take(&mut context.pending_statements);
-        pending.append(&mut result);
-        result = pending;
+        // Calls in argument expressions are evaluated in the caller. Mark the
+        // callee as expanding only while lowering its body so a nested call in
+        // an argument is not mistaken for recursion.
+        if !context.expanding_functions.insert(src.id) {
+            let name = context
+                .scope()
+                .analyzer_context
+                .functions
+                .get(&src.id)
+                .unwrap()
+                .name
+                .to_string();
+            return Err(SimulatorError::recursive_function(
+                &name,
+                &src.comptime.token,
+            ));
+        }
 
         for stmt in &body.statements {
             let stmts: Vec<ProtoStatement> = Conv::conv(context, stmt)?;
             result.extend(stmts);
         }
+        context.expanding_functions.remove(&src.id);
 
         for (var_path, destinations) in &src.outputs {
             let arg_var_id = body.arg_map.get(var_path).unwrap();
@@ -4604,39 +4814,81 @@ impl Conv<&FunctionCall> for Vec<ProtoStatement> {
                 },
             };
             for dst in destinations {
-                let scope = context.scope();
-                let dst_meta = scope.variable_meta.get(&dst.id).unwrap();
-                let dst_index = dst.index.eval_value(&mut scope.analyzer_context).unwrap();
-                let dst_index = dst_meta.r#type.array.calc_index(&dst_index).unwrap();
-                let dst_element = &dst_meta.elements[dst_index];
-
-                let select = if !dst.select.is_empty() {
-                    dst.select
-                        .eval_value(&mut scope.analyzer_context, &dst.comptime.r#type, false)
+                let dst_meta = context.scope().variable_meta.get(&dst.id).unwrap().clone();
+                let need_dynamic_select = !dst.select.is_empty() && !dst.select.is_const();
+                let select = if dst.select.is_empty() || need_dynamic_select {
+                    None
+                } else {
+                    dst.select.eval_value(
+                        &mut context.scope().analyzer_context,
+                        &dst.comptime.r#type,
+                        false,
+                    )
+                };
+                let dynamic_select = if need_dynamic_select {
+                    Some(build_dynamic_bit_select(
+                        context,
+                        dst_meta.r#type.width(),
+                        &dst.select,
+                        dst_meta.r#type.kind.width().unwrap_or(1),
+                    )?)
                 } else {
                     None
                 };
 
-                let dst_var = if dst_element.is_ff() {
-                    VarOffset::Ff(dst_element.next_offset)
-                } else {
-                    VarOffset::Comb(dst_element.current_offset())
-                };
+                if dst.index.is_const() {
+                    let dst_index = dst
+                        .index
+                        .eval_value(&mut context.scope().analyzer_context)
+                        .and_then(|index| dst_meta.r#type.array.calc_index(&index))
+                        .ok_or_else(|| {
+                            SimulatorError::unsupported_description(&src.comptime.token)
+                        })?;
+                    let dst_element = &dst_meta.elements[dst_index];
+                    let dst_var = if dst_element.is_ff() {
+                        VarOffset::Ff(dst_element.next_offset)
+                    } else {
+                        VarOffset::Comb(dst_element.current_offset())
+                    };
 
-                result.push(ProtoStatement::Assign(ProtoAssignStatement {
-                    dst: dst_var,
-                    dst_width: dst_meta.width,
-                    select,
-                    dynamic_select: None,
-                    rhs_select: None,
-                    expr: arg_expr.clone(),
-                    dst_ff_current_offset: dst_element.current_offset(),
-                    token: TokenRange::default(),
-                }));
+                    result.push(ProtoStatement::Assign(ProtoAssignStatement {
+                        dst: dst_var,
+                        dst_width: dst_meta.width,
+                        select,
+                        dynamic_select,
+                        rhs_select: None,
+                        expr: arg_expr.clone(),
+                        dst_ff_current_offset: dst_element.current_offset(),
+                        token: TokenRange::default(),
+                    }));
+                } else {
+                    let (base_current, base_next, stride, is_ff) =
+                        dst_meta.dynamic_index_info().ok_or_else(|| {
+                            SimulatorError::unsupported_description(&src.comptime.token)
+                        })?;
+                    let dst_base = if is_ff {
+                        VarOffset::Ff(base_next)
+                    } else {
+                        VarOffset::Comb(base_current)
+                    };
+                    let index_proto =
+                        build_linear_index_expr(context, &dst_meta.r#type.array, &dst.index)?;
+                    drain_function_arg_pending(context, &mut result);
+                    result.push(ProtoStatement::AssignDynamic(ProtoAssignDynamicStatement {
+                        dst_base,
+                        dst_stride: stride,
+                        dst_num_elements: dst_meta.elements.len(),
+                        dst_index_expr: index_proto,
+                        dst_width: dst_meta.width,
+                        select,
+                        dynamic_select,
+                        rhs_select: None,
+                        expr: arg_expr.clone(),
+                        dst_ff_current_base_offset: base_current,
+                    }));
+                }
             }
         }
-
-        context.expanding_functions.remove(&src.id);
         Ok(result)
     }
 }

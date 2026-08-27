@@ -6506,6 +6506,177 @@ fn function_call_array_literal_arg_shapes() {
     }
 }
 
+#[test]
+fn function_call_array_literal_arg_reentrant() {
+    let code = r#"
+    module Top (
+        clk: input clock,
+        out_q: output logic<8>,
+        deep_q: output logic<8>,
+    ) {
+        function pick (x: input logic<8> [2], index: input logic) -> logic<8> {
+            return x[index];
+        }
+
+        always_ff (clk) {
+            out_q = pick('{8'h11, 8'h22}, pick('{8'h00, 8'h01}, 0));
+            deep_q = pick(
+                '{8'h33, 8'h44},
+                pick('{8'h00, 8'h00}, pick('{8'h00, 8'h00}, 0))
+            );
+        }
+    }
+    "#;
+
+    for config in Config::all() {
+        let ir = analyze(code, &config);
+        let mut sim = Simulator::new(ir, None);
+        let clk = sim.get_clock("clk").unwrap();
+        sim.step(&clk);
+        assert_eq!(sim.get("out_q").unwrap(), Value::new(0x11, 8, false));
+        assert_eq!(sim.get("deep_q").unwrap(), Value::new(0x33, 8, false));
+    }
+}
+
+#[test]
+fn function_call_array_literal_arg_preserves_effect_order() {
+    let code = r#"
+    module Top (
+        q: output logic<8>,
+        changing: output logic<8>,
+        side: output logic<8>,
+        unused: output logic<8>,
+    ) {
+        function update (
+            value: input logic<8>,
+            written: output logic<8>
+        ) -> logic<8> {
+            written = value + 1;
+            return 0;
+        }
+        function observe (
+            value: input logic<8>,
+            written: output logic<8>
+        ) -> logic<8> {
+            written = value;
+            return value;
+        }
+        function pick (x: input logic<8> [2], index: input logic) -> logic<8> {
+            return x[index];
+        }
+
+        always_comb {
+            changing = 1;
+            side = 0;
+            q = pick('{changing, update(changing, changing)}, 0);
+            unused = pick(
+                '{default: observe(8'h11, side), observe(8'h22, side)},
+                0
+            );
+        }
+    }
+    "#;
+
+    for config in Config::all() {
+        let ir = analyze(code, &config);
+        let mut sim = Simulator::new(ir, None);
+        sim.step(&Event::Clock(VarId::SYNTHETIC));
+        assert_eq!(sim.get("q").unwrap(), Value::new(1, 8, false));
+        assert_eq!(sim.get("changing").unwrap(), Value::new(2, 8, false));
+        assert_eq!(sim.get("side").unwrap(), Value::new(0x22, 8, false));
+    }
+}
+
+#[test]
+fn function_call_array_literal_arg_multidim_fill_and_rows() {
+    let code = r#"
+    module Top (
+        clk: input clock,
+        row: input logic,
+        col: input logic,
+        filled: output logic<8>,
+        selected: output logic<4>,
+    ) {
+        function pick_default (x: input logic<8> [2, 2]) -> logic<8> {
+            return x[1][1];
+        }
+        function pick_rows (
+            x: input logic<4> [2, 2],
+            row: input logic,
+            col: input logic
+        ) -> logic<4> {
+            return x[row][col];
+        }
+        function pass_rows (
+            row0: input logic<4> [2],
+            row1: input logic<4> [2],
+            row: input logic,
+            col: input logic
+        ) -> logic<4> {
+            return pick_rows('{row0, row1}, row, col);
+        }
+
+        always_ff (clk) {
+            filled = pick_default('{default: 8'h55});
+            selected = pass_rows('{4'h1, 4'h2}, '{4'h3, 4'h4}, row, col);
+        }
+    }
+    "#;
+
+    for config in Config::all() {
+        let ir = analyze(code, &config);
+        let mut sim = Simulator::new(ir, None);
+        let clk = sim.get_clock("clk").unwrap();
+        for (row, col, expected) in [(0, 0, 1), (0, 1, 2), (1, 0, 3), (1, 1, 4)] {
+            sim.set("row", Value::new(row, 1, false));
+            sim.set("col", Value::new(col, 1, false));
+            sim.step(&clk);
+            assert_eq!(sim.get("filled").unwrap(), Value::new(0x55, 8, false));
+            assert_eq!(
+                sim.get("selected").unwrap(),
+                Value::new(expected, 4, false),
+                "row={row} col={col} config={config:?}",
+            );
+        }
+    }
+}
+
+#[test]
+fn function_call_array_literal_arg_dynamic_output_index() {
+    let code = r#"
+    module Top (
+        out_q: output logic<8>,
+    ) {
+        function pick (
+            x: input logic<8> [2],
+            index: input logic,
+            selected: output logic<8>
+        ) -> logic<8> {
+            selected = x[index];
+            return x[0];
+        }
+        var selected: logic<8> [2];
+        var inner_selected: logic<8>;
+        always_comb {
+            selected = '{default: 0};
+            inner_selected = 0;
+            out_q = pick(
+                '{8'h11, 8'h22},
+                1,
+                selected[pick('{8'h01, 8'h00}, 0, inner_selected)]
+            );
+        }
+    }
+    "#;
+
+    for config in Config::all() {
+        let ir = analyze(code, &config);
+        let mut sim = Simulator::new(ir, None);
+        sim.step(&Event::Clock(VarId::SYNTHETIC));
+        assert_eq!(sim.get("out_q").unwrap(), Value::new(0x11, 8, false));
+    }
+}
+
 // Partial constant-index of a multi-dim parent array as a function argument
 // (e.g. `pick(arr[0], ...)` on a `logic [N, M]` parent → 1D array param).
 #[test]
