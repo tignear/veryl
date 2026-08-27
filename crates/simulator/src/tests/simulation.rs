@@ -6677,6 +6677,101 @@ fn function_call_array_literal_arg_dynamic_output_index() {
     }
 }
 
+#[test]
+fn function_call_packed_array_literal_arg_preserves_effect_order() {
+    let code = r#"
+    module Top (
+        q: output logic<2>,
+        side: output logic<8>,
+    ) {
+        function observe (
+            value: input logic<8>,
+            written: output logic<8>
+        ) -> logic {
+            written = value;
+            return value[0];
+        }
+        function identity (x: input logic<2>) -> logic<2> {
+            return x;
+        }
+
+        always_comb {
+            side = 0;
+            q = identity('{default: observe(8'h11, side), observe(8'h22, side)});
+        }
+    }
+    "#;
+
+    for config in Config::all() {
+        let ir = analyze(code, &config);
+        let mut sim = Simulator::new(ir, None);
+        sim.step(&Event::Clock(VarId::SYNTHETIC));
+        assert_eq!(sim.get("side").unwrap(), Value::new(0x22, 8, false));
+    }
+}
+
+#[test]
+fn function_call_array_literal_array_item_preserves_element_type() {
+    let code = r#"
+    module Top (
+        q: output signed logic<8>,
+    ) {
+        function first (x: input signed logic<8> [2, 2]) -> signed logic<8> {
+            return x[0][0];
+        }
+        function pass (
+            row0: input signed logic<4> [2],
+            row1: input signed logic<4> [2]
+        ) -> signed logic<8> {
+            return first('{row0, row1});
+        }
+        always_comb {
+            q = pass('{4'h8, 4'h0}, '{4'h1, 4'h2});
+        }
+    }
+    "#;
+
+    for config in Config::all() {
+        let ir = analyze(code, &config);
+        let mut sim = Simulator::new(ir, None);
+        sim.step(&Event::Clock(VarId::SYNTHETIC));
+        assert_eq!(sim.get("q").unwrap(), Value::new(0xf8, 8, false));
+    }
+}
+
+#[test]
+fn function_call_array_literal_accepts_array_returning_items() {
+    let code = r#"
+    module Top (
+        q: output logic<4>,
+    ) {
+        type row_t = logic<4> [2];
+        type matrix_t = logic<4> [2, 2];
+
+        function make_row (base: input logic<4>) -> row_t {
+            var row: row_t;
+            row[0] = base;
+            row[1] = base + 1;
+            return row;
+        }
+        function pick (x: input matrix_t) -> logic<4> {
+            return x[1][0];
+        }
+
+        always_comb {
+            q = pick('{make_row(1), make_row(3)});
+        }
+    }
+    "#;
+
+    for config in Config::all() {
+        let ir = analyze(code, &config);
+        let mut sim = Simulator::new(ir, None);
+        sim.step(&Event::Clock(VarId::SYNTHETIC));
+        assert_eq!(sim.get("q").unwrap(), Value::new(3, 4, false));
+    }
+}
+
 // Partial constant-index of a multi-dim parent array as a function argument
 // (e.g. `pick(arr[0], ...)` on a `logic [N, M]` parent → 1D array param).
 #[test]

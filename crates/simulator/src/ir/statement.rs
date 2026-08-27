@@ -130,6 +130,41 @@ fn drain_function_arg_pending(context: &mut Context, result: &mut Vec<ProtoState
     result.append(&mut pending);
 }
 
+fn function_array_literal_item_counts(
+    context: &mut Context,
+    items: &[air::ArrayLiteralItem],
+    target_len: usize,
+    token: &TokenRange,
+) -> Result<(Vec<usize>, usize), SimulatorError> {
+    let mut value_counts = Vec::with_capacity(items.len());
+    let mut explicit_len = 0usize;
+    let mut default_count = 0usize;
+    for item in items {
+        let count = match item {
+            air::ArrayLiteralItem::Value(_, Some(repeat)) => repeat
+                .eval_value(&mut context.scope().analyzer_context)
+                .and_then(|x| x.to_usize())
+                .ok_or_else(|| SimulatorError::unsupported_description(token))?,
+            air::ArrayLiteralItem::Value(_, None) => 1,
+            air::ArrayLiteralItem::Defaul(_) => {
+                default_count += 1;
+                0
+            }
+        };
+        explicit_len = explicit_len
+            .checked_add(count)
+            .ok_or_else(|| SimulatorError::unsupported_description(token))?;
+        value_counts.push(count);
+    }
+    if explicit_len > target_len
+        || default_count > 1
+        || (default_count == 0 && explicit_len != target_len)
+    {
+        return Err(SimulatorError::unsupported_description(token));
+    }
+    Ok((value_counts, explicit_len))
+}
+
 fn append_function_array_arg_assign(
     result: &mut Vec<ProtoStatement>,
     arg_meta: &crate::ir::VariableMeta,
@@ -166,6 +201,93 @@ fn function_array_arg_base(shape: &air::ShapeRef, prefix: &[usize]) -> Option<(u
     Some((shape.calc_index(&first)?, count))
 }
 
+fn function_packed_arg_select(
+    context: &mut Context,
+    arg_meta: &crate::ir::VariableMeta,
+    prefix: &[usize],
+    token: &TokenRange,
+) -> Result<Option<(usize, usize)>, SimulatorError> {
+    if prefix.is_empty() {
+        return Ok(None);
+    }
+    let select = air::VarSelect(
+        prefix
+            .iter()
+            .map(|index| {
+                air::Expression::create_value(
+                    AnalyzerValue::new(*index as u64, 32, false),
+                    TokenRange::default(),
+                )
+            })
+            .collect(),
+        None,
+    );
+    select
+        .eval_value(
+            &mut context.scope().analyzer_context,
+            &arg_meta.r#type,
+            false,
+        )
+        .map(Some)
+        .ok_or_else(|| SimulatorError::unsupported_description(token))
+}
+
+/// Bind a packed assignment pattern without moving `default` evaluation past
+/// later explicit items. A non-literal item supplies the entire remaining
+/// packed sub-shape and is sized by its destination select.
+fn append_function_packed_arg(
+    context: &mut Context,
+    result: &mut Vec<ProtoStatement>,
+    arg_meta: &crate::ir::VariableMeta,
+    arg_index: usize,
+    expr: &air::Expression,
+    prefix: &mut Vec<usize>,
+    token: &TokenRange,
+) -> Result<(), SimulatorError> {
+    let shape = arg_meta.r#type.width();
+    if prefix.len() < shape.dims()
+        && let air::Expression::ArrayLiteral(items, _) = expr
+    {
+        let target_len = shape
+            .get(prefix.len())
+            .and_then(|x| *x)
+            .ok_or_else(|| SimulatorError::unsupported_description(token))?;
+        let (value_counts, explicit_len) =
+            function_array_literal_item_counts(context, items, target_len, token)?;
+
+        let mut value_index = 0usize;
+        for (item, count) in items.iter().zip(value_counts) {
+            match item {
+                air::ArrayLiteralItem::Value(item_expr, _) => {
+                    for _ in 0..count {
+                        prefix.push(value_index);
+                        append_function_packed_arg(
+                            context, result, arg_meta, arg_index, item_expr, prefix, token,
+                        )?;
+                        prefix.pop();
+                        value_index += 1;
+                    }
+                }
+                air::ArrayLiteralItem::Defaul(item_expr) => {
+                    for index in explicit_len..target_len {
+                        prefix.push(index);
+                        append_function_packed_arg(
+                            context, result, arg_meta, arg_index, item_expr, prefix, token,
+                        )?;
+                        prefix.pop();
+                    }
+                }
+            }
+        }
+        return Ok(());
+    }
+
+    let select = function_packed_arg_select(context, arg_meta, prefix, token)?;
+    let proto_expr: ProtoExpression = Conv::conv(context, expr)?;
+    drain_function_arg_pending(context, result);
+    append_function_array_arg_assign(result, arg_meta, arg_index, select, proto_expr, token)
+}
+
 /// Bind an unpacked-array function argument in source evaluation order.
 ///
 /// `eval_array_literal` returns flattened destinations in storage order, which
@@ -189,36 +311,16 @@ fn append_function_array_arg(
             .ok_or_else(|| SimulatorError::unsupported_description(token))?;
 
         if matches!(expr, air::Expression::ArrayLiteral(..)) {
-            let mut expr = expr.clone();
-            let array_exprs = eval_array_literal(
-                &mut context.scope().analyzer_context,
-                None,
-                Some(arg_meta.r#type.width()),
-                &mut expr,
-            )
-            .map_err(|_| SimulatorError::unsupported_description(token))?
-            .ok_or_else(|| SimulatorError::unsupported_description(token))?;
-            for array_expr in array_exprs {
-                let select = if array_expr.select.is_empty() {
-                    None
-                } else {
-                    Some(
-                        array_expr
-                            .to_var_select()
-                            .eval_value(
-                                &mut context.scope().analyzer_context,
-                                &arg_meta.r#type,
-                                false,
-                            )
-                            .ok_or_else(|| SimulatorError::unsupported_description(token))?,
-                    )
-                };
-                let proto_expr: ProtoExpression = Conv::conv(context, &array_expr.expr)?;
-                drain_function_arg_pending(context, result);
-                append_function_array_arg_assign(
-                    result, arg_meta, arg_index, select, proto_expr, token,
-                )?;
-            }
+            let mut packed_prefix = Vec::new();
+            append_function_packed_arg(
+                context,
+                result,
+                arg_meta,
+                arg_index,
+                expr,
+                &mut packed_prefix,
+                token,
+            )?;
         } else {
             let proto_expr: ProtoExpression = Conv::conv(context, expr)?;
             drain_function_arg_pending(context, result);
@@ -232,32 +334,8 @@ fn append_function_array_arg(
             .get(prefix.len())
             .and_then(|x| *x)
             .ok_or_else(|| SimulatorError::unsupported_description(token))?;
-        let mut value_counts = Vec::with_capacity(items.len());
-        let mut explicit_len = 0usize;
-        let mut default_count = 0usize;
-        for item in items {
-            let count = match item {
-                air::ArrayLiteralItem::Value(_, Some(repeat)) => repeat
-                    .eval_value(&mut context.scope().analyzer_context)
-                    .and_then(|x| x.to_usize())
-                    .ok_or_else(|| SimulatorError::unsupported_description(token))?,
-                air::ArrayLiteralItem::Value(_, None) => 1,
-                air::ArrayLiteralItem::Defaul(_) => {
-                    default_count += 1;
-                    0
-                }
-            };
-            explicit_len = explicit_len
-                .checked_add(count)
-                .ok_or_else(|| SimulatorError::unsupported_description(token))?;
-            value_counts.push(count);
-        }
-        if explicit_len > target_len
-            || default_count > 1
-            || (default_count == 0 && explicit_len != target_len)
-        {
-            return Err(SimulatorError::unsupported_description(token));
-        }
+        let (value_counts, explicit_len) =
+            function_array_literal_item_counts(context, items, target_len, token)?;
 
         let mut value_index = 0usize;
         for (item, count) in items.iter().zip(value_counts) {
@@ -304,7 +382,42 @@ fn append_function_array_arg(
     }
 
     if let air::Expression::Term(factor) = expr
-        && let air::Factor::Variable(parent_id, index, select, _) = factor.as_ref()
+        && let air::Factor::FunctionCall(call) = factor.as_ref()
+        && call.comptime.r#type.array.as_slice() == &shape[prefix.len()..]
+    {
+        let ret_offsets = inline_function_call(context, call)?;
+        if ret_offsets.len() != target_count {
+            return Err(SimulatorError::unsupported_description(token));
+        }
+        let width = call
+            .comptime
+            .r#type
+            .total_width()
+            .ok_or_else(|| SimulatorError::unsupported_description(token))?;
+        let expr_context: ExpressionContext = (&call.comptime.expr_context).into();
+        drain_function_arg_pending(context, result);
+        for (offset, ret_offset) in ret_offsets.into_iter().enumerate() {
+            append_function_array_arg_assign(
+                result,
+                arg_meta,
+                target_base + offset,
+                None,
+                ProtoExpression::Variable {
+                    var_offset: ret_offset,
+                    select: None,
+                    dynamic_select: None,
+                    width,
+                    var_full_width: width,
+                    expr_context,
+                },
+                token,
+            )?;
+        }
+        return Ok(());
+    }
+
+    if let air::Expression::Term(factor) = expr
+        && let air::Factor::Variable(parent_id, index, select, comptime) = factor.as_ref()
         && select.is_empty()
     {
         let parent_scope = context.scope();
@@ -327,18 +440,20 @@ fn append_function_array_arg(
                     })
             };
             if let Some(base) = base {
+                let width = comptime
+                    .r#type
+                    .total_width()
+                    .ok_or_else(|| SimulatorError::unsupported_description(token))?;
+                let expr_context: ExpressionContext = (&comptime.expr_context).into();
                 for offset in 0..target_count {
                     let parent_element = &parent_meta.elements[base + offset];
                     let proto_expr = ProtoExpression::Variable {
                         var_offset: parent_element.current,
                         select: None,
                         dynamic_select: None,
-                        width: arg_meta.width,
-                        var_full_width: arg_meta.width,
-                        expr_context: ExpressionContext {
-                            width: arg_meta.width,
-                            signed: false,
-                        },
+                        width,
+                        var_full_width: width,
+                        expr_context,
                     };
                     append_function_array_arg_assign(
                         result,
